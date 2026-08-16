@@ -108,6 +108,29 @@ this run. A full page all stamped with one instant would leave nothing later to
 anchor on; that steps past and logs at attention, and the records it skips are
 older than the store's watermark so the next run collects them.
 
+## Anti-bot challenges
+
+`waitOutChallenge` wraps both GitLab runners, so every request a run makes is
+covered without the record loop or the discussion loop knowing what a challenge
+is. It retries on `GitLabChallengeError` and nothing else, on the ladder in
+`challengeWaits` — 30s, 60s, 2m, 5m, 10m, 10m, a little under half an hour
+against a run that takes eight.
+
+The constructor comes from the vendored library rather than a substring match
+on the message, because a challenge is transient where every other `GitLabError`
+is not.
+
+Exhausting the ladder aborts the run instead of returning the error. Returning
+it would leave the caller to skip and carry on, spending the whole ladder again
+on the next record and the one after; aborting costs nothing, since progress is
+already checkpointed. Everything else is returned on the first attempt, so a bad
+token still fails immediately.
+
+The case that forced this: a challenge on the startup token check killed a run
+outright, having fetched nothing, because until then the only thing that could
+fail there was a genuinely bad token. Testing found it by starting a run 20
+seconds after a previous run's last refusal.
+
 ## Not asking twice
 
 `entryDiscussionFor` is what keeps the expensive half of a run proportional to

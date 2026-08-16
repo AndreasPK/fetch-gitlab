@@ -12,8 +12,11 @@ module FetchGitLab.Fetch
   , serverConfig
   , requestsPerSecond
   , readToken
+  , waitOutChallenge
+  , challengeWaits
   ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (try)
 import Control.Monad (filterM)
 import Control.Monad.Except (throwError)
@@ -201,13 +204,21 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
       -- for a slow page rather than having stopped.
       announce <- requestAnnouncer
       manager <- liftIO $ rateLimitedManager limiter announce
-      let gitlab :: MonadIO m => GitLab b -> m (Either GitLabError b)
-          gitlab = liftIO . runGitLabWithManagerUnchecked manager (serverConfig opts token)
+      -- Every request a run makes goes through one of these two, so waiting
+      -- out a challenge here covers the record pages and the discussions
+      -- alike, without either of them having to know what a challenge is.
+      let gitlab :: GitLab c -> LogT IO (Either GitLabError c)
+          gitlab =
+            waitOutChallenge challengeWaits
+              . liftIO
+              . runGitLabWithManagerUnchecked manager (serverConfig opts token)
 
       -- The one call that checks the token, so that the thousands to follow do
       -- not each pay for a second request saying the same thing.
       prj <-
-        liftIO (runGitLabWithManager manager (serverConfig opts token) (lookupProject (optProject opts)))
+        waitOutChallenge
+          challengeWaits
+          (liftIO (runGitLabWithManager manager (serverConfig opts token) (lookupProject (optProject opts))))
           >>= either (\err -> abort ("GitLab request failed: " <> tshow err)) pure
 
       tickets' <- fetchRecords gitlab "tickets" store tickets ticketsSince $ \since ->
@@ -229,6 +240,59 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
     terminalLevel
       | optVerbose opts = LogTrace
       | otherwise = LogInfo
+
+-- | How long to wait, in seconds, after each successive anti-bot challenge.
+--
+-- The challenge clears on its own once traffic drops. Ten minutes was measured
+-- to be enough and twenty seconds was measured not to be, so this starts well
+-- under the known-good figure — no point waiting ten minutes for something that
+-- might clear in one — and ends well over it. The whole ladder is a little
+-- under half an hour, which is nothing against a run that takes eight.
+challengeWaits :: [Int]
+challengeWaits = [30, 60, 120, 300, 600, 600]
+
+-- | Run a GitLab action, waiting out an anti-bot challenge rather than failing
+-- on it.
+--
+-- These come back with HTTP 200 and an HTML body and are transient, so the
+-- useful response is to stop asking for a while. Without this a challenge is
+-- indistinguishable from a hard failure: a run that starts inside an open one
+-- dies on the token check having done nothing, and one that meets it later
+-- spends the rest of the run making requests that cannot succeed and marking
+-- records for retry it never had a chance to fetch.
+--
+-- Every other error is returned untouched on the first try, so a bad token
+-- still fails immediately rather than after half an hour of politeness.
+--
+-- Giving up stops the run rather than returning the error to the caller. A
+-- caller that skips and carries on would spend the ladder again on the next
+-- record, and the one after that; and stopping costs nothing, because whatever
+-- has been fetched is already written and the next run resumes from it.
+waitOutChallenge ::
+  (MonadLog m, MonadIO m) => [Int] -> m (Either GitLabError a) -> m (Either GitLabError a)
+waitOutChallenge = go
+  where
+    go waits act = do
+      result <- act
+      case result of
+        Left (GitLabChallengeError detail) -> case waits of
+          [] ->
+            abort $
+              "The server has been answering with an anti-bot challenge for "
+                <> tshow (sum challengeWaits `div` 60)
+                <> " minutes, so this run is stopping. Everything fetched so far is "
+                <> "written; a later run carries on from there."
+          wait : rest -> do
+            logAttention_ $
+              "The server answered with an anti-bot challenge rather than data. Waiting "
+                <> tshow wait
+                <> "s before asking again ("
+                <> tshow (length rest)
+                <> " further attempts before giving up)"
+            logTrace_ detail
+            liftIO $ threadDelay (wait * 1000000)
+            go rest act
+        _ -> pure result
 
 -- | A callback the HTTP manager can use to report each request it makes.
 --

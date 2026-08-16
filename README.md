@@ -69,6 +69,29 @@ manager, so pagination and retries inside `gitlab-haskell` are covered too.
 Two per second was enough to draw gitlab.haskell.org's anti-bot check
 repeatedly during a long run, so the default backs off below it.
 
+## Anti-bot challenges
+
+`gitlab.haskell.org` answers sustained traffic with an Anubis interstitial: an
+HTML page served with **HTTP 200**, so nothing short of parsing the body tells
+it apart from the data that was asked for. It clears on its own once traffic
+drops — observed at around ten minutes — and it is tied to the source address
+rather than to the process, so starting a fresh run does not reset it.
+
+A run waits one out rather than failing on it, backing off 30s, 60s, 2m, 5m,
+10m, 10m before giving up and stopping:
+
+```
+ATTENTION The server answered with an anti-bot challenge rather than data.
+          Waiting 30s before asking again (5 further attempts before giving up)
+```
+
+Every other error still fails on the first try, so a bad token is reported
+immediately rather than after half an hour of waiting. Giving up stops the run
+rather than skipping the record and carrying on, since a run that carried on
+would spend the whole ladder again on the next record and the one after that.
+Stopping costs nothing: what has been fetched is already written, and the next
+run resumes from it.
+
 ## One run at a time
 
 A run reads a store, merges what it fetched into what it read, and writes the

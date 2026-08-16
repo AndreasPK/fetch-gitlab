@@ -6,7 +6,7 @@ module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Aeson (FromJSON, ToJSON, Value (..), eitherDecode, encode, object, toJSON, (.=))
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
@@ -19,6 +19,7 @@ import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (..), addUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTime)
 import Control.Monad (forM_)
+import Control.Monad.IO.Class (liftIO)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs, getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
@@ -30,14 +31,15 @@ import Test.Tasty.HUnit
 
 import Network.HTTP.Client (HttpException, Response, httpLbs, parseRequest)
 
-import GitLab.Types (Issue (..), MergeRequest, Note (..))
+import GitLab.Types (GitLabError (..), Issue (..), MergeRequest, Note (..))
 
-import Log (LogLevel (..), LogT, runLogT)
+import Log (LogLevel (..), LogT, mkLogger, runLogT)
+import Log.Internal.Logger (withLogger)
 import Log.Backend.StandardOutput (withStdOutLogger)
 
 import FetchGitLab.ClearTimestamp (clearTimestamps)
 import FetchGitLab.Convert (convertStores)
-import FetchGitLab.Fetch (readToken)
+import FetchGitLab.Fetch (challengeWaits, readToken, waitOutChallenge)
 import FetchGitLab.Options (Backend (..), parseBackend)
 import FetchGitLab.Store.Backend (StoreSpec (..), pathSpec, specPaths)
 import FetchGitLab.Lock
@@ -149,6 +151,12 @@ tests =
         "rate limit"
         [ testCase "spaces requests out" rateLimitSpacesRequests
         , testCase "one turn is taken per request" rateLimitCountsRequestsOnce
+        ]
+    , testGroup
+        "anti-bot challenge"
+        [ testCase "a challenge is waited out and retried" challengeIsRetried
+        , testCase "any other error is not retried" otherErrorsAreNotRetried
+        , testCase "a success is returned untouched" successIsNotRetried
         ]
     , testGroup
         "locking"
@@ -367,6 +375,58 @@ rateLimitCountsRequestsOnce = do
   assertEqual ("one announcement per request, connection " <> outcome attempt) 1 count
   where
     outcome = either (const "refused") (const "served")
+
+-- | An anti-bot challenge is transient, so it is waited out rather than
+-- failed on. The waits are passed in so the test does not have to sit through
+-- the real ladder.
+challengeIsRetried :: Assertion
+challengeIsRetried = do
+  attempts <- newIORef (0 :: Int)
+  let act = do
+        n <- liftIO $ atomicModifyIORef' attempts (\n -> (n + 1, n + 1))
+        pure $
+          if n < 3
+            then Left (GitLabChallengeError "anubis") :: Either GitLabError T.Text
+            else Right "the data"
+  result <- runQuietly (waitOutChallenge [0, 0, 0] act)
+  assertEqual "the retry did not return the data" (Just "the data") (succeeded result)
+  readIORef attempts >>= assertEqual "gave up too early or retried too often" 3
+
+-- | Everything else fails on the first try. Waiting out a bad token would turn
+-- a mistyped file into half an hour of silence.
+otherErrorsAreNotRetried :: Assertion
+otherErrorsAreNotRetried = do
+  attempts <- newIORef (0 :: Int)
+  let act = do
+        liftIO $ modifyIORef' attempts (+ 1)
+        pure (Left (GitLabError "access token not accepted.") :: Either GitLabError T.Text)
+  result <- runQuietly (waitOutChallenge [0, 0, 0] act)
+  case result of
+    Left (GitLabError message) -> message @?= "access token not accepted."
+    other -> assertFailure ("expected the error back unchanged, got " <> show other)
+  readIORef attempts >>= assertEqual "an ordinary error was retried" 1
+
+successIsNotRetried :: Assertion
+successIsNotRetried = do
+  attempts <- newIORef (0 :: Int)
+  let act = do
+        liftIO $ modifyIORef' attempts (+ 1)
+        pure (Right "fine" :: Either GitLabError T.Text)
+  result <- runQuietly (waitOutChallenge challengeWaits act)
+  assertEqual "a success came back changed" (Just "fine") (succeeded result)
+  readIORef attempts >>= assertEqual "a success was repeated" 1
+
+-- | 'GitLabError' has no 'Eq', so results are compared on the success side.
+succeeded :: Either GitLabError a -> Maybe a
+succeeded = either (const Nothing) Just
+
+-- | Run a 'LogT' action without putting its logging on the test output. The
+-- challenge path logs at attention, which is exactly what a passing test
+-- should not print.
+runQuietly :: LogT IO a -> IO a
+runQuietly act = do
+  logger <- mkLogger "test" (\_ -> pure ())
+  withLogger logger $ \sink -> runLogT "test" sink LogTrace act
 
 -- | Read GitLab's own JSON for a set of records, write it out as a store, read
 -- it back, and check nothing changed on the way. This is what makes an

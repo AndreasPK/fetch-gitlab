@@ -50,6 +50,8 @@ receiveString eventContent rules = do
       `catchError` \err -> do
         let e = case err of
               GitLabError t -> t
+              -- PATCHED, see PATCHES.md. Added with the constructor.
+              GitLabChallengeError t -> t
               GitLabHttpError httpErr -> T.pack (show httpErr)
         liftIO $ do
           fpath <- writeSystemTempFile "gitlab-system-hook-exception-" (T.unpack e)

@@ -279,7 +279,7 @@ gitlabHTTPOne httpMethod contentType urlPath urlParams contentParams = do
     -- cannot be read is an error, and a genuine absence is a 404, which is not
     -- a success status and so returns Left above.
     then case eitherDecode (responseBody response) of
-      Left decodeErr -> throwError (GitLabError (notJson urlPath decodeErr (responseBody response)))
+      Left decodeErr -> throwError (notJson urlPath decodeErr (responseBody response))
       Right x -> return (Right (Just x))
     else return (Left response)
 
@@ -336,7 +336,7 @@ decodePage urlPath pageNum body =
     -- between "no more results" and "we gave up" cannot do anything sensible,
     -- so this is now an error.
     Left decodeErr ->
-      throwError . GitLabError $
+      throwError $
         notJson (urlPath <> T.pack (" (page " <> show pageNum <> ")")) decodeErr body
     Right values -> concat <$> mapM decodeRecord values
   where
@@ -370,19 +370,24 @@ showBS = T.encodeUtf8 . T.pack . show
 -- succeeded, and the caller is left reporting something like "no such project"
 -- for a server that never showed it one. Saying "this was HTML" is the
 -- difference between a minute and an hour of looking in the wrong place.
-notJson :: Text -> String -> BSL.ByteString -> Text
+notJson :: Text -> String -> BSL.ByteString -> GitLabError
 notJson urlPath decodeErr body =
-  T.concat
-    [ "the server answered "
-    , urlPath
-    , " with "
-    , description
-    , " rather than JSON: "
-    , T.pack decodeErr
-    , "; the response began "
-    , T.pack (show (BSL.take 300 body))
-    ]
+  -- A challenge is transient and worth waiting out, where the rest are not, so
+  -- it is worth more to a caller than a message it would have to match on.
+  (if isChallenge then GitLabChallengeError else GitLabError) message
   where
+    message =
+      T.concat
+        [ "the server answered "
+        , urlPath
+        , " with "
+        , description
+        , " rather than JSON: "
+        , T.pack decodeErr
+        , "; the response began "
+        , T.pack (show (BSL.take 300 body))
+        ]
+
     description
       | isChallenge = "an anti-bot interstitial (the request never reached the API)"
       | looksHtml = "an HTML page"

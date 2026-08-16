@@ -16,7 +16,8 @@ To see exactly what changed:
 ```
 tar xf ~/.cabal/packages/*/gitlab-haskell/1.4.0.0/gitlab-haskell-1.4.0.0.tar.gz -C /tmp
 for f in src/GitLab.hs src/GitLab/Types.hs src/GitLab/API/Issues.hs \
-         src/GitLab/API/MergeRequests.hs src/GitLab/WebRequests/GitLabWebCalls.hs; do
+         src/GitLab/API/MergeRequests.hs src/GitLab/WebRequests/GitLabWebCalls.hs \
+         src/GitLab/SystemHooks/GitLabSystemHooks.hs; do
   diff -u /tmp/gitlab-haskell-1.4.0.0/$f $f
 done
 ```
@@ -105,6 +106,12 @@ that triggers it is well within what a cold run makes.
 A body that is JSON but not the shape the library expects is named separately,
 since "the server answered with something rather than JSON" is its own kind of
 misleading when the server answered with JSON.
+
+An interstitial also gets its own `GitLabError` constructor,
+`GitLabChallengeError`, rather than only a recognisable message. A challenge is
+transient where every other error in that type is not, so a caller can wait it
+out instead of failing — and that is worth more than a message it would have to
+match on with a substring search that the next wording change would break.
 
 ## 4. A collection can be fetched a page at a time
 

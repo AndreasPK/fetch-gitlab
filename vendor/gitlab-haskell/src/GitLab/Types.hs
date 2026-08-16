@@ -146,6 +146,16 @@ data GitLabError
   | -- | A non-success HTTP response from the GitLab server, including response
     -- headers.
     GitLabHttpError HttpResponseError
+  | -- | PATCHED, see PATCHES.md. An anti-bot interstitial was served in place
+    -- of the API response.
+    --
+    -- These arrive with __HTTP 200__ and an HTML body, so nothing short of
+    -- parsing distinguishes them from the data that was asked for. They are
+    -- also transient: the challenge clears once traffic drops, so a caller
+    -- that can recognise one can wait it out instead of failing, which is
+    -- something no amount of inspecting a 'GitLabError' message would let it
+    -- do reliably.
+    GitLabChallengeError Text
   deriving (Show)
 
 -- | Details of a non-success HTTP response from the GitLab server.
