@@ -10,7 +10,12 @@ fetch-gitlab --convert --from jsonl|sqlite --to jsonl|sqlite
 
 fetch-gitlab --clear-timestamp [--backend jsonl|sqlite] [--db FILE]
              [--tickets FILE] [--mrs FILE] [-v|--verbose]
+
+show-gl-ghc show '#123' | '!123' [--store DIR] [--full]
 ```
+
+`show-gl-ghc` prints one record out of a store the tool has already fetched; it
+is read only and never talks to GitLab. See [below](#reading-a-record-back).
 
 Each line of the output is one record together with its discussion:
 
@@ -354,6 +359,58 @@ It does not move where *records* are fetched from. That is worked out from the
 newest `updated_at` in the store — a property of the records themselves, not a
 timestamp anything could clear — so `--since` is the way to reach further back,
 and the command prints the current starting point and says so.
+
+## Reading a record back
+
+`show-gl-ghc` prints one ticket or merge request out of a store. It is read
+only and offline: no token, no network, no lock, so it can be used while a
+fetch is running.
+
+```
+show-gl-ghc show '#25166' [--store DIR] [--full]
+show-gl-ghc show '!13000' [--store DIR] [--full]
+```
+
+```
+$ show-gl-ghc show '#25166'
+#25166  Generate static closure for datacon with unpacked sums
+  state       closed
+  author      Sylvain Henry (@hsyl20)
+  created     2024-08-15 13:23
+  updated     2025-01-13 09:09
+  labels      P::normal, T::feature request, code generation
+  assignees   Sylvain Henry (@hsyl20)
+  url         https://gitlab.haskell.org/ghc/ghc/-/work_items/25166
+  discussion  8 notes (--full to show them)
+
+## Summary
+
+GHC doesn't generate static closures when some field is an unpacked sum.
+...
+```
+
+Quote the `#`, or an interactive shell will treat the rest of the line as a
+comment and the tool will never see it. A bare number is read as a ticket for
+the same reason, so `show-gl-ghc show 25166` works too. `--full` adds the
+discussion, one block per note; a field the store has nothing for is left out
+rather than printed empty, and a discussion that was never fetched says so
+instead of reading as a record nobody replied to.
+
+`--store` takes the *directory* holding the store, not a file, and the most
+recently written store in it is the one read: the newest of the `*.db` files
+and the `tickets.jsonl`/`mrs.jsonl` pair, with a tie going to SQLite. That is
+less a guess at which one was meant than at which one is current — a run writes
+exactly one store, so the newer is the one being filled and the older is
+whatever was there before the backend changed. For SQLite the write ahead log
+counts as part of the database, since a run checkpoints into `gitlab.db-wal`
+and only folds it back in when it closes; during a fetch the database file's
+own timestamp can be hours stale. Without `--store` the same rule is applied to
+`~/.fetch-gitlab`. Nothing is created: a directory with neither store in it is
+reported, as is an `iid` the store does not hold, and both exit non-zero.
+
+The SQLite backend answers by querying for the one record, so a lookup in a
+560 MB store takes about 0.4 s. A JSON lines store has to be parsed from the
+top whatever is wanted from it, which for the same data is a few seconds.
 
 ## Importing without the tool
 

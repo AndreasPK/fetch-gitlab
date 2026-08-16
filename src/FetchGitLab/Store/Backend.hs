@@ -13,12 +13,23 @@ module FetchGitLab.Store.Backend
   , pathSpec
   , specPaths
   , describeSpec
+  , detectSpec
   , withStore
   ) where
 
+import Data.List (sortOn)
+import Data.Maybe (listToMaybe)
+import Data.Ord (Down (..))
 import Data.Text (Text)
 import qualified Data.Text as T
-import System.FilePath ((</>))
+import Data.Time.Clock (UTCTime)
+import System.Directory
+  ( doesDirectoryExist
+  , doesFileExist
+  , getModificationTime
+  , listDirectory
+  )
+import System.FilePath (takeExtension, (</>))
 
 import FetchGitLab.Options (Backend (..), ClearOptions (..), Options (..), defaultStoreDir)
 import FetchGitLab.Store.Class (SomeStore (..))
@@ -38,11 +49,18 @@ data StoreSpec
 namedSpec :: Backend -> Maybe FilePath -> Maybe FilePath -> Maybe FilePath -> IO StoreSpec
 namedSpec backend tickets mrs db = case backend of
   JsonLinesBackend ->
-    JsonLinesSpec <$> orDefault "tickets.jsonl" tickets <*> orDefault "mrs.jsonl" mrs
-  SqliteBackend -> SqliteSpec <$> orDefault "gitlab.db" db
+    JsonLinesSpec <$> orDefault ticketsName tickets <*> orDefault mrsName mrs
+  SqliteBackend -> SqliteSpec <$> orDefault dbName db
   where
     orDefault _ (Just given) = pure given
     orDefault name Nothing = (</> name) <$> defaultStoreDir
+
+-- | What a run calls the files it writes, where something other than a run has
+-- to go looking for them.
+ticketsName, mrsName, dbName :: FilePath
+ticketsName = "tickets.jsonl"
+mrsName = "mrs.jsonl"
+dbName = "gitlab.db"
 
 -- | The store a fetching run was told to use.
 optionsSpec :: Options -> IO StoreSpec
@@ -59,8 +77,55 @@ clearSpec opts =
 -- A JSON lines store is two files, so there the path is the directory holding
 -- them under the names a run would give them.
 pathSpec :: Backend -> FilePath -> StoreSpec
-pathSpec JsonLinesBackend dir = JsonLinesSpec (dir </> "tickets.jsonl") (dir </> "mrs.jsonl")
+pathSpec JsonLinesBackend dir = JsonLinesSpec (dir </> ticketsName) (dir </> mrsName)
 pathSpec SqliteBackend path = SqliteSpec path
+
+-- | The store to read out of a directory that may hold either kind, or both.
+--
+-- Whichever was written to most recently wins. That is not a guess at which
+-- one the reader meant so much as which one is being kept up to date: a run
+-- writes exactly one store, so the newer file is the one it is filling and the
+-- older is whatever was there before it changed backend.
+--
+-- For SQLite that means the write ahead log as well as the database. A run
+-- checkpoints into @gitlab.db-wal@ and only folds it back in when it closes,
+-- so during a fetch — the very time someone is likely to be reading — the
+-- database file's own timestamp can be hours stale.
+--
+-- A tie goes to SQLite, which is the backend a run uses unless told otherwise.
+-- Nothing means the directory holds neither, which is for the caller to
+-- report: this creates nothing.
+detectSpec :: FilePath -> IO (Maybe StoreSpec)
+detectSpec dir = do
+  there <- doesDirectoryExist dir
+  if not there
+    then pure Nothing
+    else do
+      entries <- listDirectory dir
+      databases <-
+        traverse
+          (\path -> fmap (\t -> (t, SqliteSpec path)) <$> freshest [path, path <> "-wal"])
+          [dir </> e | e <- entries, takeExtension e == ".db"]
+      pair <- freshest [dir </> ticketsName, dir </> mrsName]
+      let jsonl = fmap (\t -> (t, JsonLinesSpec (dir </> ticketsName) (dir </> mrsName))) pair
+          -- The sort is stable, so putting the databases first is what decides
+          -- a tie.
+          found = concatMap toList databases <> toList jsonl
+      pure (snd <$> listToMaybe (sortOn (Down . fst) found))
+  where
+    toList = maybe [] pure
+
+-- | When any of these files was last written, if any of them are there.
+freshest :: [FilePath] -> IO (Maybe UTCTime)
+freshest paths = do
+  times <- traverse stamp paths
+  pure $ case concatMap (maybe [] pure) times of
+    [] -> Nothing
+    ts -> Just (maximum ts)
+  where
+    stamp path = do
+      exists <- doesFileExist path
+      if exists then Just <$> getModificationTime path else pure Nothing
 
 -- | The files a run has to hold for itself.
 --

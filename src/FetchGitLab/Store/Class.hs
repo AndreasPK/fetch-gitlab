@@ -18,7 +18,7 @@ import qualified Data.IntSet as IntSet
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 
-import FetchGitLab.Store (Record, Store)
+import FetchGitLab.Store (Entry, Record, Store)
 
 -- | A store that tickets and merge requests can be read from and written to.
 class StoreBackend b where
@@ -61,6 +61,18 @@ class StoreBackend b where
   -- in memory must not claim it.
   storeLoadWithoutNotes :: Record a => b -> IO (Either String (Store a))
   storeLoadWithoutNotes = storeLoad
+
+  -- | One entry by its 'FetchGitLab.Store.recordKey', with its discussion.
+  --
+  -- 'Nothing' means the store does not hold that key, which is a different
+  -- thing from a store it could not read: only the second is a 'Left'.
+  --
+  -- The default reads the whole store and looks in it, which is all a backend
+  -- that keeps whole files can do. A backend that can ask for one record
+  -- should, because a reader after a single ticket otherwise pays for parsing
+  -- every note in the store to answer.
+  storeLookup :: Record a => b -> Int -> IO (Either String (Maybe (Entry a)))
+  storeLookup b key = fmap (Map.lookup key) <$> storeLoad b
 
 -- | A backend chosen at run time, once the command line has been read.
 data SomeStore = forall b. StoreBackend b => SomeStore b

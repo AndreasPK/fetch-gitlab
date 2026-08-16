@@ -56,6 +56,7 @@ import Database.SQLite.Simple
   , execute_
   , open
   , query
+  , queryNamed
   , query_
   , withTransaction
   )
@@ -90,6 +91,11 @@ openSqliteStore path = do
   execute_ conn "PRAGMA journal_mode = WAL"
   execute_ conn "PRAGMA synchronous = NORMAL"
   execute_ conn "PRAGMA foreign_keys = ON"
+  -- Write ahead logging lets a reader in while a run is writing, but only one
+  -- writer at a time, and opening a store writes: the schema statements above.
+  -- Without a timeout that collides with a checkpoint as an immediate "database
+  -- is locked" rather than a wait of a few milliseconds.
+  execute_ conn "PRAGMA busy_timeout = 5000"
   mapM_ (execute_ conn . Query) schemaStatements
   checkVersion conn
   SqliteStore path conn <$> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Map.empty
@@ -141,10 +147,15 @@ instance StoreBackend SqliteStore where
   storeLocation = T.pack . sqliteStorePath
 
   storeLoad :: forall a. Record a => SqliteStore -> IO (Either String (Store a))
-  storeLoad st = loadKind WithNotes st (recordKind (Proxy :: Proxy a))
+  storeLoad st = loadKind WithNotes Everything st (recordKind (Proxy :: Proxy a))
 
   storeLoadWithoutNotes :: forall a. Record a => SqliteStore -> IO (Either String (Store a))
-  storeLoadWithoutNotes st = loadKind WithoutNotes st (recordKind (Proxy :: Proxy a))
+  storeLoadWithoutNotes st = loadKind WithoutNotes Everything st (recordKind (Proxy :: Proxy a))
+
+  storeLookup :: forall a. Record a => SqliteStore -> Int -> IO (Either String (Maybe (Entry a)))
+  storeLookup st iid =
+    fmap (Map.lookup iid)
+      <$> (loadKind WithNotes (JustOne iid) st (recordKind (Proxy :: Proxy a)) :: IO (Either String (Store a)))
 
   storeSave :: forall a. Record a => SqliteStore -> Store a -> IntSet -> IO ()
   storeSave st store dirty =
@@ -290,45 +301,63 @@ rowOf conn q key = do
 -- Reading
 -- ---------------------------------------------------------------------------
 
--- | Read every record of one kind, with its discussion.
---
--- Everything is fetched in a handful of queries and joined up in memory. One
--- query per record would be tens of thousands of round trips for a project the
--- size of GHC's.
 -- | Whether a load reads the note bodies or leaves them where they are.
 data NoteLoading = WithNotes | WithoutNotes
   deriving (Eq)
 
-loadKind :: forall a. Record a => NoteLoading -> SqliteStore -> Text -> IO (Either String (Store a))
-loadKind loading st kind = do
+-- | How much of a kind a load is after.
+data Selection
+  = -- | Every record of the kind, which is what a run wants.
+    Everything
+  | -- | The one record with this @iid@, which is what a reader after a single
+    -- ticket wants. It travels as a bound parameter that every query tests, so
+    -- the assembling below stays one code path rather than two.
+    JustOne Int
+
+-- | Read records of one kind, with their discussions.
+--
+-- Everything is fetched in a handful of queries and joined up in memory. One
+-- query per record would be tens of thousands of round trips for a project the
+-- size of GHC's.
+loadKind ::
+  forall a. Record a => NoteLoading -> Selection -> SqliteStore -> Text -> IO (Either String (Store a))
+loadKind loading selection st kind = do
   let conn = sqliteConn st
       wanted = loading == WithNotes
+      -- NULL means "no restriction", so a query can name the parameter and be
+      -- read either way. Everything below is filtered by it, notes included.
+      only = case selection of
+        Everything -> Nothing
+        JustOne iid -> Just iid
+      params = [":kind" := kind, ":iid" := only]
 
   users <- Map.fromList <$> (query_ conn "SELECT row_id, json FROM users" :: IO [(Int64, Text)])
   milestones <-
     Map.fromList <$> (query_ conn "SELECT row_id, json FROM milestones" :: IO [(Int64, Text)])
 
   recordRows <-
-    query
+    queryNamed
       conn
       "SELECT iid, milestone_row, discussion_updated_at, has_discussion, rest, lifted \
-      \ FROM records WHERE kind = ?"
-      (Only kind) ::
+      \ FROM records WHERE kind = :kind AND (:iid IS NULL OR iid = :iid)"
+      params ::
       IO [(Int, Maybe Int64, Maybe Text, Int, Text, Text)]
 
   userRefs <-
-    query
+    queryNamed
       conn
-      "SELECT iid, field, position, user_row FROM record_users WHERE kind = ?"
-      (Only kind) ::
+      "SELECT iid, field, position, user_row FROM record_users \
+      \ WHERE kind = :kind AND (:iid IS NULL OR iid = :iid)"
+      params ::
       IO [(Int, Text, Int, Int64)]
 
   labelRefs <-
-    query
+    queryNamed
       conn
       "SELECT r.iid, r.position, l.name FROM record_labels r \
-      \ JOIN labels l ON l.label_id = r.label_id WHERE r.kind = ?"
-      (Only kind) ::
+      \ JOIN labels l ON l.label_id = r.label_id \
+      \ WHERE r.kind = :kind AND (:iid IS NULL OR r.iid = :iid)"
+      params ::
       IO [(Int, Int, Text)]
 
   -- The two heavy queries of the six, and the reason 'WithoutNotes' exists:
@@ -337,21 +366,23 @@ loadKind loading st kind = do
     if not wanted
       then pure []
       else
-        query
+        queryNamed
           conn
-          "SELECT iid, position, rest, lifted FROM notes WHERE kind = ? \
+          "SELECT iid, position, rest, lifted FROM notes \
+          \ WHERE kind = :kind AND (:iid IS NULL OR iid = :iid) \
           \ ORDER BY iid, position"
-          (Only kind) ::
+          params ::
           IO [(Int, Int, Text, Text)]
 
   noteRefs <-
     if not wanted
       then pure []
       else
-        query
+        queryNamed
           conn
-          "SELECT iid, position, field, user_row FROM note_users WHERE kind = ?"
-          (Only kind) ::
+          "SELECT iid, position, field, user_row FROM note_users \
+          \ WHERE kind = :kind AND (:iid IS NULL OR iid = :iid)"
+          params ::
           IO [(Int, Int, Text, Int64)]
 
   let usersByIid = groupOn (\(iid, _, _, _) -> iid) userRefs
