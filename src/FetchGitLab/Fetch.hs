@@ -87,8 +87,14 @@ import FetchGitLab.Store.Backend (optionsSpec, specPaths, withStore)
 import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..))
 
 -- | How many requests per second we allow ourselves.
+--
+-- Two was enough to draw gitlab.haskell.org's anti-bot check repeatedly during
+-- a long discussion phase, so this backs off to below it. The check clears on
+-- its own after a few minutes and the requests it refuses are left pending
+-- rather than lost, so tripping it costs time rather than data — but a run
+-- that does not trip it is a run that does not have to make that good.
 requestsPerSecond :: Double
-requestsPerSecond = 2
+requestsPerSecond = 1.5
 
 -- | How many records to ask for in one page.
 --

@@ -235,7 +235,7 @@ the file, and the terminal logger filters for itself on `lmLevel`.
 
 What makes the file useful is that the rate limited manager announces every
 request at trace level, which also makes it a record of what was asked of the
-server. At two requests a second, several seconds of silence means stopped
+server. At 1.5 requests a second, several seconds of silence means stopped
 rather than busy.
 
 The hook is `managerWrapException`, which is not what its name suggests it is
@@ -295,7 +295,7 @@ Two subtleties, both of which the tests pin down:
   operating system, so the test suite also re-runs its own executable as a
   child (`--hold-lock`) to exercise the real cross process lock.
 
-Requests are capped at two per second, enforced in the HTTP manager so
+Requests are capped at 1.5 per second, enforced in the HTTP manager so
 `gitlab-haskell`'s internal pagination and retries are covered too. Discussions
 cost one request per object, so a cold run over a large project takes hours —
 roughly six for `ghc/ghc`. Interrupting it is safe.

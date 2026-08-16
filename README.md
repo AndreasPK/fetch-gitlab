@@ -64,8 +64,10 @@ Files are written to `<file>.tmp` and renamed into place, so an interrupted run
 cannot leave a truncated store behind. A file that fails to parse aborts the
 run rather than being silently overwritten.
 
-Requests are limited to two per second. The limit is enforced in the HTTP
+Requests are limited to 1.5 per second. The limit is enforced in the HTTP
 manager, so pagination and retries inside `gitlab-haskell` are covered too.
+Two per second was enough to draw gitlab.haskell.org's anti-bot check
+repeatedly during a long run, so the default backs off below it.
 
 ## One run at a time
 
@@ -100,7 +102,7 @@ the discussion belongs to, which is what makes that comparison possible.
 
 This is the expensive part: GitLab has no bulk endpoint for notes, so it costs
 one request per object. A cold run over `ghc/ghc` is roughly 43k requests, about
-six hours at two per second. Interrupting is safe — entries are visited newest
+eight hours at 1.5 per second. Interrupting is safe — entries are visited newest
 first and the file is rewritten every 20 objects, so the next run picks up where
 the last left off. An object whose notes fail to fetch is logged and retried on
 the next run rather than aborting.
@@ -262,7 +264,7 @@ down to trace, which is a line per HTTP request:
 2026-08-16 10:12:44 TRACE fetch-gitlab: GET https://gitlab.haskell.org/api/v4/projects/ghc%2Fghc?statistics=true
 ```
 
-Requests are capped at two per second, so lines should arrive about that often.
+Requests are capped at 1.5 per second, so lines should arrive about that often.
 Several seconds of silence means the run has stopped rather than that it is
 working through something large, which is the question the file exists to
 answer. It is appended to rather than truncated, and the access token is sent
@@ -349,7 +351,7 @@ That last point is the real cost of JSON lines here, and it is arithmetic
 rather than a benchmark: the store is rewritten in full every 20 objects, so a
 cold run over `ghc/ghc` writes about 320 GB to end up with 560 MB on disk. At
 254 MB/s of encoding a full-size tickets file takes ~1.4 s to write, against a
-checkpoint every 10 s at two requests per second.
+checkpoint every 13 s at 1.5 requests per second.
 
 ## Building
 
