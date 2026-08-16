@@ -2,8 +2,14 @@ Tool to fetch all issues/mrs from gitlab as json.
 
 ```
 fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
-             [--tickets FILE] [--mrs FILE] [--since WHEN]
-             [--notes | --no-notes] [-v|--verbose]
+             [--backend jsonl|sqlite] [--tickets FILE] [--mrs FILE] [--db FILE]
+             [--since WHEN] [--notes | --no-notes] [-v|--verbose] [--log FILE]
+
+fetch-gitlab --convert --from jsonl|sqlite --to jsonl|sqlite
+             --input-path PATH --output-path PATH [-v|--verbose]
+
+fetch-gitlab --clear-timestamp [--backend jsonl|sqlite] [--db FILE]
+             [--tickets FILE] [--mrs FILE] [-v|--verbose]
 ```
 
 Each line of the output is one record together with its discussion:
@@ -134,10 +140,181 @@ each. Both files are rewritten in full at every checkpoint, and to a `.tmp`
 beside them first, so the peak requirement is twice the size of the larger file
 on top of the rest.
 
-## SQLite
+## Backends
 
-The stores have a schema hiding in them, and [tools/jsonl-to-sqlite.sh](tools/jsonl-to-sqlite.sh)
-makes it explicit:
+`--backend` picks where a run keeps what it fetches. **The default is
+`sqlite`**, a single database at `~/.fetch-gitlab/gitlab.db`. Both backends
+hold the same thing: a store written by one and a store written by the other
+read back equal, which the test suite checks.
+
+```
+fetch-gitlab --token gitlab-token                             # ~/.fetch-gitlab/gitlab.db
+fetch-gitlab --token gitlab-token --db /srv/ghc.db
+fetch-gitlab --token gitlab-token --backend jsonl             # the two .jsonl files
+```
+
+`jsonl` is the older format described above: two files, one JSON object per
+line. `sqlite` differs in two ways that matter.
+
+**It writes only what changed.** A JSON lines store has to be rewritten from
+the top at every checkpoint. Measured, one checkpoint of 20 objects:
+
+| store | jsonl | sqlite |
+| --- | --- | --- |
+| 2 MB | 21 ms | 33 ms |
+| 8 MB | 69 ms | 58 ms |
+| 35 MB | 407 ms | 61 ms |
+| 88 MB | 749 ms | 71 ms |
+
+JSON lines costs more the more you have; SQLite costs the same. A full
+`ghc/ghc` tickets store is ~360 MB, where the JSON lines checkpoint is a couple
+of seconds against a checkpoint every ten.
+
+**It shares repeated objects.** Users are stored once and referred to. In a
+5.6 MB store that is 6,749 references to 176 distinct user objects.
+
+It is not, however, smaller: 5.69 MB against 5.60 MB for the same data. What
+sharing saves, the tables and their indexes spend again. Pick the backend for
+how it writes and what you can ask it, not to save space.
+
+The database is meant to be queried directly:
+
+```sql
+SELECT u.username, count(*) FROM note_users nu
+  JOIN users u ON u.row_id = nu.user_row GROUP BY 1 ORDER BY 2 DESC;
+SELECT iid, title FROM records WHERE kind = 'ticket' AND state = 'opened';
+```
+
+`title` and `state` are `GENERATED ... VIRTUAL` columns over the JSON each row
+already holds, so they cost nothing to store, can be indexed, and cannot drift
+from the record they describe. See
+[Store/Schema.hs](src/FetchGitLab/Store/Schema.hs) for the tables and
+[Store/Class.hs](src/FetchGitLab/Store/Class.hs) for what a backend has to do.
+
+## Converting between backends
+
+`--convert` copies a store from one backend to another and talks to no server,
+so it needs no `--token`:
+
+```
+fetch-gitlab --convert --from jsonl --to sqlite \
+             --input-path ~/.fetch-gitlab --output-path ~/.fetch-gitlab/gitlab.db
+```
+
+`--input-path` and `--output-path` take one path each: the database file for
+`sqlite`, and for `jsonl` the *directory* holding `tickets.jsonl` and
+`mrs.jsonl`. Both ends may name the same backend, which is how a store gets
+copied or rebuilt.
+
+Both stores are locked for the duration, since either may be one a run is
+using. Converting into a store that already holds records stops rather than
+merging into it or writing over it — convert into a new store and move it into
+place.
+
+A store is not changed by the trip: converting to `sqlite` and back gives the
+JSON lines files back byte for byte.
+
+Because the default backend changed, a run that finds JSON lines files where
+its database should be stops and says so, rather than quietly refetching a
+project that is already on disk:
+
+```
+$ fetch-gitlab --token gitlab-token
+ATTENTION There is a JSON lines store at ~/.fetch-gitlab/tickets.jsonl, ~/.fetch-gitlab/mrs.jsonl but no database at ~/.fetch-gitlab/gitlab.db
+ATTENTION The default store is now sqlite, so this run would fetch the project again from the beginning rather than carry on from what is already there.
+ATTENTION To keep it:  fetch-gitlab --convert --from jsonl --to sqlite --input-path ~/.fetch-gitlab --output-path ~/.fetch-gitlab/gitlab.db
+ATTENTION To carry on as before, pass --backend jsonl.
+```
+
+## Watching a run
+
+Records are fetched a page at a time and each page is written before the next
+is asked for, so the terminal reports progress as often as there is progress to
+report:
+
+```
+INFO Fetching tickets: 100 so far, written up to 2026-07-29 10:40:32.908 UTC
+INFO Fetching tickets: 199 so far, written up to 2026-08-11 14:31:09.262 UTC
+INFO Fetched 304 tickets (304 new or changed, 0 already current), store now holds 304
+```
+
+A page is one request and GitLab caps it at a hundred records, so a smaller
+batch would not report anything sooner — it would only take more requests to
+fetch the same collection.
+
+Stopping a run halfway is safe. Pages are asked for oldest change first, so a
+store holding half a collection asks for exactly the other half next time
+rather than starting again or, worse, carrying on past what it missed.
+
+For the detail underneath that, `--log FILE`:
+
+```
+fetch-gitlab --token gitlab-token --log /tmp/fetch.log
+tail -f /tmp/fetch.log
+```
+
+The terminal keeps the level it had, normally info. The file gets everything
+down to trace, which is a line per HTTP request:
+
+```
+2026-08-16 10:12:41 INFO  fetch-gitlab: Fetching tickets updated after 2026-08-13 10:12:41 UTC
+2026-08-16 10:12:41 TRACE fetch-gitlab: GET https://gitlab.haskell.org/api/v4/version
+2026-08-16 10:12:44 TRACE fetch-gitlab: GET https://gitlab.haskell.org/api/v4/projects/ghc%2Fghc?statistics=true
+```
+
+Requests are capped at two per second, so lines should arrive about that often.
+Several seconds of silence means the run has stopped rather than that it is
+working through something large, which is the question the file exists to
+answer. It is appended to rather than truncated, and the access token is sent
+as a header, so it never appears in the logged URLs.
+
+The count is honest: one line per request that is actually made. Each of these
+lines is a request GitLab served, so the file doubles as a record of how much
+was asked of the server.
+
+`-v` puts the same trace lines on the terminal instead.
+
+The executable caps its heap at 1 GB. A run holds one project's records and the
+discussion it is currently fetching, which is tens of megabytes, so anything
+approaching the cap is a leak rather than a large project and a heap overflow
+says so where it happens. Raise it with `fetch-gitlab ... +RTS -M4G -RTS` if a
+project ever genuinely needs more.
+
+## Forcing a refetch
+
+A discussion is only fetched again once its record has moved, which is what
+keeps a run proportional to what changed. It also means a discussion that was
+stored wrong stays wrong: the store believes it is current, so nothing looks
+again. `--clear-timestamp` drops that belief:
+
+```
+fetch-gitlab --clear-timestamp                        # the default store
+fetch-gitlab --clear-timestamp --db /srv/ghc.db
+fetch-gitlab --clear-timestamp --backend jsonl
+```
+
+```
+INFO Cleared the discussion timestamp of 294 of 294 tickets; the next run will fetch 294 discussions
+INFO The tickets themselves are still fetched from 2026-08-16 08:43:52 UTC onwards; to go back further use --since, for example --since "1 year"
+```
+
+The notes themselves are kept, so the store stays usable until each is
+replaced; only the claim that they are up to date is dropped. Running it twice
+does nothing the second time, so it is safe to repeat after an interrupted run.
+It takes the same lock a fetching run does.
+
+It does not move where *records* are fetched from. That is worked out from the
+newest `updated_at` in the store — a property of the records themselves, not a
+timestamp anything could clear — so `--since` is the way to reach further back,
+and the command prints the current starting point and says so.
+
+## Importing without the tool
+
+[tools/jsonl-to-sqlite.sh](tools/jsonl-to-sqlite.sh) does a similar conversion
+with nothing but `sqlite3`. It predates `--convert` and writes a different,
+fully normalised schema — useful for querying a store from a machine without
+this tool, but `--convert` is what to use for a store this tool will fetch into
+again:
 
 ```
 tools/jsonl-to-sqlite.sh [--tickets FILE] [--mrs FILE] [--db FILE] [--force]
@@ -180,6 +357,14 @@ checkpoint every 10 s at two requests per second.
 cabal build
 cabal test
 ```
+
+`cabal.project` builds `gitlab-haskell` from [vendor/gitlab-haskell/](vendor/gitlab-haskell/)
+rather than from Hackage. That is a patched 1.4.0.0 working around three
+upstream bugs, the worst of which silently discarded 79% of a collection and
+reported success; [vendor/gitlab-haskell/PATCHES.md](vendor/gitlab-haskell/PATCHES.md)
+says what was changed and why, and [repro/](repro/) is a standalone reproducer
+for filing them. Delete the directory and the `cabal.project` entry once a
+release carries the fixes.
 
 The test suite checks that real GitLab issues and merge requests survive a
 write/read roundtrip through the JSON lines store; fixtures live in

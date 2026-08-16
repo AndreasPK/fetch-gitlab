@@ -15,13 +15,16 @@ module FetchGitLab.Fetch
   ) where
 
 import Control.Exception (try)
+import Control.Monad (filterM)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.ByteString.Lazy as BL
+import Data.Aeson (Value, object)
 import Data.Default (def)
+import qualified Data.IntSet as IntSet
 import Data.List (partition, sortOn)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isNothing)
+import Data.Maybe (isNothing, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -29,14 +32,14 @@ import qualified Data.Text.IO as T
 import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
 import Network.HTTP.Client (Response, responseStatus)
 import Network.HTTP.Types.Status (statusCode)
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getFileSize)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isPermissionError)
 
-import GitLab (GitLab, runGitLabWithManager)
-import GitLab.API.Issues (IssueFilterAttrs (..), projectIssues)
-import GitLab.API.MergeRequests (MergeProjectAttrs (..), mergeRequestsWith, mrAttrs)
+import GitLab (GitLab, runGitLabWithManager, runGitLabWithManagerUnchecked)
+import GitLab.API.Issues (IssueFilterAttrs (..), projectIssuesPage)
+import GitLab.API.MergeRequests (MergeProjectAttrs (..), mergeRequestsWithPage, mrAttrs)
 import GitLab.API.Notes (issueNotes, mergeRequestNotes)
 import GitLab.API.Projects (projectWithPathAndName)
 import GitLab.Types
@@ -44,28 +47,30 @@ import GitLab.Types
   , GitLabError (..)
   , GitLabServerConfig (..)
   , Note
+  , OrderBy (..)
   , Project
+  , SortBy (..)
   )
 
 import Log
   ( LogLevel (..)
   , LogT
-  , Logger
   , MonadLog
+  , getLoggerIO
   , logAttention_
   , logInfo_
   , logTrace_
   , runLogT
   )
-import Log.Backend.StandardOutput (withStdOutLogger)
 
+import FetchGitLab.Logging (withFetchLogger)
 import FetchGitLab.Lock
   ( LockBusy (..)
   , LockInfo (..)
   , lockPath
   , withStoreLocks
   )
-import FetchGitLab.Options (Options (..), mrsFile, ticketsFile)
+import FetchGitLab.Options (Backend (..), Options (..), dbFile, mrsFile, ticketsFile)
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
 import FetchGitLab.Store
@@ -76,14 +81,23 @@ import FetchGitLab.Store
   , latestUpdate
   , mergeRecords
   , needsDiscussion
-  , readStore
   , setDiscussion
-  , writeStore
   )
+import FetchGitLab.Store.Backend (optionsSpec, specPaths, withStore)
+import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..))
 
 -- | How many requests per second we allow ourselves.
 requestsPerSecond :: Double
 requestsPerSecond = 2
+
+-- | How many records to ask for in one page.
+--
+-- This is the batch the store is written in, so it is also how often a run
+-- reports progress. GitLab caps it at 100 and a page is a single request, so
+-- asking for less would not report anything sooner -- it would only take more
+-- requests to fetch the same collection.
+recordsPerPage :: Int
+recordsPerPage = 100
 
 -- | Read the access token, which lives in a file so it does not have to be
 -- passed on the command line where every process can see it.
@@ -125,16 +139,23 @@ serverConfig opts token =
 -- what it read and writes the whole thing back, so two runs sharing a store
 -- would each drop the other's work; the second one is turned away instead.
 run :: Options -> IO ()
-run opts = withStdOutLogger $ \logger -> do
-  ticketsPath <- ticketsFile opts
-  mrsPath <- mrsFile opts
+run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
+  let runLog :: LogT IO a -> IO a
+      runLog = runLogT "fetch-gitlab" logger level
+  runLog (checkForOldStore opts)
+  spec <- optionsSpec opts
+  let paths = specPaths spec
   -- The default location is under the home directory and will not exist on a
   -- first run. The lock files are created in there, so this comes first.
-  mapM_ (createDirectoryIfMissing True . takeDirectory) [ticketsPath, mrsPath]
-  locked <- withStoreLocks [ticketsPath, mrsPath] (runLog logger (fetch ticketsPath mrsPath))
+  mapM_ (createDirectoryIfMissing True . takeDirectory) paths
+  locked <-
+    withStoreLocks paths . withStore spec $ \(SomeStore store) ->
+      runLog $ do
+        logInfo_ $ "Store: " <> storeName store <> " at " <> storeLocation store
+        fetch store
   case locked of
     Right () -> pure ()
-    Left busy -> runLog logger $ do
+    Left busy -> runLog $ do
       logAttention_ $
         "Another fetch-gitlab is already running against "
           <> T.pack (busyStore busy)
@@ -142,26 +163,23 @@ run opts = withStdOutLogger $ \logger -> do
       logAttention_ $
         "Its lock is held on "
           <> T.pack (lockPath (busyStore busy))
-          <> "; use --tickets/--mrs to work on a separate store"
+          <> "; point --tickets/--mrs/--db at a separate store to work alongside it"
       liftIO exitFailure
   where
-    runLog :: Logger -> LogT IO a -> IO a
-    runLog logger = runLogT "fetch-gitlab" logger logLevel
-
     -- The lock is only reported as held while its owner is alive, so this
     -- names a process that really is running.
     holder busy = case busyHolder busy of
       Nothing -> ""
       Just i -> ": pid " <> tshow (lockPid i) <> ", started " <> tshow (lockStartedAt i)
 
-    fetch :: FilePath -> FilePath -> LogT IO ()
-    fetch ticketsPath mrsPath = do
+    fetch :: StoreBackend b => b -> LogT IO ()
+    fetch store = do
       token <-
         liftIO (readToken (optTokenFile opts))
           >>= either (\err -> abort ("Cannot read the access token: " <> err)) pure
 
-      tickets <- loadStore "tickets" ticketsPath
-      mrs <- loadStore "merge requests" mrsPath
+      tickets <- loadStore "tickets" store
+      mrs <- loadStore "merge requests" store
 
       -- An explicit --since overrides what the stores say.
       override <- liftIO $ traverse resolveNow (optSince opts)
@@ -172,35 +190,53 @@ run opts = withStdOutLogger $ \logger -> do
       logSince "merge requests" mrsSince
 
       limiter <- liftIO $ newRateLimiter requestsPerSecond
-      manager <- liftIO $ rateLimitedManager limiter
+      -- Every request announces itself at trace level. On the terminal that is
+      -- normally filtered out; in a --log file it is what shows a run pausing
+      -- for a slow page rather than having stopped.
+      announce <- requestAnnouncer
+      manager <- liftIO $ rateLimitedManager limiter announce
       let gitlab :: MonadIO m => GitLab b -> m (Either GitLabError b)
-          gitlab = liftIO . runGitLabWithManager manager (serverConfig opts token)
+          gitlab = liftIO . runGitLabWithManagerUnchecked manager (serverConfig opts token)
 
-      result <- gitlab $ do
-        prj <- lookupProject (optProject opts)
-        newTickets <- projectIssues prj (issueFilters ticketsSince)
-        newMrs <- mergeRequestsWith prj (mrFilters mrsSince)
-        pure (prj, newTickets, newMrs)
+      -- The one call that checks the token, so that the thousands to follow do
+      -- not each pay for a second request saying the same thing.
+      prj <-
+        liftIO (runGitLabWithManager manager (serverConfig opts token) (lookupProject (optProject opts)))
+          >>= either (\err -> abort ("GitLab request failed: " <> tshow err)) pure
 
-      case result of
-        Left err -> abort ("GitLab request failed: " <> tshow err)
-        Right (prj, newTickets, newMrs) -> do
-          tickets' <- saveStore "tickets" ticketsPath tickets newTickets
-          mrs' <- saveStore "merge requests" mrsPath mrs newMrs
-          if optNotes opts
-            then do
-              _ <-
-                fetchDiscussions gitlab "tickets" ticketsPath tickets' $
-                  \iid -> issueNotes prj iid Nothing Nothing
-              _ <-
-                fetchDiscussions gitlab "merge requests" mrsPath mrs' $
-                  \iid -> mergeRequestNotes prj iid Nothing Nothing
-              pure ()
-            else logInfo_ "Skipping discussions (--no-notes)"
+      tickets' <- fetchRecords gitlab "tickets" store tickets ticketsSince $ \since ->
+        projectIssuesPage prj (issueFilters since) recordsPerPage
+      mrs' <- fetchRecords gitlab "merge requests" store mrs mrsSince $ \since ->
+        mergeRequestsWithPage prj (mrFilters since) recordsPerPage
 
-    logLevel
+      if optNotes opts
+        then do
+          _ <-
+            fetchDiscussions gitlab "tickets" store tickets' $
+              \iid -> issueNotes prj iid Nothing Nothing
+          _ <-
+            fetchDiscussions gitlab "merge requests" store mrs' $
+              \iid -> mergeRequestNotes prj iid Nothing Nothing
+          pure ()
+        else logInfo_ "Skipping discussions (--no-notes)"
+
+    terminalLevel
       | optVerbose opts = LogTrace
       | otherwise = LogInfo
+
+-- | A callback the HTTP manager can use to report each request it makes.
+--
+-- Trace level, so it is the @--log@ file that carries it rather than the
+-- terminal, unless @-v@ was asked for.
+requestAnnouncer :: MonadLog m => m (Text -> IO ())
+requestAnnouncer = do
+  logIO <- getLoggerIO
+  pure $ \what -> do
+    now <- getCurrentTime
+    logIO now LogTrace what noData
+  where
+    noData :: Value
+    noData = object []
 
 -- | How many entries to fetch discussions for between checkpoints.
 checkpointEvery :: Int
@@ -224,15 +260,15 @@ checkpointEvery = 20
 -- A record whose notes cannot be fetched is logged and left alone, so one bad
 -- object does not abort a long run. It will be retried next time.
 fetchDiscussions ::
-  (Record a, MonadLog m, MonadIO m) =>
+  (Record a, StoreBackend s, MonadLog m, MonadIO m) =>
   (forall b. GitLab b -> m (Either GitLabError b)) ->
   Text ->
-  FilePath ->
+  s ->
   Store a ->
   -- | Fetch the notes of one record, given its iid.
   (Int -> GitLab (Either (Response BL.ByteString) [Note])) ->
   m (Store a)
-fetchDiscussions gitlab what path store fetch = do
+fetchDiscussions gitlab what backend store fetch = do
   if null todo
     then do
       logInfo_ $
@@ -251,9 +287,15 @@ fetchDiscussions gitlab what path store fetch = do
           <> " never fetched, "
           <> tshow (length stale)
           <> " changed since)"
-      final <- go store 0 todo
-      liftIO $ writeStore path final
-      logInfo_ $ "Discussions for " <> tshow total <> " " <> what <> " written to " <> T.pack path
+      (final, pending) <- go store 0 IntSet.empty todo
+      liftIO $ storeSave backend final pending
+      logInfo_ $
+        "Discussions for "
+          <> tshow total
+          <> " "
+          <> what
+          <> " written to "
+          <> storeLocation backend
       pure final
   where
     -- Newest first, and entries GitLab gave no timestamp for last.
@@ -264,14 +306,17 @@ fetchDiscussions gitlab what path store fetch = do
     cached = Map.size store - total
     (missing, stale) = partition (isNothing . entryDiscussion) todo
 
-    go acc _ [] = pure acc
-    go acc done (e : es) = do
+    -- The third argument is the entries touched since the last checkpoint. A
+    -- backend that can write just those is handed them; one that cannot is
+    -- none the worse off.
+    go acc _ pending [] = pure (acc, pending)
+    go acc done pending (e : es) = do
       let iid = recordKey (entryRecord e)
       result <- gitlab (fetch iid)
-      acc' <- case result of
+      (acc', pending') <- case result of
         Left err -> do
           logAttention_ $ "Skipping notes for " <> what <> " " <> tshow iid <> ": " <> tshow err
-          pure acc
+          pure (acc, pending)
         Right (Left response) -> do
           logAttention_ $
             "Skipping notes for "
@@ -280,18 +325,59 @@ fetchDiscussions gitlab what path store fetch = do
               <> tshow iid
               <> ": HTTP "
               <> tshow (statusCode (responseStatus response))
-          pure acc
+          pure (acc, pending)
         Right (Right notes) -> do
           logTrace_ $ tshow (length notes) <> " notes for " <> what <> " " <> tshow iid
-          pure (Map.adjust (setDiscussion notes) iid acc)
+          pure (Map.adjust (setDiscussion notes) iid acc, IntSet.insert iid pending)
       let done' = done + 1
       if done' `mod` checkpointEvery == 0 && not (null es)
         then do
-          liftIO $ writeStore path acc'
+          liftIO $ storeSave backend acc' pending'
           logInfo_ $
             "Discussions: " <> tshow done' <> "/" <> tshow total <> " " <> what <> " (checkpointed)"
-          go acc' done' es
-        else go acc' done' es
+          go acc' done' IntSet.empty es
+        else go acc' done' pending' es
+
+-- | Stop a run that would silently refetch a project someone already has.
+--
+-- The default store used to be the JSON lines files and is now the database.
+-- Someone who upgrades and runs the same command as yesterday would otherwise
+-- start again from nothing: hours of work and tens of thousands of requests to
+-- arrive back where they already were. Only the case where nothing was said
+-- about where to keep things is caught, since anyone naming a store explicitly
+-- has said what they meant.
+checkForOldStore :: Options -> LogT IO ()
+checkForOldStore opts
+  | optBackend opts /= SqliteBackend = pure ()
+  | Just _ <- optDbFile opts = pure ()
+  | otherwise = do
+      db <- liftIO (dbFile opts)
+      started <- liftIO (doesFileExist db)
+      tickets <- liftIO (ticketsFile opts)
+      mrs <- liftIO (mrsFile opts)
+      old <- liftIO (filterM hasContent [tickets, mrs])
+      case (started, old) of
+        (False, kept@(_ : _)) -> do
+          logAttention_ $
+            "There is a JSON lines store at "
+              <> T.intercalate ", " (map T.pack kept)
+              <> " but no database at "
+              <> T.pack db
+          logAttention_
+            "The default store is now sqlite, so this run would fetch the project again \
+            \from the beginning rather than carry on from what is already there."
+          logAttention_ $
+            "To keep it:  fetch-gitlab --convert --from jsonl --to sqlite --input-path "
+              <> T.pack (takeDirectory tickets)
+              <> " --output-path "
+              <> T.pack db
+          logAttention_ "To carry on as before, pass --backend jsonl."
+          liftIO exitFailure
+        _ -> pure ()
+  where
+    hasContent path = do
+      there <- doesFileExist path
+      if there then (> 0) <$> getFileSize path else pure False
 
 -- | Log a reason the run cannot go on, and stop.
 abort :: (MonadLog m, MonadIO m) => Text -> m a
@@ -299,43 +385,120 @@ abort msg = do
   logAttention_ msg
   liftIO exitFailure
 
--- | Read a store, aborting if the existing file cannot be parsed.
-loadStore :: (Record a, MonadLog m, MonadIO m) => Text -> FilePath -> m (Store a)
-loadStore what path = do
-  result <- liftIO $ readStore path
+-- | Read a store, aborting if what is there cannot be parsed.
+loadStore :: (Record a, StoreBackend s, MonadLog m, MonadIO m) => Text -> s -> m (Store a)
+loadStore what backend = do
+  result <- liftIO $ storeLoad backend
   case result of
     Left err -> abort ("Cannot read existing " <> what <> ": " <> T.pack err)
     Right store -> do
-      logInfo_ $ "Read " <> tshow (length store) <> " " <> what <> " from " <> T.pack path
+      logInfo_ $ "Read " <> tshow (length store) <> " " <> what <> " from the store"
       pure store
 
--- | Merge freshly fetched records into a store and write it back out.
+-- | Fetch a collection a page at a time, writing each page to the store before
+-- asking for the next one.
+--
+-- Asking for the whole collection in one call meant minutes with nothing to
+-- show and nothing saved: a run that was paging through twenty thousand issues
+-- looked exactly like one that had wedged, and stopping it threw all of it
+-- away. A page is one request, so writing every page reports progress as often
+-- as there is progress to report, without spending a request to do it.
+--
+-- Pages are anchored on @updated_at@ rather than numbered. Each one asks for
+-- the records updated after the newest we have, oldest first, which is what
+-- makes stopping halfway safe: the next run derives what to ask for from the
+-- newest record in the store, so a store holding the first half of a
+-- collection asks for exactly the second half. Numbered pages would break that
+-- twice over -- the newest records arrive first, so a partial run would leave
+-- a watermark past everything it had not fetched, and a record edited while we
+-- page moves within the collection and shifts a neighbour out of the numbering
+-- unseen.
 --
 -- The count of records we already had at the same @updated_at@ is logged
--- because it says how much of the request was wasted. It is normally small and
+-- because it says how much of the fetch was wasted. It is normally small and
 -- never zero once a store exists: 'fetchSince' deliberately asks from a second
 -- before our newest record, so whatever sits in that second comes back again.
 -- A large count means the timestamp we asked from was further back than it
 -- needed to be.
-saveStore :: (Record a, MonadLog m, MonadIO m) => Text -> FilePath -> Store a -> [a] -> m (Store a)
-saveStore what path old new = do
-  let merged = mergeRecords old new
-      cached = alreadyCurrent old new
-  logInfo_ $
-    "Fetched "
-      <> tshow (length new)
-      <> " "
-      <> what
-      <> " ("
-      <> tshow (length new - cached)
-      <> " new or changed, "
-      <> tshow cached
-      <> " already current), writing "
-      <> tshow (length merged)
-      <> " to "
-      <> T.pack path
-  liftIO $ writeStore path merged
-  pure merged
+fetchRecords ::
+  (Record a, StoreBackend s, MonadLog m, MonadIO m) =>
+  (forall b. GitLab b -> m (Either GitLabError b)) ->
+  Text ->
+  s ->
+  Store a ->
+  -- | Where to start, or 'Nothing' to fetch the whole collection.
+  Maybe UTCTime ->
+  -- | One page of records updated at or after the given time, oldest first.
+  (Maybe UTCTime -> GitLab [a]) ->
+  m (Store a)
+fetchRecords gitlab what backend original start page = go original start IntSet.empty 0
+  where
+    go acc anchor seen cached = do
+      result <- gitlab (page (addUTCTime (-overlap) <$> anchor))
+      records <- either (\err -> abort ("GitLab request failed: " <> tshow err)) pure result
+      let touched = IntSet.fromList (map recordKey records)
+          fresh = filter (not . (`IntSet.member` seen) . recordKey) records
+          seen' = IntSet.union seen touched
+          cached' = cached + alreadyCurrent original fresh
+          acc' = mergeRecords acc records
+          newest = maximumOf (mapMaybe recordUpdatedAt records)
+      liftIO $ storeSave backend acc' touched
+      if length records < recordsPerPage
+        then do
+          let fetched = IntSet.size seen'
+          logInfo_ $
+            "Fetched "
+              <> tshow fetched
+              <> " "
+              <> what
+              <> " ("
+              <> tshow (fetched - cached')
+              <> " new or changed, "
+              <> tshow cached'
+              <> " already current), store now holds "
+              <> tshow (length acc')
+          pure acc'
+        else do
+          logInfo_ $
+            "Fetching "
+              <> what
+              <> ": "
+              <> tshow (IntSet.size seen')
+              <> " so far, written up to "
+              <> maybe "an unknown time" tshow newest
+          case newest of
+            Just t | maybe True (t >) anchor -> go acc' (Just t) seen' cached'
+            -- A whole page of records sharing one instant, so there is no
+            -- later time to ask from. Stepping past it is the only way on;
+            -- anything it skips has an older timestamp than the store's
+            -- newest record and so comes back on the next run.
+            _ -> case anchor of
+              Just t -> do
+                logAttention_ $
+                  "A full page of "
+                    <> what
+                    <> " is stamped "
+                    <> tshow t
+                    <> "; stepping past it, some may be left for the next run"
+                go acc' (Just (addUTCTime (overlap + tick) t)) seen' cached'
+              Nothing -> do
+                logAttention_ $
+                  "GitLab gave no update time for any of the first "
+                    <> tshow recordsPerPage
+                    <> " "
+                    <> what
+                    <> ", so there is nothing to page on; stopping here"
+                pure acc'
+
+    -- GitLab reads @updated_after@ as "at or after", so asking from exactly
+    -- the newest record we hold returns that record again, which is harmless.
+    -- Going back a further millisecond costs one more repeat and covers a
+    -- server that reads it as "after".
+    overlap = 0.001
+    tick = 0.000001
+
+    maximumOf [] = Nothing
+    maximumOf ts = Just (maximum ts)
 
 -- | Timestamp to request updates from, or 'Nothing' to fetch everything.
 --
@@ -350,11 +513,24 @@ fetchSince = fmap (addUTCTime (-1)) . latestUpdate
 resolveNow :: Since -> IO UTCTime
 resolveNow s = flip resolveSince s <$> getCurrentTime
 
+-- | Oldest change first, so that a run stopped halfway leaves a store whose
+-- newest record is exactly where the next one should carry on from. See
+-- 'fetchRecords'.
 issueFilters :: Maybe UTCTime -> IssueFilterAttrs
-issueFilters since = def {issueFilter_updated_after = since}
+issueFilters since =
+  def
+    { issueFilter_updated_after = since
+    , issueFilter_order_by = Just UpdatedAt
+    , issueFilter_sort = Just Ascending
+    }
 
 mrFilters :: Maybe UTCTime -> MergeProjectAttrs
-mrFilters since = mrAttrs {mr_attr_updated_after = since}
+mrFilters since =
+  mrAttrs
+    { mr_attr_updated_after = since
+    , mr_attr_order_by = Just UpdatedAt
+    , mr_attr_sort = Just Ascending
+    }
 
 -- | Look up the project to fetch from, given as @namespace/project@.
 lookupProject :: Text -> GitLab Project

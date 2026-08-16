@@ -41,6 +41,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Proxy (Proxy (..))
+import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 import System.Directory (doesFileExist, renameFile)
 
@@ -59,15 +60,21 @@ class (FromJSON a, ToJSON a) => Record a where
   -- | The JSON field the record itself is stored under.
   recordField :: Proxy a -> Key
 
+  -- | What to call this kind of record where a name is needed rather than a
+  -- JSON key: the @kind@ column of a table, a log line, an error message.
+  recordKind :: Proxy a -> Text
+
 instance Record Issue where
   recordKey = issue_iid
   recordUpdatedAt = issue_updated_at
   recordField _ = "ticket"
+  recordKind _ = "ticket"
 
 instance Record MergeRequest where
   recordKey = merge_request_iid
   recordUpdatedAt = Just . merge_request_updated_at
   recordField _ = "mr"
+  recordKind _ = "mr"
 
 -- | One record together with its discussion.
 data Entry a = Entry

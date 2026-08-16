@@ -5,17 +5,21 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Data.Aeson (FromJSON, ToJSON, Value (..), eitherDecode, toJSON)
+import Control.Exception (try)
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Aeson (FromJSON, ToJSON, Value (..), eitherDecode, encode, object, toJSON, (.=))
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
-import Data.List (isInfixOf)
+import qualified Data.IntSet as IntSet
+import Data.List (isInfixOf, nub)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (..), addUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTime)
-import System.Directory (doesFileExist)
+import Control.Monad (forM_)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs, getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
@@ -24,9 +28,18 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty
 import Test.Tasty.HUnit
 
+import Network.HTTP.Client (HttpException, Response, httpLbs, parseRequest)
+
 import GitLab.Types (Issue (..), MergeRequest, Note (..))
 
+import Log (LogLevel (..), LogT, runLogT)
+import Log.Backend.StandardOutput (withStdOutLogger)
+
+import FetchGitLab.ClearTimestamp (clearTimestamps)
+import FetchGitLab.Convert (convertStores)
 import FetchGitLab.Fetch (readToken)
+import FetchGitLab.Options (Backend (..), parseBackend)
+import FetchGitLab.Store.Backend (StoreSpec (..), pathSpec, specPaths)
 import FetchGitLab.Lock
   ( LockBusy (..)
   , LockInfo (..)
@@ -34,7 +47,7 @@ import FetchGitLab.Lock
   , readLockInfo
   , withStoreLocks
   )
-import FetchGitLab.RateLimit (newRateLimiter, waitTurn)
+import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager, waitTurn)
 import FetchGitLab.Since (Since (..), Unit (..), parseSince, resolveSince)
 import FetchGitLab.Store
   ( Entry (..)
@@ -49,6 +62,16 @@ import FetchGitLab.Store
   , setDiscussion
   , writeStore
   )
+import FetchGitLab.Store.Class (StoreBackend (..), storeSaveAll)
+import FetchGitLab.Store.JsonLines (openJsonLinesStore)
+import FetchGitLab.Store.Schema
+  ( Lifted (..)
+  , noteSpec
+  , recordSpec
+  , spliceObject
+  , splitObject
+  )
+import FetchGitLab.Store.Sqlite (sqliteTableCounts, withSqliteStore)
 
 -- | Normally the test suite, but 'lockExcludesAnotherProcess' re-runs this
 -- executable as its own lock holding child.
@@ -89,6 +112,34 @@ tests =
         , testCase "a changed record does not count as current" changedIsNotCurrent
         ]
     , testGroup
+        "sqlite backend"
+        [ testCase "issues survive a round trip" (sqliteRoundtrips (Proxy :: Proxy Issue) "test/data/issues.jsonl")
+        , testCase "merge requests survive a round trip" (sqliteRoundtrips (Proxy :: Proxy MergeRequest) "test/data/mrs.jsonl")
+        , testCase "an empty store reads back empty" sqliteStartsEmpty
+        , testCase "both backends hold the same thing" backendsAgree
+        , testCase "a checkpoint writes only what changed" sqliteWritesOnlyChanged
+        , testCase "reopening finds what was written" sqliteSurvivesReopen
+        , testCase "repeated users are shared, not copied" sqliteSharesUsers
+        ]
+    , testGroup
+        "convert"
+        [ testCase "jsonl to sqlite and back is the same store" convertRoundtrips
+        , testCase "converting between the same backend copies" convertCopies
+        , testCase "a jsonl store is named by its directory" convertNamesJsonlByDirectory
+        ]
+    , testGroup
+        "clear-timestamp"
+        [ testCase "a cleared store fetches its discussions again" clearForcesRefetch
+        , testCase "the notes themselves are kept" clearKeepsNotes
+        , testCase "clearing twice is the same as clearing once" clearIsIdempotent
+        ]
+    , testGroup
+        "schema"
+        [ testCase "splitting and splicing are inverse" splitSpliceRoundtrips
+        , testCase "an absent field is not invented" splitKeepsAbsence
+        , testCase "--backend is parsed" backendFlagParses
+        ]
+    , testGroup
         "token file"
         [ testCase "a missing token file is reported, not thrown" missingTokenIsReported
         , testCase "an empty token file is reported" emptyTokenIsReported
@@ -97,6 +148,7 @@ tests =
     , testGroup
         "rate limit"
         [ testCase "spaces requests out" rateLimitSpacesRequests
+        , testCase "one turn is taken per request" rateLimitCountsRequestsOnce
         ]
     , testGroup
         "locking"
@@ -292,6 +344,30 @@ rateLimitSpacesRequests = do
     ("expected at least 0.4s, took " <> show elapsed <> "s")
     (elapsed >= 0.4)
 
+-- | A request must announce itself once, not once per time the manager happens
+-- to look at it.
+--
+-- 'managerModifyRequest', the obvious hook and the one this used to use, runs
+-- twice for every request: @responseOpen@ applies it to the request it is
+-- given and then again inside the redirect loop. That charged two turns of the
+-- rate limiter per request, so a limit of two per second delivered one, and
+-- the log claimed twice the traffic we were actually making.
+--
+-- Nothing is listening on the port, which is the point: the hook runs before
+-- the connection is attempted, so a refused connection exercises it exactly as
+-- a served one does and the test needs no server.
+rateLimitCountsRequestsOnce :: Assertion
+rateLimitCountsRequestsOnce = do
+  limiter <- newRateLimiter 1000
+  announced <- newIORef (0 :: Int)
+  manager <- rateLimitedManager limiter (\_ -> modifyIORef' announced (+ 1))
+  request <- parseRequest "http://127.0.0.1:9/nothing-is-listening-here"
+  attempt <- try (httpLbs request manager) :: IO (Either HttpException (Response BL.ByteString))
+  count <- readIORef announced
+  assertEqual ("one announcement per request, connection " <> outcome attempt) 1 count
+  where
+    outcome = either (const "refused") (const "served")
+
 -- | Read GitLab's own JSON for a set of records, write it out as a store, read
 -- it back, and check nothing changed on the way. This is what makes an
 -- incremental run safe: yesterday's file has to decode into the same values we
@@ -461,6 +537,290 @@ changedIsNotCurrent = do
     (issue : rest) -> do
       let touched = issue {issue_updated_at = fmap (addUTCTime 60) (issue_updated_at issue)}
       assertEqual "all but the changed one" (length rest) (alreadyCurrent store (touched : rest))
+
+-- | The claim the SQLite backend has to earn: what comes out is what went in.
+--
+-- Comparing the encoded 'Entry' rather than the record alone covers the
+-- discussion and the timestamp the staleness check depends on, all three of
+-- which travel through separate tables and have to arrive together.
+sqliteRoundtrips :: forall a. Record a => Proxy a -> FilePath -> Assertion
+sqliteRoundtrips _ path = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  records <- decodeFixture path :: IO [a]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  assertBool (path <> " has no records") (not (null records))
+
+  -- Half the entries get a discussion and half do not, so that both the
+  -- has-notes and the never-fetched case are exercised.
+  let bare = mergeRecords Map.empty records
+      store = Map.mapWithKey (\k e -> if even k then setDiscussion notes e else e) bare
+
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeSaveAll db store
+    reread <- storeLoad db :: IO (Either String (Store a))
+    case reread of
+      Left err -> assertFailure ("reading the database back failed: " <> err)
+      Right store' -> do
+        assertEqual "keys" (Map.keys store) (Map.keys store')
+        assertEqual
+          "entries, discussions and timestamps"
+          (map toJSON (Map.elems store))
+          (map toJSON (Map.elems store'))
+        assertBool
+          "nothing needs re-fetching that did not before"
+          (map needsDiscussion (Map.elems store) == map needsDiscussion (Map.elems store'))
+
+sqliteStartsEmpty :: Assertion
+sqliteStartsEmpty = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    loaded <- storeLoad db :: IO (Either String (Store Issue))
+    case loaded of
+      Left err -> assertFailure ("a fresh database should be empty, got: " <> err)
+      Right store -> assertEqual "empty" 0 (Map.size store)
+
+-- | Whichever backend a run used, the next run has to see the same thing.
+backendsAgree :: Assertion
+backendsAgree = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+
+  jsonl <- openJsonLinesStore (dir </> "tickets.jsonl") (dir </> "mrs.jsonl")
+  storeSaveAll jsonl store
+  Right fromJsonl <- storeLoad jsonl :: IO (Either String (Store Issue))
+
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeSaveAll db store
+    Right fromSqlite <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual
+      "the two backends disagree"
+      (map toJSON (Map.elems fromJsonl))
+      (map toJSON (Map.elems fromSqlite))
+
+-- | The reason for the backend at all: a checkpoint must not rewrite the
+-- whole store, and must not lose the part it did not write.
+sqliteWritesOnlyChanged :: Assertion
+sqliteWritesOnlyChanged = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let store = mergeRecords Map.empty issues
+  case Map.keys store of
+    [] -> assertFailure "fixture is empty"
+    (target : others) -> withSqliteStore (dir </> "gitlab.db") $ \db -> do
+      storeSaveAll db store
+
+      -- Attach a discussion to one entry and save only that key.
+      let store' = Map.adjust (setDiscussion notes) target store
+      storeSave db store' (IntSet.singleton target)
+
+      Right reread <- storeLoad db :: IO (Either String (Store Issue))
+      assertEqual "nothing appeared or vanished" (Map.keys store) (Map.keys reread)
+      assertBool
+        "the entry we saved did not gain its discussion"
+        (not (needsDiscussion (reread Map.! target)))
+      assertBool
+        "an entry we did not save was changed"
+        (all (\k -> needsDiscussion (reread Map.! k)) others)
+
+      -- A save that claims nothing changed must leave the store alone, which
+      -- is what makes the changed-key set safe to trust.
+      storeSave db (Map.map (setDiscussion notes) store) IntSet.empty
+      Right settled <- storeLoad db :: IO (Either String (Store Issue))
+      assertEqual
+        "an empty changed set still wrote something"
+        (map toJSON (Map.elems reread))
+        (map toJSON (Map.elems settled))
+
+sqliteSurvivesReopen :: Assertion
+sqliteSurvivesReopen = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let path = dir </> "gitlab.db"
+      store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+  withSqliteStore path (`storeSaveAll` store)
+  withSqliteStore path $ \db -> do
+    Right reread <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual
+      "what a later run reads"
+      (map toJSON (Map.elems store))
+      (map toJSON (Map.elems reread))
+
+-- | Sharing is the point of the schema, so it is worth checking it happens
+-- rather than assuming it: the same author on every note must be one row.
+sqliteSharesUsers :: Assertion
+sqliteSharesUsers = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+      distinct =
+        length . nub . map (encode . toJSON) $
+          concatMap (\e -> maybe [] (map note_author) (entryDiscussion e)) (Map.elems store)
+      references = sum (map (maybe 0 length . entryDiscussion) (Map.elems store))
+  assertBool "fixture does not repeat any user" (references > distinct)
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeSaveAll db store
+    counts <- sqliteTableCounts db
+    let stored = maybe 0 id (lookup "users" counts)
+        refs = maybe 0 id (lookup "note_users" counts)
+    assertBool
+      ( "expected far fewer user rows than references, got "
+          <> show stored
+          <> " rows for "
+          <> show refs
+          <> " note references"
+      )
+      (stored < refs)
+
+-- | The point of the command: a store that thinks its discussions are current
+-- has to stop thinking so.
+clearForcesRefetch :: Assertion
+clearForcesRefetch = withClearedStore $ \before cleared -> do
+  assertBool
+    "the fixture was already stale, so this proves nothing"
+    (not (any needsDiscussion (Map.elems before)))
+  assertBool
+    "clearing left entries still claiming to be current"
+    (all needsDiscussion (Map.elems cleared))
+
+-- | Only the claim that they are current is dropped. Throwing the notes away
+-- would leave the store useless until the refetch finished.
+clearKeepsNotes :: Assertion
+clearKeepsNotes = withClearedStore $ \before cleared -> do
+  assertEqual "entries" (Map.keys before) (Map.keys cleared)
+  assertEqual
+    "the notes changed"
+    (map (fmap (map note_id) . entryDiscussion) (Map.elems before))
+    (map (fmap (map note_id) . entryDiscussion) (Map.elems cleared))
+  assertEqual
+    "the records changed"
+    (map (toJSON . entryRecord) (Map.elems before))
+    (map (toJSON . entryRecord) (Map.elems cleared))
+
+-- | Running it twice must not do anything the second time, so it is safe to
+-- repeat when a run in between was interrupted.
+clearIsIdempotent :: Assertion
+clearIsIdempotent = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeSaveAll db store
+    runNoLog (clearTimestamps db)
+    Right once <- storeLoad db :: IO (Either String (Store Issue))
+    runNoLog (clearTimestamps db)
+    Right twice <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual
+      "the second clearing changed something"
+      (map toJSON (Map.elems once))
+      (map toJSON (Map.elems twice))
+
+-- | A store with current discussions, before and after clearing it.
+withClearedStore :: (Store Issue -> Store Issue -> Assertion) -> Assertion
+withClearedStore check = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeSaveAll db store
+    Right before <- storeLoad db :: IO (Either String (Store Issue))
+    runNoLog (clearTimestamps db)
+    Right cleared <- storeLoad db :: IO (Either String (Store Issue))
+    check before cleared
+
+-- | What @--convert@ does, without the command line around it: a store put
+-- through the other backend and back has to be the store we started with.
+convertRoundtrips :: Assertion
+convertRoundtrips = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  mrs <- decodeFixture "test/data/mrs.jsonl" :: IO [MergeRequest]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let tickets = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+      requests = mergeRecords Map.empty mrs
+
+  createDirectoryIfMissing True (dir </> "src")
+  createDirectoryIfMissing True (dir </> "back")
+  source <- openJsonLinesStore (dir </> "src" </> "tickets.jsonl") (dir </> "src" </> "mrs.jsonl")
+  storeSaveAll source tickets
+  storeSaveAll source requests
+
+  withSqliteStore (dir </> "out.db") $ \db -> runNoLog (convertStores source db)
+  back <- openJsonLinesStore (dir </> "back" </> "tickets.jsonl") (dir </> "back" </> "mrs.jsonl")
+  withSqliteStore (dir </> "out.db") $ \db -> runNoLog (convertStores db back)
+
+  -- The files themselves, not just what they decode to: a conversion that
+  -- reordered or re-encoded anything would show up here.
+  forM_ ["tickets.jsonl", "mrs.jsonl"] $ \name -> do
+    before <- BL.readFile (dir </> "src" </> name)
+    afterwards <- BL.readFile (dir </> "back" </> name)
+    assertEqual (name <> " changed on the way through sqlite") before afterwards
+
+-- | Both ends being the same backend is allowed, and is how a store gets
+-- copied or rebuilt.
+convertCopies :: Assertion
+convertCopies = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  let store = mergeRecords Map.empty issues
+  withSqliteStore (dir </> "a.db") $ \a -> do
+    storeSaveAll a store
+    withSqliteStore (dir </> "b.db") $ \b -> do
+      runNoLog (convertStores a b)
+      Right copied <- storeLoad b :: IO (Either String (Store Issue))
+      assertEqual
+        "the copy differs"
+        (map toJSON (Map.elems store))
+        (map toJSON (Map.elems copied))
+
+-- | @--input-path@ and @--output-path@ take one path, so a JSON lines store is
+-- named by the directory its two files sit in.
+convertNamesJsonlByDirectory :: Assertion
+convertNamesJsonlByDirectory = do
+  pathSpec JsonLinesBackend "/tmp/store"
+    @?= JsonLinesSpec "/tmp/store/tickets.jsonl" "/tmp/store/mrs.jsonl"
+  pathSpec SqliteBackend "/tmp/gitlab.db" @?= SqliteSpec "/tmp/gitlab.db"
+  specPaths (pathSpec SqliteBackend "/tmp/gitlab.db") @?= ["/tmp/gitlab.db"]
+
+-- | Conversions log, and the tests do not care what they say.
+runNoLog :: LogT IO a -> IO a
+runNoLog act = withStdOutLogger $ \logger -> runLogT "test" logger LogAttention act
+
+-- | 'splitObject' takes shared objects out and 'spliceObject' puts them back;
+-- if that is not exact then nothing else about the backend matters.
+splitSpliceRoundtrips :: Assertion
+splitSpliceRoundtrips = do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  mrs <- decodeFixture "test/data/mrs.jsonl" :: IO [MergeRequest]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  mapM_ (check recordSpec . toJSON) issues
+  mapM_ (check recordSpec . toJSON) mrs
+  mapM_ (check noteSpec . toJSON) notes
+  where
+    check spec v =
+      let (rest, lifted) = splitObject spec v
+       in assertEqual "splicing did not restore the value" v (spliceObject spec lifted rest)
+
+-- | A field that was not there must not come back, and an empty list must not
+-- become an absent one: both decide whether a discussion is refetched.
+splitKeepsAbsence :: Assertion
+splitKeepsAbsence = do
+  let withEmpty = object ["iid" .= (1 :: Int), "assignees" .= ([] :: [Value]), "labels" .= ([] :: [Value])]
+      without = object ["iid" .= (1 :: Int)]
+  mapM_ (check recordSpec) [withEmpty, without]
+  assertBool
+    "an empty list should still be lifted"
+    (liftedKeys (snd (splitObject recordSpec withEmpty)) /= [])
+  assertEqual
+    "an absent field should lift nothing"
+    []
+    (liftedKeys (snd (splitObject recordSpec without)))
+  where
+    check spec v =
+      let (rest, lifted) = splitObject spec v
+       in assertEqual "splicing changed the value" v (spliceObject spec lifted rest)
+
+backendFlagParses :: Assertion
+backendFlagParses = do
+  parseBackend "jsonl" @?= Right JsonLinesBackend
+  parseBackend "sqlite" @?= Right SqliteBackend
+  assertBool "nonsense is rejected" (either (const True) (const False) (parseBackend "postgres"))
 
 -- | A mistyped @--token@ path has to come back as something we can log, not as
 -- an exception out of the middle of a run.
