@@ -1,0 +1,11 @@
+{
+  "created_at": "2026-01-22T09:28:55Z",
+  "updated_at": "2026-01-22T10:50:25Z",
+  "event_name": "group_rename",
+  "name": "proj-name",
+  "path": "proj-path",
+  "full_path": "full-path",
+  "group_id": 12345,
+  "old_path": "the-old-path",
+  "old_full_path": "the-new-path"
+}

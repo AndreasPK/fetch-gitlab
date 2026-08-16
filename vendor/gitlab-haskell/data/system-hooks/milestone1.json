@@ -1,0 +1,36 @@
+{
+  "object_kind": "milestone",
+  "event_type": "milestone",
+  "project": {
+    "id": 48355,
+    "name": "proj name",
+    "description": null,
+    "web_url": "https://example.com/group1/proj-name",
+    "avatar_url": null,
+    "git_ssh_url": "git@example.com:group1/proj-name.git",
+    "git_http_url": "https://example.com/group1/proj-name.git",
+    "namespace": "project namespace",
+    "visibility_level": 0,
+    "path_with_namespace": "group1/proj-name",
+    "default_branch": "main",
+    "ci_config_path": "",
+    "homepage": "https://example.com/group1/proj-name",
+    "url": "git@example.com:group1/proj-name.git",
+    "ssh_url": "git@example.com:group1/proj-name.git",
+    "http_url": "https://example.com/group1/proj-name.git"
+  },
+  "group": null,
+  "object_attributes": {
+    "id": 115,
+    "iid": 1,
+    "title": "Milestone title",
+    "description": "Milestone description",
+    "state": "active",
+    "created_at": "2026-02-12 12:35:59 UTC",
+    "updated_at": "2026-02-12 12:35:59 UTC",
+    "due_date": "2026-02-23",
+    "start_date": "2026-01-26",
+    "project_id": 48355
+  },
+  "action": "create"
+}

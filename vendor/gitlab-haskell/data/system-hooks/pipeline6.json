@@ -1,0 +1,178 @@
+{
+  "object_kind": "pipeline",
+  "object_attributes": {
+    "id": 74974,
+    "iid": 1,
+    "name": null,
+    "ref": "main",
+    "tag": false,
+    "sha": "abc1",
+    "before_sha": "aaa1",
+    "source": "push",
+    "status": "pending",
+    "detailed_status": "pending",
+    "stages": [
+      "build",
+      "test",
+      "deploy"
+    ],
+    "created_at": "2026-02-07 02:47:56 UTC",
+    "finished_at": null,
+    "duration": null,
+    "queued_duration": null,
+    "protected_ref": true,
+    "variables": [],
+    "url": "https://example.com/joe1/proj1/-/pipelines/74974"
+  },
+  "merge_request": null,
+  "user": {
+    "id": 414,
+    "name": "Joe Bloggs",
+    "username": "joe1",
+    "avatar_url": "https://secure.gravatar.com/avatar/aaa1?s=80&d=identicon",
+    "email": "[REDACTED]"
+  },
+  "project": {
+    "id": 47461,
+    "name": "proj1",
+    "description": null,
+    "web_url": "https://example.com/joe1/proj1",
+    "avatar_url": null,
+    "git_ssh_url": "git@example.com:joe1/proj1.git",
+    "git_http_url": "https://example.com/joe1/proj1.git",
+    "namespace": "Joe Bloggs",
+    "visibility_level": 0,
+    "path_with_namespace": "joe1/proj1",
+    "default_branch": "main",
+    "ci_config_path": ""
+  },
+  "commit": {
+    "id": "abc1",
+    "message": "commit message",
+    "title": "commit message",
+    "timestamp": "2026-02-07T02:47:55+00:00",
+    "url": "https://example.com/joe1/proj1/-/commit/abc1",
+    "author": {
+      "name": "Joe Bloggs",
+      "email": "joe1@example.com"
+    }
+  },
+  "builds": [
+    {
+      "id": 103996,
+      "stage": "build",
+      "name": "build-job",
+      "status": "pending",
+      "created_at": "2026-02-07 02:47:56 UTC",
+      "started_at": null,
+      "finished_at": null,
+      "duration": null,
+      "queued_duration": 0.486474635,
+      "failure_reason": null,
+      "when": "on_success",
+      "manual": false,
+      "allow_failure": false,
+      "user": {
+        "id": 414,
+        "name": "Joe Bloggs",
+        "username": "joe1",
+        "avatar_url": "https://secure.gravatar.com/avatar/aaa1?s=80&d=identicon",
+        "email": "[REDACTED]"
+      },
+      "runner": null,
+      "artifacts_file": {
+        "filename": null,
+        "size": null
+      },
+      "environment": null
+    },
+    {
+      "id": 103997,
+      "stage": "test",
+      "name": "test",
+      "status": "created",
+      "created_at": "2026-02-07 02:47:56 UTC",
+      "started_at": null,
+      "finished_at": null,
+      "duration": null,
+      "queued_duration": null,
+      "failure_reason": null,
+      "when": "on_success",
+      "manual": false,
+      "allow_failure": false,
+      "user": {
+        "id": 414,
+        "name": "Joe Bloggs",
+        "username": "joe1",
+        "avatar_url": "https://secure.gravatar.com/avatar/aaa1?s=80&d=identicon",
+        "email": "[REDACTED]"
+      },
+      "runner": null,
+      "artifacts_file": {
+        "filename": null,
+        "size": null
+      },
+      "environment": null
+    },
+    {
+      "id": 103998,
+      "stage": "test",
+      "name": "test job",
+      "status": "created",
+      "created_at": "2026-02-07 02:47:56 UTC",
+      "started_at": null,
+      "finished_at": null,
+      "duration": null,
+      "queued_duration": null,
+      "failure_reason": null,
+      "when": "on_success",
+      "manual": false,
+      "allow_failure": false,
+      "user": {
+        "id": 414,
+        "name": "Joe Bloggs",
+        "username": "joe1",
+        "avatar_url": "https://secure.gravatar.com/avatar/aaa1?s=80&d=identicon",
+        "email": "[REDACTED]"
+      },
+      "runner": null,
+      "artifacts_file": {
+        "filename": null,
+        "size": null
+      },
+      "environment": null
+    },
+    {
+      "id": 103999,
+      "stage": "deploy",
+      "name": "deploy-job",
+      "status": "created",
+      "created_at": "2026-02-07 02:47:56 UTC",
+      "started_at": null,
+      "finished_at": null,
+      "duration": null,
+      "queued_duration": null,
+      "failure_reason": null,
+      "when": "on_success",
+      "manual": false,
+      "allow_failure": false,
+      "user": {
+        "id": 414,
+        "name": "Joe Bloggs",
+        "username": "joe1",
+        "avatar_url": "https://secure.gravatar.com/avatar/aaa1?s=80&d=identicon",
+        "email": "[REDACTED]"
+      },
+      "runner": null,
+      "artifacts_file": {
+        "filename": null,
+        "size": null
+      },
+      "environment": {
+        "name": "production",
+        "action": "start",
+        "deployment_tier": "production"
+      }
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "object_kind": "access_token",
+  "project": {
+    "id": 28294,
+    "name": "proj-name",
+    "description": null,
+    "web_url": "https://example.com/aaa1/proj-name",
+    "avatar_url": null,
+    "git_ssh_url": "git@example.com:aaa1/proj-name.git",
+    "git_http_url": "https://example.com/aaa1/proj-name.git",
+    "namespace": "Joe Bloggs",
+    "visibility_level": 0,
+    "path_with_namespace": "aaa1/proj-name",
+    "default_branch": "main",
+    "ci_config_path": null,
+    "homepage": "https://example.com/aaa1/proj-name",
+    "url": "git@example.com:aaa1/proj-name.git",
+    "ssh_url": "git@example.com:aaa1/proj-name.git",
+    "http_url": "https://example.com/aaa1/proj-name.git"
+  },
+  "object_attributes": {
+    "user_id": 3401,
+    "created_at": "2024-11-25 08:12:01 UTC",
+    "id": 1470,
+    "name": "aaa1",
+    "expires_at": "2025-11-25"
+  },
+  "event_name": "expiring_access_token",
+  "interval": "seven_days"
+}

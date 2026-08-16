@@ -1,0 +1,106 @@
+{
+  "object_kind": "emoji",
+  "event_type": "award",
+  "user": {
+    "id": 3892,
+    "name": "Bloggs, Joe",
+    "username": "abc1",
+    "avatar_url": "https://secure.gravatar.com/avatar/abc",
+    "email": "[REDACTED]"
+  },
+  "project_id": 44159,
+  "project": {
+    "id": 44159,
+    "name": "proj_name ",
+    "description": "",
+    "web_url": "https://example.com/abc1/proj_name",
+    "avatar_url": null,
+    "git_ssh_url": "git@example.com:abc1/proj_name.git",
+    "git_http_url": "https://example.com/abc1/proj_name.git",
+    "namespace": "Bloggs, Joe",
+    "visibility_level": 0,
+    "path_with_namespace": "abc1/proj_name",
+    "default_branch": "main",
+    "ci_config_path": "",
+    "homepage": "https://example.com/abc1/proj_name",
+    "url": "git@example.com:abc1/proj_name.git",
+    "ssh_url": "git@example.com:abc1/proj_name.git",
+    "http_url": "https://example.com/abc1/proj_name.git"
+  },
+  "object_attributes": {
+    "user_id": 3892,
+    "created_at": "2025-11-07 19:21:17 UTC",
+    "id": 107,
+    "name": "thumbsup",
+    "awardable_type": "Note",
+    "awardable_id": 26062,
+    "updated_at": "2025-11-07 19:21:17 UTC",
+    "awarded_on_url": "https://example.com/abc1/proj_name/-/commit/abc1234567889#note_26062"
+  },
+  "note": {
+    "author_id": 1424,
+    "change_position": {
+      "base_sha": null,
+      "start_sha": null,
+      "head_sha": null,
+      "old_path": null,
+      "new_path": null,
+      "position_type": "text",
+      "old_line": null,
+      "new_line": null,
+      "line_range": null
+    },
+    "commit_id": "abc1234567889",
+    "created_at": "2025-11-07 19:19:58 UTC",
+    "discussion_id": "1a5f45c5c3272a75442dfe28eb49a6272e3c5f6d",
+    "id": 26062,
+    "line_code": "4b6fcb2d521ef0fd442a5301e7932d16cc9f375a_0_1",
+    "note": "@abc1 This is a function",
+    "noteable_id": null,
+    "noteable_type": "Commit",
+    "original_position": {
+      "base_sha": "abcde123456789",
+      "start_sha": "abcde123456789",
+      "head_sha": "abc1234567889",
+      "old_path": "test.txt",
+      "new_path": "test.txt",
+      "position_type": "text",
+      "old_line": null,
+      "new_line": 1,
+      "line_range": null
+    },
+    "position": {
+      "base_sha": "abcde123456789",
+      "start_sha": "abcde123456789",
+      "head_sha": "abc1234567889",
+      "old_path": "test.txt",
+      "new_path": "test.txt",
+      "position_type": "text",
+      "old_line": null,
+      "new_line": 1,
+      "line_range": null
+    },
+    "project_id": 44159,
+    "resolved_at": null,
+    "resolved_by_id": null,
+    "resolved_by_push": null,
+    "st_diff": null,
+    "system": false,
+    "type": "DiffNote",
+    "updated_at": "2025-11-07 19:21:17 UTC",
+    "updated_by_id": null,
+    "description": "@abc1 This is a note.",
+    "url": "https://example.com/abc1/proj_name/-/commit/abc1234567889#note_26062"
+  },
+  "commit": {
+    "id": "abc1234567889",
+    "message": "this is a message",
+    "title": "The title",
+    "timestamp": "2025-11-07T19:00:05+00:00",
+    "url": "https://example.com/abc1/proj_name/-/commit/abc1234567889",
+    "author": {
+      "name": "Bloggs, Joe",
+      "email": "abc1@example.com"
+    }
+  }
+}

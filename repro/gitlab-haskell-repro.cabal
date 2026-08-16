@@ -1,0 +1,24 @@
+cabal-version:      3.0
+name:               gitlab-haskell-repro
+version:            0.1.0.0
+synopsis:
+  Reproducer: gitlab-haskell fails on MRs with null source_project_id
+  and reports decode failures as successes
+
+build-type:         Simple
+
+executable repro
+  main-is:          Main.hs
+  hs-source-dirs:   .
+  default-language: GHC2021
+  ghc-options:      -Wall
+  build-depends:
+      base                  >=4.14 && <5
+    , aeson                 >=2
+    , bytestring
+    , data-default
+    , gitlab-haskell        ==1.4.0.0
+    , http-conduit
+    , http-types
+    , text
+    , time

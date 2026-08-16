@@ -1,0 +1,42 @@
+{
+  "object_kind": "deployment",
+  "status": "running",
+  "status_changed_at": "2026-03-16 03:09:32 +0000",
+  "deployment_id": 56,
+  "deployable_id": 106120,
+  "deployable_url": "https://example.com/joe1/proj-name/-/jobs/106120",
+  "environment": "production",
+  "environment_tier": "production",
+  "environment_slug": "production",
+  "environment_external_url": null,
+  "project": {
+    "id": 47800,
+    "name": "proj-name",
+    "description": null,
+    "web_url": "https://example.com/joe1/proj-name",
+    "avatar_url": null,
+    "git_ssh_url": "git@example.com:joe1/proj-name.git",
+    "git_http_url": "https://example.com/joe1/proj-name.git",
+    "namespace": "Joe Bloggs",
+    "visibility_level": 0,
+    "path_with_namespace": "joe1/proj-name",
+    "default_branch": "main",
+    "ci_config_path": "",
+    "homepage": "https://example.com/joe1/proj-name",
+    "url": "git@example.com:joe1/proj-name.git",
+    "ssh_url": "git@example.com:joe1/proj-name.git",
+    "http_url": "https://example.com/joe1/proj-name.git"
+  },
+  "short_sha": "abc1",
+  "user": {
+    "id": 414,
+    "name": "Joe Bloggs",
+    "username": "joe1",
+    "avatar_url": "https://secure.gravatar.com/avatar/abc1?s=80&d=identicon",
+    "email": "[REDACTED]"
+  },
+  "user_url": "https://example.com/joe1",
+  "commit_url": "https://example.com/joe1/proj-name/-/commit/abc1",
+  "commit_title": "Commit title",
+  "ref": "main"
+}
