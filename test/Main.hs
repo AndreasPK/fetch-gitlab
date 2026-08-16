@@ -11,7 +11,7 @@ import Data.Aeson (FromJSON, ToJSON, Value (..), eitherDecode, encode, object, t
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.IntSet as IntSet
-import Data.List (isInfixOf, nub)
+import Data.List (isInfixOf, nub, sort)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
@@ -184,6 +184,7 @@ tests =
         , testCase "a record is looked up without reading the store" lookupFindsOneRecord
         , testCase "a key the store does not hold is not an error" lookupMissesCleanly
         , testCase "--full is what prints the notes" fullTogglesNotes
+        , testCase "the discussion reads oldest first" notesAreChronological
         , testCase "a record with no discussion says so" showsWhenNothingWasFetched
         , testCase "a merge request prints its branches" showsMergeRequestBranches
         , testCase "the newest store in a directory is the one found" detectsNewestStore
@@ -1098,6 +1099,35 @@ fullTogglesNotes = do
         assertBool
           "the record was not named"
           (T.pack ("#" <> show (issue_iid issue)) `T.isInfixOf` rendered)
+
+-- | A store keeps the order GitLab returned a discussion in, which is newest
+-- first. A conversation reads the other way, so the printing sorts it.
+notesAreChronological :: Assertion
+notesAreChronological = do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  case issues of
+    [] -> assertFailure "fixture is empty"
+    (issue : _) -> do
+      let stored = map note_created_at notes
+          rendered = renderIssue True (setDiscussion notes (newEntry issue))
+          -- Where each note's body turned up in the output, in stored order.
+          positions =
+            [ T.length prefix
+            | n <- notes
+            , let (prefix, _) = T.breakOn (maybe "" T.strip (note_body n)) rendered
+            ]
+      assertBool
+        "the fixture is already in order, so this proves nothing"
+        (stored /= sort stored)
+      assertEqual
+        "every note was printed once"
+        (length notes)
+        (length (nub positions))
+      assertEqual
+        "the notes were printed in some order other than oldest first"
+        (map snd (sort (zip stored positions)))
+        (sort positions)
 
 -- | An entry whose discussion was never fetched must not read as one that has
 -- none: a run that has not got there yet and a ticket nobody replied to look

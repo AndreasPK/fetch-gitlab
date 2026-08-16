@@ -392,9 +392,10 @@ GHC doesn't generate static closures when some field is an unpacked sum.
 Quote the `#`, or an interactive shell will treat the rest of the line as a
 comment and the tool will never see it. A bare number is read as a ticket for
 the same reason, so `show-gl-ghc show 25166` works too. `--full` adds the
-discussion, one block per note; a field the store has nothing for is left out
-rather than printed empty, and a discussion that was never fetched says so
-instead of reading as a record nobody replied to.
+discussion, one block per note and oldest first — a store keeps the order
+GitLab returned, which is newest first. A field the store has nothing for is
+left out rather than printed empty, and a discussion that was never fetched
+says so instead of reading as a record nobody replied to.
 
 `--store` takes the *directory* holding the store, not a file, and the most
 recently written store in it is the one read: the newest of the `*.db` files

@@ -23,6 +23,7 @@ module FetchGitLab.Show
   ) where
 
 import Data.Char (isDigit)
+import Data.List (sortOn)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -244,8 +245,10 @@ layout full ref title fields description discussion =
           <> " notes"
           <> if full then "" else " (--full to show them)"
 
+    -- Oldest first, which is how a conversation reads. The store keeps the
+    -- order GitLab returned them in, which is newest first.
     notes = case (full, discussion) of
-      (True, Notes ns) -> concat (zipWith (note (length ns)) [1 ..] ns)
+      (True, Notes ns) -> concat (zipWith (note (length ns)) [1 ..] (sortOn note_created_at ns))
       _ -> []
 
 note :: Int -> Int -> Note -> [Text]
