@@ -47,6 +47,21 @@ class StoreBackend b where
   -- saves, so a key that is absent has not been deleted, it was never there.
   storeSave :: Record a => b -> Store a -> IntSet -> IO ()
 
+  -- | The same as 'storeLoad', but without reading the notes.
+  --
+  -- Entries whose discussion is in the store come back as 'Kept', which writes
+  -- back as "leave what is there alone". A fetch uses this: notes are three
+  -- quarters of a store and it needs none of their content, only whether a
+  -- discussion is there and what record version it belongs to. Anything that
+  -- has to copy the notes -- @--convert@ -- must use 'storeLoad' instead.
+  --
+  -- The default reads them, for a backend that cannot do better. That is
+  -- honest rather than merely convenient: 'Kept' promises the notes are safe
+  -- in the store, so a backend that would rewrite the whole thing from what is
+  -- in memory must not claim it.
+  storeLoadWithoutNotes :: Record a => b -> IO (Either String (Store a))
+  storeLoadWithoutNotes = storeLoad
+
 -- | A backend chosen at run time, once the command line has been read.
 data SomeStore = forall b. StoreBackend b => SomeStore b
 

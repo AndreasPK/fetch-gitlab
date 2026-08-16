@@ -52,9 +52,11 @@ import FetchGitLab.Lock
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager, waitTurn)
 import FetchGitLab.Since (Since (..), Unit (..), parseSince, resolveSince)
 import FetchGitLab.Store
-  ( Entry (..)
+  ( Discussion (..)
+  , Entry (..)
   , Record (..)
   , Store
+  , discussionNotes
   , alreadyCurrent
   , latestUpdate
   , mergeRecords
@@ -122,6 +124,8 @@ tests =
         , testCase "a checkpoint writes only what changed" sqliteWritesOnlyChanged
         , testCase "reopening finds what was written" sqliteSurvivesReopen
         , testCase "repeated users are shared, not copied" sqliteSharesUsers
+        , testCase "a load without notes still knows what is stale" loadWithoutNotesKnowsStaleness
+        , testCase "rewriting an unloaded entry keeps its notes" keptNotesSurviveRewrite
         ]
     , testGroup
         "convert"
@@ -376,6 +380,56 @@ rateLimitCountsRequestsOnce = do
   where
     outcome = either (const "refused") (const "served")
 
+-- | A fetch loads without note bodies, but has to make exactly the same
+-- decisions about what to fetch as it would with them.
+loadWithoutNotesKnowsStaleness :: Assertion
+loadWithoutNotesKnowsStaleness = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let path = dir </> "gitlab.db"
+      -- One entry with a discussion, one without.
+      full = mergeRecords Map.empty issues
+      store = case Map.keys full of
+        (k : _) -> Map.adjust (setDiscussion notes) k full
+        [] -> full
+  withSqliteStore path (`storeSaveAll` store)
+  withSqliteStore path $ \db -> do
+    Right light <- storeLoadWithoutNotes db :: IO (Either String (Store Issue))
+    Right heavy <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual
+      "which entries a run would ask GitLab about"
+      (Map.map needsDiscussion heavy)
+      (Map.map needsDiscussion light)
+    assertEqual
+      "the notes were not read"
+      (replicate (Map.size light) Nothing)
+      (map (discussionNotes . entryDiscussion) (Map.elems light))
+
+-- | The hole this could have left: an entry loaded without its notes still
+-- gets written back whenever its record changes, and writing a record
+-- replaces everything hanging off it. If that took the absent notes literally
+-- it would delete a discussion that was never in memory to be written back.
+keptNotesSurviveRewrite :: Assertion
+keptNotesSurviveRewrite = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  let path = dir </> "gitlab.db"
+      store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
+  withSqliteStore path (`storeSaveAll` store)
+
+  -- What a run does: load without notes, then write the entries back because
+  -- their records were refetched.
+  withSqliteStore path $ \db -> do
+    Right light <- storeLoadWithoutNotes db :: IO (Either String (Store Issue))
+    storeSaveAll db (light :: Store Issue)
+
+  withSqliteStore path $ \db -> do
+    Right reread <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual
+      "the discussions survived being written back without being loaded"
+      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store))
+      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems reread))
+
 -- | An anti-bot challenge is transient, so it is waited out rather than
 -- failed on. The waits are passed in so the test does not have to sit through
 -- the real ladder.
@@ -482,8 +536,8 @@ discussionRoundtrips = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
     (map toJSON (Map.elems store'))
   assertEqual
     "notes came back"
-    (map (fmap (map note_id) . entryDiscussion) (Map.elems store))
-    (map (fmap (map note_id) . entryDiscussion) (Map.elems store'))
+    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store))
+    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store'))
   assertBool
     "nothing needs re-fetching"
     (not (any needsDiscussion (Map.elems store')))
@@ -509,8 +563,8 @@ mergeKeepsDiscussion = do
   assertEqual "same entries" (Map.keys withNotes) (Map.keys merged)
   assertEqual
     "discussions survived"
-    (map (fmap length . entryDiscussion) (Map.elems withNotes))
-    (map (fmap length . entryDiscussion) (Map.elems merged))
+    (map (fmap length . discussionNotes . entryDiscussion) (Map.elems withNotes))
+    (map (fmap length . discussionNotes . entryDiscussion) (Map.elems merged))
   assertBool "and are still current" (not (any needsDiscussion (Map.elems merged)))
 
 -- | If the record changed after we fetched its discussion, we have to look
@@ -713,8 +767,8 @@ sqliteSharesUsers = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
       distinct =
         length . nub . map (encode . toJSON) $
-          concatMap (\e -> maybe [] (map note_author) (entryDiscussion e)) (Map.elems store)
-      references = sum (map (maybe 0 length . entryDiscussion) (Map.elems store))
+          concatMap (\e -> maybe [] (map note_author) (discussionNotes (entryDiscussion e))) (Map.elems store)
+      references = sum (map (maybe 0 length . discussionNotes . entryDiscussion) (Map.elems store))
   assertBool "fixture does not repeat any user" (references > distinct)
   withSqliteStore (dir </> "gitlab.db") $ \db -> do
     storeSaveAll db store
@@ -748,8 +802,8 @@ clearKeepsNotes = withClearedStore $ \before cleared -> do
   assertEqual "entries" (Map.keys before) (Map.keys cleared)
   assertEqual
     "the notes changed"
-    (map (fmap (map note_id) . entryDiscussion) (Map.elems before))
-    (map (fmap (map note_id) . entryDiscussion) (Map.elems cleared))
+    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems before))
+    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems cleared))
   assertEqual
     "the records changed"
     (map (toJSON . entryRecord) (Map.elems before))

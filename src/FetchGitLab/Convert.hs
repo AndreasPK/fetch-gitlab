@@ -89,6 +89,10 @@ convertStores from to = do
   where
     copy :: forall a m'. (Record a, MonadLog m', MonadIO m') => Text -> Proxy a -> m' ()
     copy what _ = do
+      -- Unlike a fetch, this has to carry the notes across, so it reads them
+      -- and holds a whole kind at once. That is the memory ceiling on
+      -- --convert, and for a store holding a large project's full history it
+      -- is a real one: see README.
       loaded <- liftIO (storeLoad from :: IO (Either String (Store a)))
       case loaded of
         Left err -> abort ("Cannot read " <> what <> " from the source store: " <> T.pack err)

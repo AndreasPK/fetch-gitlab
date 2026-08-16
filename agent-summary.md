@@ -108,6 +108,38 @@ this run. A full page all stamped with one instant would leave nothing later to
 anchor on; that steps past and logs at attention, and the records it skips are
 older than the store's watermark so the next run collects them.
 
+## What a run keeps in memory
+
+`storeLoadWithoutNotes` is what keeps a run's memory proportional to a
+project's record count rather than to its entire history of discussion. Notes
+are three quarters of a store and a fetch needs none of their content: it
+decides what to ask for from `entryDiscussionFor` against the record's
+`updated_at`, and writes what it fetches straight out.
+
+`Discussion` has three cases rather than `Maybe [Note]`. `Kept` means "there is
+a discussion in the store and it was deliberately not read in", which is the
+case that makes this safe: `writeEntry` skips the note delete-and-reinsert for
+a `Kept` entry, so an entry whose record changed can be written back without
+taking absent notes literally and deleting the discussion. `discussionNotes`
+deliberately maps `Kept` to `Nothing` rather than to `[]`, since "not here" and
+"there are none" differ by exactly one silently deleted discussion. There is a
+test for this that fails loudly if the guard is removed.
+
+The discussion loop applies `forgetWritten` after every checkpoint, dropping
+the notes of the entries the store was just told to write. Without it a run
+re-accumulates the whole thing in memory as it goes, which is the same ceiling
+by a different route.
+
+Measured on a 17,052 record store with 229k notes, loading it for a fetch: 301
+MB live and 813 MiB peak heap before, 155 MB and 340 MiB after. Projected to
+`ghc/ghc`'s full history (~42.8k records) that is ~2 GB against ~850 MiB, which
+is the difference between overflowing the 1 GB cap and fitting under it.
+
+`--convert` still loads notes, because copying a store means carrying them
+across. That is the one path whose memory tracks the store rather than the
+record count, and it will not convert a full-history store under the default
+cap.
+
 ## Anti-bot challenges
 
 `waitOutChallenge` wraps both GitLab runners, so every request a run makes is

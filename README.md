@@ -69,6 +69,31 @@ manager, so pagination and retries inside `gitlab-haskell` are covered too.
 Two per second was enough to draw gitlab.haskell.org's anti-bot check
 repeatedly during a long run, so the default backs off below it.
 
+## Memory
+
+A run holds its records in memory but not their notes. Notes are three
+quarters of a store and a run needs none of their content: what to fetch is
+decided from the record's `updated_at` against the stored
+`discussion_updated_at`, and what is fetched is written out at the next
+checkpoint and then dropped. So a run's memory tracks how many records a
+project has, not how much has ever been said about them.
+
+Measured on a store of 17,052 records with 229k notes, loading it for a fetch:
+
+| | live data | peak heap |
+| --- | --- | --- |
+| holding the notes | 301 MB | 813 MiB |
+| not holding them | 155 MB | 340 MiB |
+
+The executable caps its heap at 1 GB, which is roughly twice what `ghc/ghc`'s
+full history needs. Raise it with `+RTS -M4G -RTS` if you need to; a heap
+overflow well under that is a leak worth reporting rather than a large project.
+
+`--convert` is the exception and does not get this: copying a store means
+carrying the notes across, so it holds a whole kind at once and needs memory in
+proportion to the store rather than to the record count. Converting a store
+with a large project's full history in it will want more than the default cap.
+
 ## Anti-bot challenges
 
 `gitlab.haskell.org` answers sustained traffic with an Anubis interstitial: an
@@ -299,11 +324,8 @@ was asked of the server.
 
 `-v` puts the same trace lines on the terminal instead.
 
-The executable caps its heap at 1 GB. A run holds one project's records and the
-discussion it is currently fetching, which is tens of megabytes, so anything
-approaching the cap is a leak rather than a large project and a heap overflow
-says so where it happens. Raise it with `fetch-gitlab ... +RTS -M4G -RTS` if a
-project ever genuinely needs more.
+The executable caps its heap at 1 GB; see "Memory" above for what a run
+actually holds and why that is enough.
 
 ## Forcing a refetch
 

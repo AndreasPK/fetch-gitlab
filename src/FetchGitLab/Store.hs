@@ -13,6 +13,9 @@
 module FetchGitLab.Store
   ( Record (..)
   , Entry (..)
+  , Discussion (..)
+  , discussionNotes
+  , keepDiscussion
   , Store
   , newEntry
   , needsDiscussion
@@ -80,8 +83,8 @@ instance Record MergeRequest where
 data Entry a = Entry
   { entryRecord :: a
     -- ^ The ticket or merge request itself.
-  , entryDiscussion :: Maybe [Note]
-    -- ^ Its notes, or 'Nothing' if we have never fetched them.
+  , entryDiscussion :: Discussion
+    -- ^ Its notes, as far as this run is concerned.
   , entryDiscussionFor :: Maybe UTCTime
     -- ^ The record's @updated_at@ when the discussion was fetched. Lets a
     -- later run tell whether the discussion it has is still current, which is
@@ -89,37 +92,73 @@ data Entry a = Entry
   }
   deriving (Show)
 
+-- | What a run is holding of an entry's discussion.
+--
+-- The third case is what keeps a run's memory in proportion to the project
+-- rather than to the whole history of it. Notes are three quarters of a store
+-- and a run needs none of their content: it decides what to fetch from
+-- 'entryDiscussionFor' and writes what it fetches straight out. Holding
+-- every note of every record for the length of a run costs hundreds of
+-- megabytes to answer a question nothing asks.
+data Discussion
+  = -- | No discussion has ever been fetched for this record.
+    NeverFetched
+  | -- | The notes themselves.
+    Notes [Note]
+  | -- | There is a discussion in the store, deliberately not read into memory.
+    -- Writing the entry leaves whatever is there alone, so this can never
+    -- stand in for notes that are missing.
+    Kept
+  deriving (Show)
+
+-- | The notes, for the cases that have them to give.
+--
+-- 'Kept' yields 'Nothing' rather than an empty list: it means "not here", and
+-- an empty list would say "there are none", which is a different thing and the
+-- kind of difference that quietly deletes a discussion.
+discussionNotes :: Discussion -> Maybe [Note]
+discussionNotes (Notes ns) = Just ns
+discussionNotes _ = Nothing
+
+-- | Forget the content of a discussion we have already written out, keeping
+-- only the fact that the store has one.
+keepDiscussion :: Entry a -> Entry a
+keepDiscussion e = case entryDiscussion e of
+  Notes _ -> e {entryDiscussion = Kept}
+  _ -> e
+
 instance Record a => ToJSON (Entry a) where
   toJSON e =
     object $
       (recordField (Proxy :: Proxy a) .= entryRecord e)
         : catMaybes
-          [ ("discussion" .=) <$> entryDiscussion e
+          [ ("discussion" .=) <$> discussionNotes (entryDiscussion e)
           , ("discussion_updated_at" .=) <$> entryDiscussionFor e
           ]
 
 instance Record a => FromJSON (Entry a) where
   parseJSON = withObject "Entry" $ \o -> do
     record <- o .: recordField (Proxy :: Proxy a)
-    Entry record <$> o .:? "discussion" <*> o .:? "discussion_updated_at"
+    discussion <- maybe NeverFetched Notes <$> o .:? "discussion"
+    Entry record discussion <$> o .:? "discussion_updated_at"
 
 -- | A record we have not fetched any discussion for yet.
 newEntry :: a -> Entry a
-newEntry r = Entry r Nothing Nothing
+newEntry r = Entry r NeverFetched Nothing
 
 -- | Whether the entry's discussion is missing or out of date.
 needsDiscussion :: Record a => Entry a -> Bool
 needsDiscussion e =
   case entryDiscussion e of
-    Nothing -> True
-    Just _ -> entryDiscussionFor e /= recordUpdatedAt (entryRecord e)
+    NeverFetched -> True
+    _ -> entryDiscussionFor e /= recordUpdatedAt (entryRecord e)
 
 -- | Attach a freshly fetched discussion, marking it current for the record as
 -- it stands now.
 setDiscussion :: Record a => [Note] -> Entry a -> Entry a
 setDiscussion notes e =
   e
-    { entryDiscussion = Just notes
+    { entryDiscussion = Notes notes
     , entryDiscussionFor = recordUpdatedAt (entryRecord e)
     }
 
@@ -170,8 +209,8 @@ latestUpdate store =
 mergeRecords :: Record a => Store a -> [a] -> Store a
 mergeRecords old new = foldr insert old new
   where
-    insert r = Map.insertWith keepDiscussion (recordKey r) (newEntry r)
-    keepDiscussion fresh existing =
+    insert r = Map.insertWith carryOver (recordKey r) (newEntry r)
+    carryOver fresh existing =
       fresh
         { entryDiscussion = entryDiscussion existing
         , entryDiscussionFor = entryDiscussionFor existing

@@ -27,7 +27,7 @@ import Data.Default (def)
 import qualified Data.IntSet as IntSet
 import Data.List (partition, sortOn)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isNothing, mapMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -77,11 +77,13 @@ import FetchGitLab.Options (Backend (..), Options (..), dbFile, mrsFile, tickets
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
 import FetchGitLab.Store
-  ( Entry (..)
+  ( Discussion (..)
+  , Entry (..)
   , Record (..)
   , Store
   , alreadyCurrent
   , latestUpdate
+  , keepDiscussion
   , mergeRecords
   , needsDiscussion
   , setDiscussion
@@ -374,7 +376,9 @@ fetchDiscussions gitlab what backend store fetch = do
     -- Entries we are not asking about again, which is the point of storing
     -- 'entryDiscussionFor' at all.
     cached = Map.size store - total
-    (missing, stale) = partition (isNothing . entryDiscussion) todo
+    (missing, stale) = partition (neverFetched . entryDiscussion) todo
+    neverFetched NeverFetched = True
+    neverFetched _ = False
 
     -- The third argument is the entries touched since the last checkpoint. A
     -- backend that can write just those is handed them; one that cannot is
@@ -405,8 +409,18 @@ fetchDiscussions gitlab what backend store fetch = do
           liftIO $ storeSave backend acc' pending'
           logInfo_ $
             "Discussions: " <> tshow done' <> "/" <> tshow total <> " " <> what <> " (checkpointed)"
-          go acc' done' IntSet.empty es
+          -- Written, so the notes are the store's problem now rather than
+          -- ours. Holding them for the rest of the run would make a run's
+          -- memory grow with the size of the project's whole history; this
+          -- keeps it flat.
+          go (forgetWritten pending' acc') done' IntSet.empty es
         else go acc' done' pending' es
+
+-- | Drop the note bodies of the entries a checkpoint has just written.
+--
+-- Only sound because the store was told to write exactly these keys and did.
+forgetWritten :: IntSet.IntSet -> Store a -> Store a
+forgetWritten written store = IntSet.foldl' (flip (Map.adjust keepDiscussion)) store written
 
 -- | Stop a run that would silently refetch a project someone already has.
 --
@@ -458,7 +472,7 @@ abort msg = do
 -- | Read a store, aborting if what is there cannot be parsed.
 loadStore :: (Record a, StoreBackend s, MonadLog m, MonadIO m) => Text -> s -> m (Store a)
 loadStore what backend = do
-  result <- liftIO $ storeLoad backend
+  result <- liftIO $ storeLoadWithoutNotes backend
   case result of
     Left err -> abort ("Cannot read existing " <> what <> ": " <> T.pack err)
     Right store -> do

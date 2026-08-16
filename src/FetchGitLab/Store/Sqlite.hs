@@ -62,7 +62,7 @@ import Database.SQLite.Simple
 
 import GitLab.Types (Note)
 
-import FetchGitLab.Store (Entry (..), Record (..), Store)
+import FetchGitLab.Store (Discussion (..), Entry (..), Record (..), Store, discussionNotes)
 import FetchGitLab.Store.Class (StoreBackend (..))
 import FetchGitLab.Store.Schema
 
@@ -141,7 +141,10 @@ instance StoreBackend SqliteStore where
   storeLocation = T.pack . sqliteStorePath
 
   storeLoad :: forall a. Record a => SqliteStore -> IO (Either String (Store a))
-  storeLoad st = loadKind st (recordKind (Proxy :: Proxy a))
+  storeLoad st = loadKind WithNotes st (recordKind (Proxy :: Proxy a))
+
+  storeLoadWithoutNotes :: forall a. Record a => SqliteStore -> IO (Either String (Store a))
+  storeLoadWithoutNotes st = loadKind WithoutNotes st (recordKind (Proxy :: Proxy a))
 
   storeSave :: forall a. Record a => SqliteStore -> Store a -> IntSet -> IO ()
   storeSave st store dirty =
@@ -170,8 +173,15 @@ writeEntry st kind iid e = do
 
   execute conn "DELETE FROM record_users WHERE kind = ? AND iid = ?" (kind, iid)
   execute conn "DELETE FROM record_labels WHERE kind = ? AND iid = ?" (kind, iid)
-  execute conn "DELETE FROM note_users WHERE kind = ? AND iid = ?" (kind, iid)
-  execute conn "DELETE FROM notes WHERE kind = ? AND iid = ?" (kind, iid)
+
+  -- 'Kept' means the notes are in the store and were never read in, so there
+  -- is nothing here to write them back from. Deleting them would be deleting
+  -- them for good.
+  case entryDiscussion e of
+    Kept -> pure ()
+    _ -> do
+      execute conn "DELETE FROM note_users WHERE kind = ? AND iid = ?" (kind, iid)
+      execute conn "DELETE FROM notes WHERE kind = ? AND iid = ?" (kind, iid)
 
   executeNamed
     conn
@@ -183,7 +193,9 @@ writeEntry st kind iid e = do
     , ":iid" := iid
     , ":milestone_row" := milestoneRow
     , ":discussion_updated_at" := fmap encodeTime (entryDiscussionFor e)
-    , ":has_discussion" := maybe (0 :: Int) (const 1) (entryDiscussion e)
+    , ":has_discussion" := case entryDiscussion e of
+        NeverFetched -> 0 :: Int
+        _ -> 1
     , ":rest" := encodeText rest
     , ":lifted" := encodeText (toJSON (liftedKeys lifted))
     ]
@@ -203,7 +215,7 @@ writeEntry st kind iid e = do
       "INSERT OR REPLACE INTO record_labels (kind, iid, position, label_id) VALUES (?, ?, ?, ?)"
       (kind, iid, position, label)
 
-  forM_ (entryDiscussion e) $ \notes ->
+  forM_ (discussionNotes (entryDiscussion e)) $ \notes ->
     forM_ (zip [0 :: Int ..] notes) (uncurry (writeNote st kind iid))
 
 writeNote :: SqliteStore -> Text -> Int -> Int -> Note -> IO ()
@@ -283,9 +295,14 @@ rowOf conn q key = do
 -- Everything is fetched in a handful of queries and joined up in memory. One
 -- query per record would be tens of thousands of round trips for a project the
 -- size of GHC's.
-loadKind :: forall a. Record a => SqliteStore -> Text -> IO (Either String (Store a))
-loadKind st kind = do
+-- | Whether a load reads the note bodies or leaves them where they are.
+data NoteLoading = WithNotes | WithoutNotes
+  deriving (Eq)
+
+loadKind :: forall a. Record a => NoteLoading -> SqliteStore -> Text -> IO (Either String (Store a))
+loadKind loading st kind = do
   let conn = sqliteConn st
+      wanted = loading == WithNotes
 
   users <- Map.fromList <$> (query_ conn "SELECT row_id, json FROM users" :: IO [(Int64, Text)])
   milestones <-
@@ -314,20 +331,28 @@ loadKind st kind = do
       (Only kind) ::
       IO [(Int, Int, Text)]
 
+  -- The two heavy queries of the six, and the reason 'WithoutNotes' exists:
+  -- notes outnumber records by an order of magnitude and carry the bodies.
   noteRows <-
-    query
-      conn
-      "SELECT iid, position, rest, lifted FROM notes WHERE kind = ? \
-      \ ORDER BY iid, position"
-      (Only kind) ::
-      IO [(Int, Int, Text, Text)]
+    if not wanted
+      then pure []
+      else
+        query
+          conn
+          "SELECT iid, position, rest, lifted FROM notes WHERE kind = ? \
+          \ ORDER BY iid, position"
+          (Only kind) ::
+          IO [(Int, Int, Text, Text)]
 
   noteRefs <-
-    query
-      conn
-      "SELECT iid, position, field, user_row FROM note_users WHERE kind = ?"
-      (Only kind) ::
-      IO [(Int, Int, Text, Int64)]
+    if not wanted
+      then pure []
+      else
+        query
+          conn
+          "SELECT iid, position, field, user_row FROM note_users WHERE kind = ?"
+          (Only kind) ::
+          IO [(Int, Int, Text, Int64)]
 
   let usersByIid = groupOn (\(iid, _, _, _) -> iid) userRefs
       labelsByIid = groupOn (\(iid, _, _) -> iid) labelRefs
@@ -371,13 +396,16 @@ loadKind st kind = do
               , liftedKeys = keys
               }
       record <- parseValue "record" (spliceObject recordSpec l base) :: Either String a
-      notes <- notesFor iid
+      discussion <-
+        if hasDiscussion == (0 :: Int)
+          then pure NeverFetched
+          else if wanted then Notes <$> notesFor iid else pure Kept
       discussionAt <- traverse decodeTime discussionFor
       pure
         ( iid
         , Entry
             { entryRecord = record
-            , entryDiscussion = if hasDiscussion /= (0 :: Int) then Just notes else Nothing
+            , entryDiscussion = discussion
             , entryDiscussionFor = discussionAt
             }
         )

@@ -79,7 +79,10 @@ clearTimestamps backend = do
   where
     clear :: forall a m'. (Record a, MonadLog m', MonadIO m') => Text -> Proxy a -> m' ()
     clear what _ = do
-      loaded <- liftIO (storeLoad backend :: IO (Either String (Store a)))
+      -- Only the timestamps are rewritten, so the notes never have to be read;
+      -- 'Kept' writes back as "leave the discussion where it is". A store with
+      -- a project's whole history in it will not fit in memory otherwise.
+      loaded <- liftIO (storeLoadWithoutNotes backend :: IO (Either String (Store a)))
       case loaded of
         Left err -> do
           logAttention_ ("Cannot read " <> what <> ": " <> T.pack err)
