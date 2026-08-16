@@ -1,0 +1,13 @@
+dist-newstyle/
+*.tmp
+
+# Local state and secrets
+gitlab-token
+*.jsonl
+!test/data/*.jsonl
+.decision-log/
+
+# Stores written by older versions, before the default moved to
+# ~/.fetch-gitlab/<name>.jsonl
+/tickets
+/mrs
