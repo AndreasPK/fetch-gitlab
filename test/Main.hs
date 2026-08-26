@@ -11,7 +11,7 @@ import Data.Aeson (FromJSON, ToJSON, Value (..), eitherDecode, encode, object, t
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.IntSet as IntSet
-import Data.List (isInfixOf, nub, sort)
+import Data.List (isInfixOf, nub)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
@@ -50,16 +50,9 @@ import FetchGitLab.Lock
   , withStoreLocks
   )
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager, waitTurn)
-import FetchGitLab.Show
-  ( Target (..)
-  , parseTarget
-  , renderIssue
-  , renderMergeRequest
-  )
 import FetchGitLab.Since (Since (..), Unit (..), parseSince, resolveSince)
 import FetchGitLab.Store
-  ( Discussion (..)
-  , Entry (..)
+  ( Entry (..)
   , Record (..)
   , Store
   , discussionNotes
@@ -178,16 +171,8 @@ tests =
         , testCase "another process is excluded, named, and survives a rewrite" lockExcludesAnotherProcess
         ]
     , testGroup
-        "show"
-        [ testCase "#123 is a ticket and !123 a merge request" targetsAreParsed
-        , testCase "anything else is refused" badTargetsAreRefused
-        , testCase "a record is looked up without reading the store" lookupFindsOneRecord
-        , testCase "a key the store does not hold is not an error" lookupMissesCleanly
-        , testCase "--full is what prints the notes" fullTogglesNotes
-        , testCase "the discussion reads oldest first" notesAreChronological
-        , testCase "a record with no discussion says so" showsWhenNothingWasFetched
-        , testCase "a merge request prints its branches" showsMergeRequestBranches
-        , testCase "the newest store in a directory is the one found" detectsNewestStore
+        "store detection"
+        [ testCase "the newest store in a directory is the one found" detectsNewestStore
         , testCase "a database being written to is found by its log" detectsThroughWriteAheadLog
         , testCase "backups and empty directories are not stores" detectsNothingToRead
         ]
@@ -1017,152 +1002,6 @@ latestUpdateIsNewest = do
   let store = mergeRecords Map.empty issues
       expected = maximum [t | Just t <- map recordUpdatedAt issues] :: UTCTime
   assertEqual "newest timestamp" (Just expected) (latestUpdate store)
-
--- ---------------------------------------------------------------------------
--- show-gl-ghc
--- ---------------------------------------------------------------------------
-
--- | GitLab's own spelling for the two kinds. A bare number is a ticket, since
--- an interactive shell eats a leading @#@ before the program ever sees it.
-targetsAreParsed :: Assertion
-targetsAreParsed = do
-  parseTarget "#25166" @?= Right (Ticket 25166)
-  parseTarget "!13000" @?= Right (Mr 13000)
-  parseTarget "25166" @?= Right (Ticket 25166)
-
-badTargetsAreRefused :: Assertion
-badTargetsAreRefused =
-  forM_ ["", "#", "!", "abc", "#12x", "#-1", "#0", "# 12"] $ \s ->
-    case parseTarget s of
-      Left message ->
-        assertBool
-          (show s <> " was refused without saying what was wanted: " <> message)
-          ("#123" `isInfixOf` message)
-      Right target -> assertFailure (show s <> " was read as " <> show target)
-
--- | Reading one record has to give what reading the whole store and picking
--- that record out of it gives, including its notes.
-lookupFindsOneRecord :: Assertion
-lookupFindsOneRecord = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-      keys = Map.keys store
-
-  -- Both backends, because one answers from a query and the other from the
-  -- default: reading everything and looking in it.
-  jsonl <- openJsonLinesStore (dir </> "tickets.jsonl") (dir </> "mrs.jsonl")
-  storeSaveAll jsonl store
-  withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
-    forM_ keys $ \iid -> do
-      fromSqlite <- storeLookup db iid :: IO (Either String (Maybe (Entry Issue)))
-      fromJsonl <- storeLookup jsonl iid :: IO (Either String (Maybe (Entry Issue)))
-      let expected = Right (fmap toJSON (Map.lookup iid store))
-      assertEqual ("sqlite lookup of " <> show iid) expected (fmap (fmap toJSON) fromSqlite)
-      assertEqual ("jsonl lookup of " <> show iid) expected (fmap (fmap toJSON) fromJsonl)
-
--- | Nothing is not a failure: a store that does not hold the ticket is the
--- ordinary case of asking for one that does not exist, and it has to be told
--- apart from a store that could not be read.
-lookupMissesCleanly :: Assertion
-lookupMissesCleanly = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  let store = mergeRecords Map.empty issues
-      absent = maximum (Map.keys store) + 1
-  withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
-    found <- storeLookup db absent :: IO (Either String (Maybe (Entry Issue)))
-    assertEqual "an absent key" (Right Nothing) (fmap (fmap toJSON) found)
-
--- | The discussion is the bulk of a record and is off by default, so what
--- @--full@ switches on is exactly the note bodies.
-fullTogglesNotes :: Assertion
-fullTogglesNotes = do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  case issues of
-    [] -> assertFailure "fixture is empty"
-    (issue : _) -> do
-      let entry = setDiscussion notes (newEntry issue)
-          brief = renderIssue False entry
-          full = renderIssue True entry
-          bodies = [T.strip b | Just b <- map note_body notes, not (T.null (T.strip b))]
-      assertBool "the fixture has no note bodies to look for" (not (null bodies))
-      forM_ bodies $ \body -> do
-        assertBool ("the brief form printed a note: " <> T.unpack body) (not (body `T.isInfixOf` brief))
-        assertBool ("--full left out a note: " <> T.unpack body) (body `T.isInfixOf` full)
-      assertBool
-        "the brief form does not say how to see them"
-        ("--full" `T.isInfixOf` brief)
-      forM_ [brief, full] $ \rendered ->
-        assertBool
-          "the record was not named"
-          (T.pack ("#" <> show (issue_iid issue)) `T.isInfixOf` rendered)
-
--- | A store keeps the order GitLab returned a discussion in, which is newest
--- first. A conversation reads the other way, so the printing sorts it.
-notesAreChronological :: Assertion
-notesAreChronological = do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  case issues of
-    [] -> assertFailure "fixture is empty"
-    (issue : _) -> do
-      let stored = map note_created_at notes
-          rendered = renderIssue True (setDiscussion notes (newEntry issue))
-          -- Where each note's body turned up in the output, in stored order.
-          positions =
-            [ T.length prefix
-            | n <- notes
-            , let (prefix, _) = T.breakOn (maybe "" T.strip (note_body n)) rendered
-            ]
-      assertBool
-        "the fixture is already in order, so this proves nothing"
-        (stored /= sort stored)
-      assertEqual
-        "every note was printed once"
-        (length notes)
-        (length (nub positions))
-      assertEqual
-        "the notes were printed in some order other than oldest first"
-        (map snd (sort (zip stored positions)))
-        (sort positions)
-
--- | An entry whose discussion was never fetched must not read as one that has
--- none: a run that has not got there yet and a ticket nobody replied to look
--- the same otherwise.
-showsWhenNothingWasFetched :: Assertion
-showsWhenNothingWasFetched = do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  case issues of
-    [] -> assertFailure "fixture is empty"
-    (issue : _) -> do
-      assertBool
-        "a never fetched discussion is not marked as such"
-        ("not fetched" `T.isInfixOf` renderIssue True (newEntry issue))
-      assertBool
-        "a discussion that was fetched and is empty reads as never fetched"
-        (not ("not fetched" `T.isInfixOf` renderIssue True (setDiscussion [] (newEntry issue))))
-      assertBool
-        "a fetched discussion is not counted"
-        ( T.pack (show (length notes) <> " notes")
-            `T.isInfixOf` renderIssue False (setDiscussion notes (newEntry issue))
-        )
-
--- | What a merge request has that a ticket does not, since the two are
--- rendered by separate field lists and only one of them is exercised above.
-showsMergeRequestBranches :: Assertion
-showsMergeRequestBranches = do
-  mrs <- decodeFixture "test/data/mrs.jsonl" :: IO [MergeRequest]
-  case mrs of
-    [] -> assertFailure "fixture is empty"
-    (mr : _) -> do
-      let rendered = renderMergeRequest False (newEntry mr)
-      assertBool "the reference is not a !" (T.pack ("!" <> show (merge_request_iid mr)) `T.isInfixOf` rendered)
-      forM_ [merge_request_source_branch mr, merge_request_target_branch mr] $ \branch ->
-        assertBool ("branch " <> T.unpack branch <> " is missing") (branch `T.isInfixOf` rendered)
 
 -- | A directory can hold a store of either kind, or one of each left over from
 -- a change of backend. The one being written to is the one to read, and that

@@ -23,7 +23,6 @@ library
                       FetchGitLab.Logging
                       FetchGitLab.Lock
                       FetchGitLab.RateLimit
-                      FetchGitLab.Show
                       FetchGitLab.Since
                       FetchGitLab.Store
                       FetchGitLab.Store.Backend
@@ -63,15 +62,6 @@ executable fetch-gitlab
     -- point it happens instead of the machine swapping. -rtsopts leaves the
     -- cap raisable from the command line if a project ever does need it.
     ghc-options:      -rtsopts "-with-rtsopts=-M1G"
-    build-depends:    base
-                    , fetch-gitlab
-                    , optparse-applicative
-    default-language: Haskell2010
-
-executable show-gl-ghc
-    import:           warnings
-    main-is:          Main.hs
-    hs-source-dirs:   show-gl-ghc
     build-depends:    base
                     , fetch-gitlab
                     , optparse-applicative
