@@ -14,6 +14,8 @@ module FetchGitLab.Fetch
   , readToken
   , waitOutChallenge
   , challengeWaits
+  , addUserAgent
+  , userAgent
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -32,8 +34,12 @@ import Data.Ord (Down (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
+import Data.Text.Encoding (encodeUtf8)
 import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
-import Network.HTTP.Client (Response, responseStatus)
+import Data.Version (showVersion)
+import Network.HTTP.Client (Manager, Request, Response, requestHeaders, responseStatus)
+import Network.HTTP.Client.Internal (Manager (..))
+import Network.HTTP.Types.Header (hUserAgent)
 import Network.HTTP.Types.Status (statusCode)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getFileSize)
 import System.Exit (exitFailure)
@@ -90,6 +96,7 @@ import FetchGitLab.Store
   )
 import FetchGitLab.Store.Backend (optionsSpec, specPaths, withStore)
 import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..))
+import Paths_fetch_gitlab (version)
 
 -- | How many requests per second we allow ourselves.
 --
@@ -205,7 +212,7 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
       -- normally filtered out; in a --log file it is what shows a run pausing
       -- for a slow page rather than having stopped.
       announce <- requestAnnouncer
-      manager <- liftIO $ rateLimitedManager limiter announce
+      manager <- liftIO $ rateLimitedManager limiter announce >>= addUserAgent
       -- Every request a run makes goes through one of these two, so waiting
       -- out a challenge here covers the record pages and the discussions
       -- alike, without either of them having to know what a challenge is.
@@ -242,6 +249,33 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
     terminalLevel
       | optVerbose opts = LogTrace
       | otherwise = LogInfo
+
+-- | What this tool calls itself: @fetch-gitlab/<version>@.
+userAgent :: Text
+userAgent = "fetch-gitlab/" <> T.pack (showVersion version)
+
+-- | Make a manager send 'userAgent' with every request.
+--
+-- Neither @http-client@ nor @gitlab-haskell@ sets a User-Agent, so without this
+-- a run's requests carry none — and gitlab.haskell.org's anti-bot check treats
+-- an anonymous client worse than one that says what it is.
+--
+-- Done on the manager rather than in the vendored library because it is the
+-- tool that has a name and a version, and because it then covers every request
+-- the library makes, the startup token check included. The hook is
+-- @mModifyRequest@, which runs more than once per request; replacing the
+-- header rather than adding to it keeps that harmless.
+addUserAgent :: Manager -> IO Manager
+addUserAgent manager =
+  pure manager {mModifyRequest = fmap setUserAgent . mModifyRequest manager}
+  where
+    setUserAgent :: Request -> Request
+    setUserAgent req =
+      req
+        { requestHeaders =
+            (hUserAgent, encodeUtf8 userAgent)
+              : filter ((/= hUserAgent) . fst) (requestHeaders req)
+        }
 
 -- | How long to wait, in seconds, after each successive anti-bot challenge.
 --

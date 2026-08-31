@@ -374,36 +374,10 @@ roughly six for `ghc/ghc`. Interrupting it is safe.
 | `FetchGitLab.Logging` | Terminal and `--log` file loggers at different levels |
 | `FetchGitLab.RateLimit` | Rate limiter and the manager that obeys it |
 | `FetchGitLab.Fetch` | `run`, orchestration, paged record fetch, discussion loop |
-| `FetchGitLab.Show` | `show-gl-ghc`: target parsing, store detection, rendering one record |
 
 `Record` is the class tying a type to the store: `recordKey` (the `iid`),
 `recordUpdatedAt`, and `recordField` (the JSON field name). Instances exist for
 `Issue` and `MergeRequest`.
-
-## Reading a record back
-
-`show-gl-ghc` is a second executable (`show-gl-ghc/Main.hs`, logic in
-`FetchGitLab.Show`) that prints one record out of a store:
-
-```
-show-gl-ghc show '#123' | '!123' [--store DIR] [--full]
-```
-
-Read only, offline, and unlocked, so it works while a fetch runs. It shares the
-store machinery rather than parsing stores itself; `StoreBackend.storeLookup`
-is the entry point, defaulting to load-and-look-up and overridden by SQLite
-with a query for the one record (0.4 s against a 560 MB store, against seconds
-for JSON lines, which has to be parsed whole).
-
-`--store` names a *directory*, and the most recently written store in it wins:
-newest of the `*.db` files and the `tickets.jsonl`/`mrs.jsonl` pair, ties to
-SQLite, `gitlab.db-wal` counting as part of the database because a run
-checkpoints there and the database file's own timestamp goes stale mid-fetch.
-Without `--store` the same rule is applied to `~/.fetch-gitlab`. It creates
-nothing; a missing store or `iid` is a message on stderr and a non-zero exit.
-
-A bare number means a ticket, because an interactive shell eats `#123` as a
-comment before the program sees it.
 
 ## Building
 

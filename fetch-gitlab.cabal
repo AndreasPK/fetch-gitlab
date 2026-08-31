@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               fetch-gitlab
-version:            0.1.0.0
+version:            0.1.1.0
 synopsis:           Fetch all issues/MRs from a GitLab instance as JSONL
 description:        Command line tool to dump GitLab issues and merge requests
                     into newline delimited JSON files.
@@ -31,6 +31,9 @@ library
                       FetchGitLab.Store.Schema
                       FetchGitLab.Store.Sqlite
                       FetchGitLab.Fetch
+    -- For the version in the User-Agent header.
+    other-modules:    Paths_fetch_gitlab
+    autogen-modules:  Paths_fetch_gitlab
     build-depends:    base                 >=4.16 && <5
                     , aeson                >=2.0  && <2.3
                     , bytestring           >=0.11 && <0.13
