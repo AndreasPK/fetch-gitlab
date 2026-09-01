@@ -110,8 +110,11 @@ closeSqliteStore st = do
 withSqliteStore :: FilePath -> (SqliteStore -> IO a) -> IO a
 withSqliteStore path = bracket (openSqliteStore path) closeSqliteStore
 
--- | Refuse a store written by a different schema rather than reading the wrong
--- columns out of it.
+-- | Refuse a store written by an incompatible schema rather than reading the
+-- wrong columns out of it. A store from a version in 'compatibleVersions' is
+-- accepted as it is: the schema statements just executed have already created
+-- whatever tables it was missing, and its recorded version stays untouched so
+-- a binary of that older version can still open it.
 checkVersion :: Connection -> IO ()
 checkVersion conn = do
   stored <- query_ conn "SELECT value FROM meta WHERE key = 'schema_version'"
@@ -122,7 +125,7 @@ checkVersion conn = do
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
         (Only version)
     (Only v : _)
-      | v == version -> pure ()
+      | v `elem` accepted -> pure ()
       | otherwise ->
           ioError . userError $
             "store was written by schema version "
@@ -131,6 +134,7 @@ checkVersion conn = do
               <> show schemaVersion
   where
     version = T.pack (show schemaVersion)
+    accepted = version : map (T.pack . show) compatibleVersions
 
 -- | How many rows each table holds. Says whether the sharing the schema is
 -- built around is actually happening.

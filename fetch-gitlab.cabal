@@ -26,6 +26,8 @@ library
                       FetchGitLab.Store.Backend
                       FetchGitLab.Store.Class
                       FetchGitLab.Store.Schema
+                      FetchGitLab.Store.Schema.Pipeline
+                      FetchGitLab.Store.Schema.Types
                       FetchGitLab.Store.Sqlite
                       FetchGitLab.Fetch
     -- For the version in the User-Agent header.
