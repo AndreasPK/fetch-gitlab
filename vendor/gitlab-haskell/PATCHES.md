@@ -200,3 +200,17 @@ that cannot have changed since the run started.
 The new function is the same minus the check. `runGitLabWithManager` is
 unchanged and `fetch-gitlab` still calls it once at the start, so a bad token
 is still reported immediately rather than as a wall of failures.
+
+## 6. The raw request layer is exposed
+
+`GitLab.WebRequests.GitLabWebCalls` moved from `other-modules` to
+`exposed-modules` in the cabal file. No code change.
+
+The typed API covers a fraction of GitLab's endpoints — a merge request's
+pipelines and a pipeline's jobs, which `fetch-gitlab --pipelines` needs, are
+not among them — and the typed models drop any field they do not know, which
+a store that keeps objects verbatim cannot accept. `gitlabGetMany` is
+polymorphic in its `FromJSON` result, so an exposed request layer lets a
+caller fetch any endpoint as raw `Value`s: every field kept, no vendored
+model to maintain, and still through the library's session, retries and
+pagination.

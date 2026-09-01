@@ -85,6 +85,11 @@ data Options = Options
     -- already stored.
   , optNotes :: Bool
     -- ^ Whether to fetch the discussion of each ticket and merge request.
+  , optPipelines :: Maybe Int
+    -- ^ Fetch the pipelines (and their jobs) of this one merge request,
+    -- instead of fetching records at all. Pipelines are never fetched
+    -- unasked: a project the size of GHC runs one per push, so following
+    -- them for every merge request would dwarf the records themselves.
   , optVerbose :: Bool
     -- ^ Log at trace level rather than info level.
   , optLogFile :: Maybe FilePath
@@ -101,7 +106,7 @@ defaultProject = "ghc/ghc"
 
 optionsParser :: Parser Options
 optionsParser =
-  Options
+  build
     <$> strOption
       ( long "token"
           <> metavar "FILE"
@@ -138,7 +143,7 @@ optionsParser =
                 )
           )
       )
-    <*> notesFlag
+    <*> modeFlags
     <*> verboseOption
     <*> optional
       ( strOption
@@ -152,9 +157,30 @@ optionsParser =
           )
       )
   where
+    build token url project backend db when_ (notes, pipelines) verbose logFile =
+      Options token url project backend db when_ notes pipelines verbose logFile
+
     text = T.pack <$> str
 
     since = eitherReader parseSince
+
+    -- What a run fetches: records with or without their discussions, or -- an
+    -- entirely separate errand -- one merge request's pipelines. The pipelines
+    -- alternative comes first because the notes flag defaults to True and so
+    -- never fails to parse.
+    modeFlags =
+      (\mr -> (True, Just mr))
+        <$> option
+          auto
+          ( long "pipelines"
+              <> metavar "MR"
+              <> help
+                ( "Fetch the pipelines and jobs of this one merge request, given by "
+                    <> "its number, instead of fetching records. Pipelines are only "
+                    <> "ever fetched on request"
+                )
+          )
+        <|> (\notes -> (notes, Nothing)) <$> notesFlag
 
     -- One request per ticket and merge request, so this is by far the
     -- expensive part of a cold run; --no-notes skips it.

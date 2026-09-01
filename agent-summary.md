@@ -8,7 +8,7 @@ into a SQLite database. Incremental: a second run fetches only what changed.
 ```
 fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE] [--since WHEN]
-             [--notes | --no-notes] [-v|--verbose]
+             [--notes | --no-notes | --pipelines <mr> ] [-v|--verbose]
 ```
 
 | Flag | Default | Meaning |
@@ -20,6 +20,7 @@ fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
 | `--db` | `~/.fetch-gitlab/gitlab.db` | Database to fetch into |
 | `--since` | — | Override the incremental timestamp |
 | `--notes` / `--no-notes` | `--notes` | Whether to fetch discussions |
+| `--pipelines MR` | — | Fetch one merge request's pipelines and jobs instead of records |
 | `-v`, `--verbose` | off | Log at trace level |
 
 `--since` accepts a date (`2026-08-01`), an ISO 8601 timestamp
@@ -253,6 +254,10 @@ does not otherwise offer without changing what the existing functions do:
   discussion phase: around 28,000 extra requests on `ghc/ghc`, four hours at two
   a second. The checked version is still called once at the start, so a bad
   token is still reported immediately.
+- `GitLab.WebRequests.GitLabWebCalls` is exposed (a cabal file change only),
+  so endpoints the typed API does not cover — a merge request's pipelines, a
+  pipeline's jobs — can be fetched as raw `Value`s through the library's
+  session, retries and pagination.
 
 ## Watching a run
 
@@ -276,6 +281,35 @@ the traffic actually made. `managerWrapException` wraps the whole of
 default wrapper is still called, so exceptions are translated as before. The
 test asserts one announcement per request against a refused connection, which
 exercises the hook without needing a server.
+
+## Pipelines on request
+
+`--pipelines <mr>` fetches the pipelines of one merge request and the jobs of
+each, instead of fetching records at all. Pipelines are never fetched unasked:
+a project the size of GHC runs a pipeline per push, so following them for
+every merge request would dwarf the records themselves. A run is one request
+for the pipeline list plus one per pipeline for its jobs.
+
+Both are fetched as raw JSON (`gitlabGetMany` at `Value`) rather than through
+the library's typed models, which would silently drop unmodelled fields.
+`Store.Schema.Pipeline` holds the tables: pipelines keyed by their
+project-unique id and carrying the `(kind, iid)` of the record they were
+fetched for; jobs keyed by an autoincrement row with the GitLab id only
+UNIQUE, since the docs do not promise instance-wide ids. A job's `user` and
+`runner` are interned (a runner is interned per observed state — `online` and
+`status` change between fetches), its `commit` goes to a table keyed on the
+sha, and its nested `pipeline` object is dropped as a strict subset of the
+pipelines row. Status, stage, the timestamps and durations are real columns;
+the rest of the object stays verbatim in `rest` under generated columns.
+
+Any failure aborts the run rather than skipping: re-running costs a handful
+of requests, so there is no staleness bookkeeping as there is for notes.
+Refetching a merge request's pipelines replaces what was there.
+
+The pipeline tables were schema version 2. Version 1 stores are still opened
+— the versions only differ by added tables, which opening creates — and their
+recorded version deliberately stays 1 so older binaries can open them too
+(`compatibleVersions` in `Store.Schema`).
 
 ## Forcing a refetch
 
@@ -337,7 +371,9 @@ roughly six for `ghc/ghc`. Interrupting it is safe.
 | `FetchGitLab.Since` | `--since` parsing and resolution against now |
 | `FetchGitLab.Store` | `Record` class, `Entry`, merge, staleness |
 | `FetchGitLab.Store.Class` | `StoreBackend`, the interface a backend implements |
-| `FetchGitLab.Store.Schema` | Entities, relations, lift/splice, the SQL tables |
+| `FetchGitLab.Store.Schema` | Entities, relations, the SQL tables, schema versions |
+| `FetchGitLab.Store.Schema.Types` | The lift/splice machinery (`LiftSpec`, `splitObject`) |
+| `FetchGitLab.Store.Schema.Pipeline` | The pipeline, job, runner and commit tables |
 | `FetchGitLab.Store.Sqlite` | The SQLite backend, via sqlite-simple |
 | `FetchGitLab.Store.Backend` | `--backend` to an open store, and the paths to lock |
 | `FetchGitLab.Lock` | Exclusive store locks, `LockInfo` holder record |

@@ -22,10 +22,12 @@ module FetchGitLab.Fetch
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
+import Control.Monad (forM)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.ByteString.Lazy as BL
 import Data.Aeson (Value, object)
+import qualified Data.Aeson.Types as Aeson
 import Data.Default (def)
 import qualified Data.IntSet as IntSet
 import Data.List (partition, sortOn)
@@ -67,7 +69,9 @@ import GitLab.Types
   , OrderBy (..)
   , Project
   , SortBy (..)
+  , project_id
   )
+import GitLab.WebRequests.GitLabWebCalls (gitlabGetMany)
 
 import Log
   ( LogLevel (..)
@@ -203,16 +207,7 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
         liftIO (readToken (optTokenFile opts))
           >>= either (\err -> abort ("Cannot read the access token: " <> err)) pure
 
-      tickets <- loadStore "tickets" store
-      mrs <- loadStore "merge requests" store
-
-      -- An explicit --since overrides what the stores say.
-      override <- liftIO $ traverse resolveNow (optSince opts)
-      let ticketsSince = maybe (fetchSince tickets) Just override
-          mrsSince = maybe (fetchSince mrs) Just override
       logInfo_ $ "Fetching " <> optProject opts <> " from " <> optServerUrl opts
-      logSince "tickets" ticketsSince
-      logSince "merge requests" mrsSince
 
       limiter <- liftIO $ newRateLimiter requestsPerSecond
       -- Every request announces itself at trace level. On the terminal that is
@@ -237,21 +232,34 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
           (liftIO (runGitLabWithManager manager (serverConfig opts token) (lookupProject (optProject opts))))
           >>= either (\err -> abort ("GitLab request failed: " <> tshow err)) pure
 
-      tickets' <- fetchRecords gitlab "tickets" store tickets ticketsSince $ \since ->
-        projectIssuesPage prj (issueFilters since) recordsPerPage
-      mrs' <- fetchRecords gitlab "merge requests" store mrs mrsSince $ \since ->
-        mergeRequestsWithPage prj (mrFilters since) recordsPerPage
+      case optPipelines opts of
+        Just mr -> fetchPipelines gitlab store prj mr
+        Nothing -> do
+          tickets <- loadStore "tickets" store
+          mrs <- loadStore "merge requests" store
 
-      if optNotes opts
-        then do
-          _ <-
-            fetchDiscussions gitlab "tickets" store tickets' $
-              \iid -> issueNotes prj iid Nothing Nothing
-          _ <-
-            fetchDiscussions gitlab "merge requests" store mrs' $
-              \iid -> mergeRequestNotes prj iid Nothing Nothing
-          pure ()
-        else logInfo_ "Skipping discussions (--no-notes)"
+          -- An explicit --since overrides what the stores say.
+          override <- liftIO $ traverse resolveNow (optSince opts)
+          let ticketsSince = maybe (fetchSince tickets) Just override
+              mrsSince = maybe (fetchSince mrs) Just override
+          logSince "tickets" ticketsSince
+          logSince "merge requests" mrsSince
+
+          tickets' <- fetchRecords gitlab "tickets" store tickets ticketsSince $ \since ->
+            projectIssuesPage prj (issueFilters since) recordsPerPage
+          mrs' <- fetchRecords gitlab "merge requests" store mrs mrsSince $ \since ->
+            mergeRequestsWithPage prj (mrFilters since) recordsPerPage
+
+          if optNotes opts
+            then do
+              _ <-
+                fetchDiscussions gitlab "tickets" store tickets' $
+                  \iid -> issueNotes prj iid Nothing Nothing
+              _ <-
+                fetchDiscussions gitlab "merge requests" store mrs' $
+                  \iid -> mergeRequestNotes prj iid Nothing Nothing
+              pure ()
+            else logInfo_ "Skipping discussions (--no-notes)"
 
     terminalLevel
       | optVerbose opts = LogTrace
@@ -510,6 +518,74 @@ fetchDiscussions gitlab what backend store fetch = do
 -- Only sound because the store was told to write exactly these keys and did.
 forgetWritten :: IntSet.IntSet -> Store a -> Store a
 forgetWritten written store = IntSet.foldl' (flip (Map.adjust keepDiscussion)) store written
+
+-- | Fetch the pipelines of one merge request, and the jobs of each.
+--
+-- Never part of an ordinary run: a project the size of GHC runs a pipeline
+-- per push, so following pipelines for every merge request would dwarf the
+-- records themselves. This is the on-request path — one request lists the
+-- pipelines, then one more per pipeline lists its jobs, a handful in all.
+--
+-- Both are fetched as raw JSON rather than through the library's types,
+-- because the store keeps a pipeline and a job verbatim; a typed model would
+-- silently drop whatever fields it does not know.
+--
+-- Any failure aborts the run rather than skipping: a whole run here is a few
+-- requests, so re-running it costs less than reasoning about a store holding
+-- half a fetch. Writing happens once, at the end, for the same reason.
+fetchPipelines ::
+  forall s m.
+  (StoreBackend s, MonadLog m, MonadIO m) =>
+  (forall b. GitLab b -> m (Either GitLabError b)) ->
+  s ->
+  Project ->
+  -- | The merge request, by its iid.
+  Int ->
+  m ()
+fetchPipelines gitlab backend prj mr = do
+  pipelines <-
+    fetchJSON
+      ("pipelines of merge request !" <> tshow mr)
+      (base <> "/merge_requests/" <> tshow mr <> "/pipelines")
+  logInfo_ $
+    tshow (length pipelines) <> " pipelines for merge request !" <> tshow mr
+  pairs <- forM pipelines $ \p -> do
+    pid <- case pipelineId p of
+      Nothing -> abort ("GitLab sent a pipeline without an id for merge request !" <> tshow mr)
+      Just pid -> pure pid
+    jobs <-
+      fetchJSON
+        ("jobs of pipeline " <> tshow pid)
+        (base <> "/pipelines/" <> tshow pid <> "/jobs")
+    logTrace_ $ tshow (length jobs) <> " jobs in pipeline " <> tshow pid
+    pure (p, jobs)
+  liftIO $ storeWritePipelines backend "mr" mr pairs
+  logInfo_ $
+    "Pipelines for merge request !"
+      <> tshow mr
+      <> " ("
+      <> tshow (sum (map (length . snd) pairs))
+      <> " jobs) written to "
+      <> storeLocation backend
+  where
+    base = "/projects/" <> tshow (project_id prj)
+
+    fetchJSON :: Text -> Text -> m [Value]
+    fetchJSON what path = do
+      result <- gitlab (orChallenge (gitlabGetMany path []))
+      case result of
+        Left err -> abort ("Cannot fetch " <> what <> ": " <> tshow err)
+        Right (Left response) ->
+          abort
+            ( "Cannot fetch "
+                <> what
+                <> ": HTTP "
+                <> tshow (statusCode (responseStatus response))
+            )
+        Right (Right values) -> pure values
+
+    pipelineId :: Value -> Maybe Int
+    pipelineId = Aeson.parseMaybe (Aeson.withObject "pipeline" (Aeson..: "id"))
 
 -- | Log a reason the run cannot go on, and stop.
 abort :: (MonadLog m, MonadIO m) => Text -> m a

@@ -12,6 +12,7 @@ module FetchGitLab.Store.Class
   , storeSaveAll
   ) where
 
+import Data.Aeson (Value)
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Data.Map.Strict as Map
@@ -72,6 +73,15 @@ class StoreBackend b where
   -- every note in the store to answer.
   storeLookup :: Record a => b -> Int -> IO (Either String (Maybe (Entry a)))
   storeLookup b key = fmap (Map.lookup key) <$> storeLoad b
+
+  -- | Write the pipelines of one record, each paired with the jobs it ran.
+  --
+  -- The record is named by kind and iid exactly as everywhere else, because
+  -- which merge request a pipeline was fetched for is not part of the
+  -- pipeline object. The values are the raw JSON the server sent, verbatim;
+  -- what to lift out of them is the backend's business. Re-writing a
+  -- pipeline or job replaces the previous copy.
+  storeWritePipelines :: b -> Text -> Int -> [(Value, [Value])] -> IO ()
 
 -- | A backend chosen at run time, once the command line has been read.
 data SomeStore = forall b. StoreBackend b => SomeStore b

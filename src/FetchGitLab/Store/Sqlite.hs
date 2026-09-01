@@ -28,6 +28,8 @@ module FetchGitLab.Store.Sqlite
 import Control.Exception (bracket)
 import Control.Monad (forM, forM_)
 import Data.Aeson (Value (..), decodeStrict, encode, fromJSON, toJSON)
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -76,6 +78,7 @@ data SqliteStore = SqliteStore
     -- would otherwise be one round trip per note.
   , sqliteMilestones :: IORef (Map Text Int64)
   , sqliteLabels :: IORef (Map Text Int64)
+  , sqliteRunners :: IORef (Map Text Int64)
   }
 
 -- | Open a store, creating the file and its tables if they are not there.
@@ -98,7 +101,11 @@ openSqliteStore path = do
   execute_ conn "PRAGMA busy_timeout = 5000"
   mapM_ (execute_ conn . Query) schemaStatements
   checkVersion conn
-  SqliteStore path conn <$> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Map.empty
+  SqliteStore path conn
+    <$> newIORef Map.empty
+    <*> newIORef Map.empty
+    <*> newIORef Map.empty
+    <*> newIORef Map.empty
 
 -- | Fold the write ahead log back into the database before letting go of it,
 -- so that what is left behind is one file rather than three.
@@ -144,7 +151,19 @@ sqliteTableCounts st =
     rows <- query_ (sqliteConn st) (Query ("SELECT count(*) FROM " <> t))
     pure (t, case rows of (Only n : _) -> n; [] -> 0)
   where
-    tables = ["records", "notes", "users", "milestones", "labels", "record_users", "note_users"]
+    tables =
+      [ "records"
+      , "notes"
+      , "users"
+      , "milestones"
+      , "labels"
+      , "record_users"
+      , "note_users"
+      , "pipelines"
+      , "jobs"
+      , "runners"
+      , "commits"
+      ]
 
 instance StoreBackend SqliteStore where
   storeName _ = "sqlite"
@@ -168,6 +187,11 @@ instance StoreBackend SqliteStore where
         -- A key with no entry has not been deleted; a run only ever adds, so
         -- it was never there in the first place.
         forM_ (Map.lookup iid store) (writeEntry st (recordKind (Proxy :: Proxy a)) iid)
+
+  storeWritePipelines :: SqliteStore -> Text -> Int -> [(Value, [Value])] -> IO ()
+  storeWritePipelines st kind iid pairs =
+    withTransaction (sqliteConn st) $
+      forM_ pairs $ \(p, jobs) -> writePipeline st kind iid p jobs
 
 -- ---------------------------------------------------------------------------
 -- Writing
@@ -258,6 +282,95 @@ writeNote st kind iid position note = do
       \ VALUES (?, ?, ?, ?, ?)"
       (kind, iid, position, field, row)
 
+-- | Write one pipeline and the jobs it ran.
+--
+-- The pipeline object is kept verbatim: the MR pipelines endpoint returns the
+-- basic pipeline object with nothing shared in it worth lifting.
+writePipeline :: SqliteStore -> Text -> Int -> Value -> [Value] -> IO ()
+writePipeline st kind iid p jobs = do
+  pid <- require "pipeline id" (fieldOf "id" p :: Maybe Int)
+  execute
+    (sqliteConn st)
+    "INSERT OR REPLACE INTO pipelines (pipeline_id, kind, iid, rest) VALUES (?, ?, ?, ?)"
+    (pid, kind, iid, encodeText p)
+  forM_ jobs (writeJob st pid)
+
+-- | Write one job of a pipeline.
+--
+-- Four objects leave the job before it is stored: its @user@ and @runner@ are
+-- interned, its @commit@ is written to the commits table, and its nested
+-- @pipeline@ is dropped outright — it is a shorter copy of the row every
+-- field of which the pipelines table already holds. As in 'splitObject', a
+-- key is only taken out when it holds the shape expected of it, so a @null@
+-- runner stays in @rest@ and the NULL reference column is what says nothing
+-- was lifted.
+--
+-- The scalars a job is queried by are copied into real columns; @rest@ keeps
+-- them too, so it stays the object the server sent minus exactly the four
+-- lifted keys.
+writeJob :: SqliteStore -> Int -> Value -> IO ()
+writeJob st pid v = do
+  jid <- require "job id" (fieldOf "id" v :: Maybe Int)
+  status <- require "job status" (fieldOf "status" v)
+  stage <- require "job stage" (fieldOf "stage" v)
+  createdAt <- require "job created_at" (fieldOf "created_at" v)
+
+  userRow <- traverse (internUser st) (objectAt "user" v)
+  runnerRow <- traverse (internRunner st) (objectAt "runner" v)
+  commitId <- forM (objectAt "commit" v) $ \c -> do
+    cid <- require "commit id" (fieldOf "id" c :: Maybe Text)
+    execute
+      conn
+      "INSERT OR IGNORE INTO commits (commit_id, author_name, author_email, json) \
+      \ VALUES (?, ?, ?, ?)"
+      (cid, fieldOf "author_name" c :: Maybe Text, fieldOf "author_email" c :: Maybe Text, encodeText c)
+    pure cid
+
+  executeNamed
+    conn
+    "INSERT OR REPLACE INTO jobs \
+    \ (id, pipeline_id, user_row, runner_row, commit_id, status, stage, \
+    \  created_at, started_at, finished_at, erased_at, duration, queued_duration, rest) \
+    \ VALUES \
+    \ (:id, :pipeline_id, :user_row, :runner_row, :commit_id, :status, :stage, \
+    \  :created_at, :started_at, :finished_at, :erased_at, :duration, :queued_duration, :rest)"
+    [ ":id" := jid
+    , ":pipeline_id" := pid
+    , ":user_row" := userRow
+    , ":runner_row" := runnerRow
+    , ":commit_id" := commitId
+    , ":status" := (status :: Text)
+    , ":stage" := (stage :: Text)
+    , ":created_at" := (createdAt :: Text)
+    , ":started_at" := (fieldOf "started_at" v :: Maybe Text)
+    , ":finished_at" := (fieldOf "finished_at" v :: Maybe Text)
+    , ":erased_at" := (fieldOf "erased_at" v :: Maybe Text)
+    , ":duration" := (fieldOf "duration" v :: Maybe Double)
+    , ":queued_duration" := (fieldOf "queued_duration" v :: Maybe Double)
+    , ":rest" := encodeText rest
+    ]
+  where
+    conn = sqliteConn st
+
+    lifted = [k | k <- ["user", "pipeline", "commit", "runner"], Just _ <- [objectAt k v]]
+    rest = case v of
+      Object o -> Object (foldr (KM.delete . Key.fromText) o lifted)
+      other -> other
+
+-- | A field of a JSON object, at whatever type the caller expects; 'Nothing'
+-- for a missing field, a @null@, or a value of another shape.
+fieldOf :: Aeson.FromJSON a => Text -> Value -> Maybe a
+fieldOf k = Aeson.parseMaybe (Aeson.withObject "object" (Aeson..: Key.fromText k))
+
+-- | A field holding a JSON object, and nothing of any other shape.
+objectAt :: Text -> Value -> Maybe Value
+objectAt k v = case fieldOf k v of
+  Just o@(Object _) -> Just o
+  _ -> Nothing
+
+require :: Text -> Maybe a -> IO a
+require what = maybe (ioError (userError ("GitLab sent no usable " <> T.unpack what))) pure
+
 -- ---------------------------------------------------------------------------
 -- Interning
 -- ---------------------------------------------------------------------------
@@ -273,6 +386,16 @@ internMilestone :: SqliteStore -> Value -> IO Int64
 internMilestone st value = intern (sqliteMilestones st) key $ do
   execute (sqliteConn st) "INSERT OR IGNORE INTO milestones (json) VALUES (?)" (Only key)
   rowOf (sqliteConn st) "SELECT row_id FROM milestones WHERE json = ?" key
+  where
+    key = encodeText value
+
+-- | Interned by exact JSON like a user, deliberately not by the runner's id:
+-- a runner object is mutable state — @online@, @status@ — and each job keeps
+-- the state its fetch observed.
+internRunner :: SqliteStore -> Value -> IO Int64
+internRunner st value = intern (sqliteRunners st) key $ do
+  execute (sqliteConn st) "INSERT OR IGNORE INTO runners (json) VALUES (?)" (Only key)
+  rowOf (sqliteConn st) "SELECT row_id FROM runners WHERE json = ?" key
   where
     key = encodeText value
 

@@ -193,8 +193,9 @@ library
                 , GitLab.SystemHooks.Types
                 , GitLab.SystemHooks.GitLabSystemHooks
                 , GitLab.SystemHooks.Rules
-  other-modules:
-                  GitLab.WebRequests.GitLabWebCalls
+                -- PATCHED, see PATCHES.md: exposed so a caller can fetch an
+                -- endpoint the typed API does not cover as raw JSON.
+                , GitLab.WebRequests.GitLabWebCalls
   hs-source-dirs:
                  src
   build-depends:

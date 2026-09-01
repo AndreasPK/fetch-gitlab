@@ -115,6 +115,8 @@ tests =
         , testCase "repeated users are shared, not copied" sqliteSharesUsers
         , testCase "a load without notes still knows what is stale" loadWithoutNotesKnowsStaleness
         , testCase "rewriting an unloaded entry keeps its notes" keptNotesSurviveRewrite
+        , testCase "pipelines and jobs are written, their objects shared" pipelinesAreWritten
+        , testCase "rewriting pipelines replaces rather than duplicates" pipelinesRewriteReplaces
         ]
     , testGroup
         "clear-timestamp"
@@ -715,6 +717,77 @@ sqliteSharesUsers = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
           <> " note references"
       )
       (stored < refs)
+
+-- | What one --pipelines fetch of a two pipeline merge request hands the
+-- store: the same commit and user on every job, one runner seen in two
+-- states.
+pipelineFixture :: [(Value, [Value])]
+pipelineFixture =
+  [ (pipelineJson 101, [jobJson 9001 "success" runnerIdle, jobJson 9002 "failed" runnerIdle])
+  , (pipelineJson 102, [jobJson 9003 "failed" runnerBusy])
+  ]
+  where
+    runnerIdle = runnerJson "idle"
+    runnerBusy = runnerJson "busy"
+
+    pipelineJson :: Int -> Value
+    pipelineJson pid =
+      object
+        [ "id" .= pid
+        , "iid" .= (pid + 500)
+        , "status" .= ("failed" :: T.Text)
+        , "sha" .= sha
+        , "created_at" .= ("2026-07-18T09:20:50.122Z" :: T.Text)
+        ]
+
+    jobJson :: Int -> T.Text -> Value -> Value
+    jobJson jid status runner =
+      object
+        [ "id" .= jid
+        , "status" .= status
+        , "stage" .= ("full-build" :: T.Text)
+        , "created_at" .= ("2026-07-18T09:20:50.200Z" :: T.Text)
+        , "started_at" .= ("2026-07-18T09:21:00.000Z" :: T.Text)
+        , "duration" .= (3805.2 :: Double)
+        , "queued_duration" .= (9.7 :: Double)
+        , "name" .= ("x86_64-linux-validate" :: T.Text)
+        , "user" .= object ["id" .= (7 :: Int), "username" .= ("andreask" :: T.Text)]
+        , "commit" .= object ["id" .= sha, "author_name" .= ("A. Klebinger" :: T.Text), "author_email" .= ("a@example.org" :: T.Text)]
+        , "runner" .= runner
+        , "pipeline" .= object ["id" .= (101 :: Int), "sha" .= sha]
+        , "tag_list" .= (["x86_64-linux"] :: [T.Text])
+        ]
+
+    runnerJson :: T.Text -> Value
+    runnerJson state = object ["id" .= (792 :: Int), "description" .= ("maki" :: T.Text), "status" .= state]
+
+    sha = "fd9855fa6e96f7ab472d754c411d5353c9ab38f2" :: T.Text
+
+-- | One write of the fixture: every pipeline and job lands, the objects a job
+-- repeats are shared rather than copied — one commit and one user across all
+-- three jobs — and a runner seen in two states is kept as two rows.
+pipelinesAreWritten :: Assertion
+pipelinesAreWritten = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    counts <- sqliteTableCounts db
+    let count t = maybe 0 id (lookup t counts)
+    assertEqual "pipelines" 2 (count "pipelines")
+    assertEqual "jobs" 3 (count "jobs")
+    assertEqual "commits" 1 (count "commits")
+    assertEqual "users" 1 (count "users")
+    assertEqual "runner states" 2 (count "runners")
+
+-- | Fetching the same merge request again replaces what is there. The id
+-- columns are what stop a second write doubling every table.
+pipelinesRewriteReplaces :: Assertion
+pipelinesRewriteReplaces = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    before <- sqliteTableCounts db
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    after <- sqliteTableCounts db
+    assertEqual "a rewrite changes no table" before after
 
 -- | The point of the command: a store that thinks its discussions are current
 -- has to stop thinking so.
