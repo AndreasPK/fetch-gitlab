@@ -66,3 +66,6 @@ for proximity or windowed matching, pipe `sqlite3 -json` into grep or python.
 `queries.sql` (runs as it stands) keeps the recipes not worth rederiving:
 a record reassembled into one JSON object with its discussion, all-of-several
 labels, store coverage and staleness.
+
+`Pipelines.md` covers CI: how to efficiently check an MR's pipeline success
+status, job failure reasons, and fetch the precise CI build logs.
