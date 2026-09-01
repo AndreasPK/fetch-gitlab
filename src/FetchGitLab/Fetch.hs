@@ -4,9 +4,9 @@
 
 -- | Fetching issues and merge requests from a GitLab server.
 --
--- Fetching is incremental: whatever is already in the JSON lines files is read
--- back in, and only records modified since the newest timestamp we have are
--- requested from GitLab.
+-- Fetching is incremental: whatever is already in the store is read back in,
+-- and only records modified since the newest timestamp we have are requested
+-- from GitLab.
 module FetchGitLab.Fetch
   ( run
   , serverConfig
@@ -20,7 +20,6 @@ module FetchGitLab.Fetch
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
-import Control.Monad (filterM)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.ByteString.Lazy as BL
@@ -41,7 +40,7 @@ import Network.HTTP.Client (Manager, Request, Response, requestHeaders, response
 import Network.HTTP.Client.Internal (Manager (..))
 import Network.HTTP.Types.Header (hUserAgent)
 import Network.HTTP.Types.Status (statusCode)
-import System.Directory (createDirectoryIfMissing, doesFileExist, getFileSize)
+import System.Directory (createDirectoryIfMissing)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isPermissionError)
@@ -79,7 +78,7 @@ import FetchGitLab.Lock
   , lockPath
   , withStoreLocks
   )
-import FetchGitLab.Options (Backend (..), Options (..), dbFile, mrsFile, ticketsFile)
+import FetchGitLab.Options (Options (..))
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
 import FetchGitLab.Store
@@ -151,16 +150,15 @@ serverConfig opts token =
     , debugSystemHooks = Nothing
     }
 
--- | Fetch tickets and merge requests and write them out as JSON lines.
+-- | Fetch tickets and merge requests and write them into the store.
 --
--- Both stores are locked for the duration. A run reads each store, merges into
--- what it read and writes the whole thing back, so two runs sharing a store
--- would each drop the other's work; the second one is turned away instead.
+-- The store is locked for the duration. A run reads it, merges into what it
+-- read and writes the result back, so two runs sharing a store would each drop
+-- the other's work; the second one is turned away instead.
 run :: Options -> IO ()
 run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
   let runLog :: LogT IO a -> IO a
       runLog = runLogT "fetch-gitlab" logger level
-  runLog (checkForOldStore opts)
   spec <- optionsSpec opts
   let paths = specPaths spec
   -- The default location is under the home directory and will not exist on a
@@ -455,47 +453,6 @@ fetchDiscussions gitlab what backend store fetch = do
 -- Only sound because the store was told to write exactly these keys and did.
 forgetWritten :: IntSet.IntSet -> Store a -> Store a
 forgetWritten written store = IntSet.foldl' (flip (Map.adjust keepDiscussion)) store written
-
--- | Stop a run that would silently refetch a project someone already has.
---
--- The default store used to be the JSON lines files and is now the database.
--- Someone who upgrades and runs the same command as yesterday would otherwise
--- start again from nothing: hours of work and tens of thousands of requests to
--- arrive back where they already were. Only the case where nothing was said
--- about where to keep things is caught, since anyone naming a store explicitly
--- has said what they meant.
-checkForOldStore :: Options -> LogT IO ()
-checkForOldStore opts
-  | optBackend opts /= SqliteBackend = pure ()
-  | Just _ <- optDbFile opts = pure ()
-  | otherwise = do
-      db <- liftIO (dbFile opts)
-      started <- liftIO (doesFileExist db)
-      tickets <- liftIO (ticketsFile opts)
-      mrs <- liftIO (mrsFile opts)
-      old <- liftIO (filterM hasContent [tickets, mrs])
-      case (started, old) of
-        (False, kept@(_ : _)) -> do
-          logAttention_ $
-            "There is a JSON lines store at "
-              <> T.intercalate ", " (map T.pack kept)
-              <> " but no database at "
-              <> T.pack db
-          logAttention_
-            "The default store is now sqlite, so this run would fetch the project again \
-            \from the beginning rather than carry on from what is already there."
-          logAttention_ $
-            "To keep it:  fetch-gitlab --convert --from jsonl --to sqlite --input-path "
-              <> T.pack (takeDirectory tickets)
-              <> " --output-path "
-              <> T.pack db
-          logAttention_ "To carry on as before, pass --backend jsonl."
-          liftIO exitFailure
-        _ -> pure ()
-  where
-    hasContent path = do
-      there <- doesFileExist path
-      if there then (> 0) <$> getFileSize path else pure False
 
 -- | Log a reason the run cannot go on, and stop.
 abort :: (MonadLog m, MonadIO m) => Text -> m a

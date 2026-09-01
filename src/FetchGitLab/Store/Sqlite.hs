@@ -7,10 +7,10 @@
 -- The shape of what is stored is 'FetchGitLab.Store.Schema'; this module is
 -- the part that talks to the database. Two things about it are worth knowing.
 --
--- __It writes only what changed.__ A JSON lines store has to be rewritten from
--- the top at every checkpoint, which over a cold run costs orders of magnitude
--- more writing than the data is worth. Here a checkpoint upserts the entries
--- whose keys the caller passed and leaves the rest alone.
+-- __It writes only what changed.__ A store that has to be rewritten from the
+-- top at every checkpoint costs, over a cold run, orders of magnitude more
+-- writing than the data is worth. Here a checkpoint upserts the entries whose
+-- keys the caller passed and leaves the rest alone.
 --
 -- __It shares repeated objects.__ A user arrives again with every note, and a
 -- project has thousands of notes per person. Users and milestones are interned

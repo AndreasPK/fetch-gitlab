@@ -2,10 +2,10 @@
 
 -- | The relational shape of what a store holds.
 --
--- The JSON lines stores repeat themselves heavily: the same user object is
--- written out once per note, and a project's notes outnumber its people by
--- thousands to one. This module says what the objects actually are and how
--- they relate, so a backend that can share them does not have to guess.
+-- What GitLab sends repeats itself heavily: the same user object arrives once
+-- per note, and a project's notes outnumber its people by thousands to one.
+-- This module says what the objects actually are and how they relate, so a
+-- backend that can share them does not have to guess.
 --
 -- The entities are:
 --
@@ -201,8 +201,8 @@ spliceObject _ _ v = v
 -- written beside it. They take no space, they can be indexed, and there is no
 -- Haskell code deciding what goes in them, so they cannot come to disagree
 -- with the record they describe. Writing them as ordinary columns was the
--- first attempt and made the database half again as large as the JSON lines
--- files it replaced, since every note body was then stored twice.
+-- first attempt and made the database half again as large as the JSON it
+-- holds, since every note body was then stored twice.
 --
 -- The real columns are only what SQLite cannot derive: the keys, the lifted
 -- references, and the two pieces of bookkeeping that are not part of a record

@@ -5,8 +5,7 @@
 --
 -- A backend holds tickets and merge requests together: 'storeLoad' and
 -- 'storeSave' pick which by the 'Record' instance they are used at, so one
--- handle serves both. That is what lets a SQLite store be a single file while
--- a JSON lines store is a file per kind.
+-- handle serves both, whether the backend keeps them in one place or two.
 module FetchGitLab.Store.Class
   ( StoreBackend (..)
   , SomeStore (..)
@@ -53,7 +52,7 @@ class StoreBackend b where
   -- back as "leave what is there alone". A fetch uses this: notes are three
   -- quarters of a store and it needs none of their content, only whether a
   -- discussion is there and what record version it belongs to. Anything that
-  -- has to copy the notes -- @--convert@ -- must use 'storeLoad' instead.
+  -- has to see the notes themselves must use 'storeLoad' instead.
   --
   -- The default reads them, for a backend that cannot do better. That is
   -- honest rather than merely convenient: 'Kept' promises the notes are safe

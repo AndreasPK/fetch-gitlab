@@ -1,9 +1,9 @@
 cabal-version:      3.0
 name:               fetch-gitlab
 version:            0.1.1.0
-synopsis:           Fetch all issues/MRs from a GitLab instance as JSONL
+synopsis:           Fetch all issues/MRs from a GitLab instance into SQLite
 description:        Command line tool to dump GitLab issues and merge requests
-                    into newline delimited JSON files.
+                    into a SQLite database.
 license:            BSD-3-Clause
 author:             Andreas Klebinger
 maintainer:         klebinger.andreas@gmx.at
@@ -18,8 +18,6 @@ library
     hs-source-dirs:   src
     exposed-modules:  FetchGitLab.Options
                       FetchGitLab.ClearTimestamp
-                      FetchGitLab.Convert
-                      FetchGitLab.JsonLines
                       FetchGitLab.Logging
                       FetchGitLab.Lock
                       FetchGitLab.RateLimit
@@ -27,7 +25,6 @@ library
                       FetchGitLab.Store
                       FetchGitLab.Store.Backend
                       FetchGitLab.Store.Class
-                      FetchGitLab.Store.JsonLines
                       FetchGitLab.Store.Schema
                       FetchGitLab.Store.Sqlite
                       FetchGitLab.Fetch

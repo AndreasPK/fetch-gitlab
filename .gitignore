@@ -11,3 +11,6 @@ gitlab-token
 # ~/.fetch-gitlab/<name>.jsonl
 /tickets
 /mrs
+
+# Scratch space, not for commit
+tmp/

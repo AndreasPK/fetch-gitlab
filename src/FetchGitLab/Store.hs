@@ -1,15 +1,13 @@
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
--- | The on-disk JSON lines store of tickets and merge requests.
+-- | What a store holds, independently of where it is kept.
 --
--- Each line is an object wrapping one record together with its discussion:
+-- An entry is one record together with its discussion and the record version
+-- that discussion was fetched for. A store is keyed by the project local id
+-- (@iid@) of a record, so fetching the same record again simply replaces the
+-- old copy.
 --
--- > {"ticket": {...}, "discussion": [...], "discussion_updated_at": "..."}
---
--- A store is keyed by the project local id (@iid@) of a record, so fetching
--- the same record again simply replaces the old copy.
+-- Where the entries actually live is 'FetchGitLab.Store.Class.StoreBackend'.
 module FetchGitLab.Store
   ( Record (..)
   , Entry (..)
@@ -20,37 +18,20 @@ module FetchGitLab.Store
   , newEntry
   , needsDiscussion
   , setDiscussion
-  , readStore
-  , writeStore
   , latestUpdate
   , mergeRecords
   , alreadyCurrent
   ) where
 
-import Data.Aeson
-  ( FromJSON (..)
-  , Key
-  , ToJSON (..)
-  , eitherDecode
-  , object
-  , withObject
-  , (.:)
-  , (.:?)
-  , (.=)
-  )
-import Data.Bifunctor (first)
-import qualified Data.ByteString.Lazy.Char8 as BL
+import Data.Aeson (FromJSON, ToJSON)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, mapMaybe)
-import Data.Proxy (Proxy (..))
+import Data.Maybe (mapMaybe)
+import Data.Proxy (Proxy)
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
-import System.Directory (doesFileExist, renameFile)
 
 import GitLab.Types (Issue (..), MergeRequest (..), Note)
-
-import FetchGitLab.JsonLines (writeJsonLines)
 
 -- | Records we can keep in a store.
 class (FromJSON a, ToJSON a) => Record a where
@@ -60,9 +41,6 @@ class (FromJSON a, ToJSON a) => Record a where
   -- | When the record was last modified, if GitLab told us.
   recordUpdatedAt :: a -> Maybe UTCTime
 
-  -- | The JSON field the record itself is stored under.
-  recordField :: Proxy a -> Key
-
   -- | What to call this kind of record where a name is needed rather than a
   -- JSON key: the @kind@ column of a table, a log line, an error message.
   recordKind :: Proxy a -> Text
@@ -70,13 +48,11 @@ class (FromJSON a, ToJSON a) => Record a where
 instance Record Issue where
   recordKey = issue_iid
   recordUpdatedAt = issue_updated_at
-  recordField _ = "ticket"
   recordKind _ = "ticket"
 
 instance Record MergeRequest where
   recordKey = merge_request_iid
   recordUpdatedAt = Just . merge_request_updated_at
-  recordField _ = "mr"
   recordKind _ = "mr"
 
 -- | One record together with its discussion.
@@ -127,21 +103,6 @@ keepDiscussion e = case entryDiscussion e of
   Notes _ -> e {entryDiscussion = Kept}
   _ -> e
 
-instance Record a => ToJSON (Entry a) where
-  toJSON e =
-    object $
-      (recordField (Proxy :: Proxy a) .= entryRecord e)
-        : catMaybes
-          [ ("discussion" .=) <$> discussionNotes (entryDiscussion e)
-          , ("discussion_updated_at" .=) <$> entryDiscussionFor e
-          ]
-
-instance Record a => FromJSON (Entry a) where
-  parseJSON = withObject "Entry" $ \o -> do
-    record <- o .: recordField (Proxy :: Proxy a)
-    discussion <- maybe NeverFetched Notes <$> o .:? "discussion"
-    Entry record discussion <$> o .:? "discussion_updated_at"
-
 -- | A record we have not fetched any discussion for yet.
 newEntry :: a -> Entry a
 newEntry r = Entry r NeverFetched Nothing
@@ -164,36 +125,6 @@ setDiscussion notes e =
 
 -- | Entries indexed by 'recordKey'.
 type Store a = Map Int (Entry a)
-
--- | Read a store from a JSON lines file. A missing file is an empty store.
---
--- Parsing is all-or-nothing on purpose: a partially readable file would
--- otherwise be silently truncated when we write it back out.
-readStore :: forall a. Record a => FilePath -> IO (Either String (Store a))
-readStore path = do
-  exists <- doesFileExist path
-  if not exists
-    then pure (Right Map.empty)
-    else do
-      contents <- BL.readFile path
-      let ls = filter (not . BL.null) (BL.lines contents)
-      pure $ toStore <$> traverse decodeLine (zip [1 :: Int ..] ls)
-  where
-    decodeLine (lineNo, line) =
-      first (\err -> path <> ":" <> show lineNo <> ": " <> err) (eitherDecode line)
-
-    toStore entries = Map.fromList [(recordKey (entryRecord e), e) | e <- entries]
-
--- | Write a store out as JSON lines, ordered by key.
---
--- The file is written to a temporary path and renamed into place, so an
--- interrupted run cannot leave a half written store behind.
-writeStore :: Record a => FilePath -> Store a -> IO ()
-writeStore path store = do
-  writeJsonLines tmpPath (Map.elems store)
-  renameFile tmpPath path
-  where
-    tmpPath = path <> ".tmp"
 
 -- | The most recent modification time in the store, if any.
 latestUpdate :: Record a => Store a -> Maybe UTCTime

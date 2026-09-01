@@ -16,9 +16,9 @@
 -- fields, since an empty aggregate would otherwise insert []. On a ticket
 -- the merged_by/reviewers subqueries are empty and simply drop out.
 --
--- Not byte-exact against what GitLab sent: `fetch-gitlab --convert` goes
--- through the code that guarantees the round trip. ORDER BY inside an
--- aggregate needs SQLite 3.44 or newer.
+-- Not byte-exact against what GitLab sent: the store's own reader is what
+-- guarantees the round trip. ORDER BY inside an aggregate needs SQLite 3.44
+-- or newer.
 SELECT json_patch(
          r.rest,
          json_object(

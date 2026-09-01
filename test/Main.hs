@@ -1,14 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Tests for the JSON lines store.
+-- | Tests for the store and the fetching around it.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
-import Data.Aeson (FromJSON, ToJSON, Value (..), eitherDecode, encode, object, toJSON, (.=))
-import qualified Data.Aeson.KeyMap as KM
+import Data.Aeson (FromJSON, Value, eitherDecode, encode, object, toJSON, (.=))
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.IntSet as IntSet
 import Data.List (isInfixOf, nub)
@@ -20,7 +19,7 @@ import Data.Time.Clock (UTCTime (..), addUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTime)
 import Control.Monad (forM_)
 import Control.Monad.IO.Class (liftIO)
-import System.Directory (createDirectoryIfMissing, doesFileExist, setModificationTime)
+import System.Directory (doesFileExist, renameFile, setModificationTime)
 import System.Environment (getArgs, getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
@@ -38,10 +37,9 @@ import Log.Internal.Logger (withLogger)
 import Log.Backend.StandardOutput (withStdOutLogger)
 
 import FetchGitLab.ClearTimestamp (clearTimestamps)
-import FetchGitLab.Convert (convertStores)
 import FetchGitLab.Fetch (challengeWaits, readToken, waitOutChallenge)
 import FetchGitLab.Options (Backend (..), parseBackend)
-import FetchGitLab.Store.Backend (StoreSpec (..), detectSpec, pathSpec, specPaths)
+import FetchGitLab.Store.Backend (StoreSpec (..), detectSpec)
 import FetchGitLab.Lock
   ( LockBusy (..)
   , LockInfo (..)
@@ -61,12 +59,9 @@ import FetchGitLab.Store
   , mergeRecords
   , needsDiscussion
   , newEntry
-  , readStore
   , setDiscussion
-  , writeStore
   )
 import FetchGitLab.Store.Class (StoreBackend (..), storeSaveAll)
-import FetchGitLab.Store.JsonLines (openJsonLinesStore)
 import FetchGitLab.Store.Schema
   ( Lifted (..)
   , noteSpec
@@ -90,15 +85,8 @@ tests =
   testGroup
     "fetch-gitlab"
     [ testGroup
-        "JSON lines roundtrip"
-        [ testCase "issues" $ roundtripFile (Proxy :: Proxy Issue) "test/data/issues.jsonl"
-        , testCase "merge requests" $ roundtripFile (Proxy :: Proxy MergeRequest) "test/data/mrs.jsonl"
-        ]
-    , testGroup
         "store"
-        [ testCase "missing file is an empty store" missingFileIsEmpty
-        , testCase "reading a corrupt file fails" corruptFileFails
-        , testCase "merging replaces records with the same iid" mergeReplaces
+        [ testCase "merging replaces records with the same iid" mergeReplaces
         , testCase "latestUpdate finds the newest timestamp" latestUpdateIsNewest
         ]
     , testGroup
@@ -119,18 +107,11 @@ tests =
         [ testCase "issues survive a round trip" (sqliteRoundtrips (Proxy :: Proxy Issue) "test/data/issues.jsonl")
         , testCase "merge requests survive a round trip" (sqliteRoundtrips (Proxy :: Proxy MergeRequest) "test/data/mrs.jsonl")
         , testCase "an empty store reads back empty" sqliteStartsEmpty
-        , testCase "both backends hold the same thing" backendsAgree
         , testCase "a checkpoint writes only what changed" sqliteWritesOnlyChanged
         , testCase "reopening finds what was written" sqliteSurvivesReopen
         , testCase "repeated users are shared, not copied" sqliteSharesUsers
         , testCase "a load without notes still knows what is stale" loadWithoutNotesKnowsStaleness
         , testCase "rewriting an unloaded entry keeps its notes" keptNotesSurviveRewrite
-        ]
-    , testGroup
-        "convert"
-        [ testCase "jsonl to sqlite and back is the same store" convertRoundtrips
-        , testCase "converting between the same backend copies" convertCopies
-        , testCase "a jsonl store is named by its directory" convertNamesJsonlByDirectory
         ]
     , testGroup
         "clear-timestamp"
@@ -184,7 +165,7 @@ tests =
 -- two processes: the lock belongs to the open file, not to the process.
 lockIsExclusive :: Assertion
 lockIsExclusive = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let store = dir </> "tickets.jsonl"
+  let store = dir </> "gitlab.db"
   outer <- withStoreLocks [store] $ withStoreLocks [store] (pure ())
   case outer of
     Left busy -> assertFailure ("outer lock was refused: " <> show busy)
@@ -196,7 +177,7 @@ lockIsExclusive = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
 -- file cannot be read while this process holds it open.
 lockRecordsHolder :: Assertion
 lockRecordsHolder = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let store = dir </> "tickets.jsonl"
+  let store = dir </> "gitlab.db"
   us <- fromIntegral <$> getCurrentPid
   began <- getCurrentTime
   taken <- withStoreLocks [store] (pure ())
@@ -218,7 +199,7 @@ lockRecordsHolder = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
 -- locked out by its predecessor.
 lockIsReleased :: Assertion
 lockIsReleased = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let store = dir </> "tickets.jsonl"
+  let store = dir </> "gitlab.db"
   first' <- withStoreLocks [store] (pure ())
   first' @?= Right ()
   second <- withStoreLocks [store] (pure ())
@@ -227,8 +208,8 @@ lockIsReleased = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
 -- | Runs pointed at different files have nothing to fight over.
 lockIsPerStore :: Assertion
 lockIsPerStore = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let tickets = dir </> "tickets.jsonl"
-      mrs = dir </> "mrs.jsonl"
+  let tickets = dir </> "one.db"
+      mrs = dir </> "two.db"
   result <- withStoreLocks [tickets] $ withStoreLocks [mrs] (pure ())
   result @?= Right (Right ())
 
@@ -236,8 +217,8 @@ lockIsPerStore = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
 -- enough to turn a full run away, and it is named as the reason.
 lockIsAllOrNothing :: Assertion
 lockIsAllOrNothing = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let tickets = dir </> "tickets.jsonl"
-      mrs = dir </> "mrs.jsonl"
+  let tickets = dir </> "one.db"
+      mrs = dir </> "two.db"
   result <- withStoreLocks [mrs] $ withStoreLocks [tickets, mrs] (pure ())
   case result of
     Right (Left busy) -> busyStore busy @?= mrs
@@ -253,7 +234,7 @@ lockIsAllOrNothing = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
 -- replaced file and let this second run straight in.
 lockExcludesAnotherProcess :: Assertion
 lockExcludesAnotherProcess = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let store = dir </> "tickets.jsonl"
+  let store = dir </> "gitlab.db"
       ready = dir </> "ready"
       release = dir </> "release"
   self <- getExecutablePath
@@ -289,7 +270,9 @@ holdLockFlag = "--hold-lock"
 holdLock :: FilePath -> FilePath -> FilePath -> IO ()
 holdLock store ready release = do
   result <- withStoreLocks [store] $ do
-    writeStore store (Map.empty :: Store Issue)
+    -- What a checkpoint does to the file the lock is meant to cover.
+    writeFile (store <> ".tmp") ""
+    renameFile (store <> ".tmp") store
     writeFile ready ""
     told <- waitForFile release
     if told then pure ExitSuccess else pure (ExitFailure 3)
@@ -487,76 +470,29 @@ runQuietly act = do
   logger <- mkLogger "test" (\_ -> pure ())
   withLogger logger $ \sink -> runLogT "test" sink LogTrace act
 
--- | Read GitLab's own JSON for a set of records, write it out as a store, read
--- it back, and check nothing changed on the way. This is what makes an
--- incremental run safe: yesterday's file has to decode into the same values we
--- would have fetched today.
-roundtripFile :: forall a. Record a => Proxy a -> FilePath -> Assertion
-roundtripFile _ path = do
-  original <- decodeFixture path :: IO [a]
-  assertBool (path <> " has no records") (not (null original))
-
-  withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-    let storePath = dir </> "store"
-        store = mergeRecords Map.empty original
-
-    writeStore storePath store
-    reread <- readStore storePath :: IO (Either String (Store a))
-    case reread of
-      Left err -> assertFailure ("re-reading the store failed: " <> err)
-      Right store' -> do
-        assertEqual "number of records" (Map.size store) (Map.size store')
-        assertEqual "keys" (Map.keys store) (Map.keys store')
-        assertEqual
-          "records"
-          (map jsonOf (Map.elems store))
-          (map jsonOf (Map.elems store'))
-
-    -- Writing the re-read store again has to be byte for byte identical,
-    -- otherwise repeated runs would keep rewriting the same data.
-    let storePath' = dir </> "store2"
-    Right store' <- readStore storePath :: IO (Either String (Store a))
-    writeStore storePath' store'
-    first <- BL.readFile storePath
-    second <- BL.readFile storePath'
-    assertEqual "re-encoding is stable" first second
-
--- | An entry with notes attached survives the trip through the file, and comes
--- back no longer needing a discussion.
+-- | An entry with notes attached survives the trip through the store, and
+-- comes back no longer needing a discussion.
 discussionRoundtrips :: Assertion
 discussionRoundtrips = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
   assertBool "fixture has notes" (not (null notes))
 
-  let path = dir </> "store"
+  let path = dir </> "gitlab.db"
       store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-  writeStore path store
+  withSqliteStore path (`storeSaveAll` store)
 
-  Right store' <- readStore path :: IO (Either String (Store Issue))
-  assertEqual "entries" (Map.keys store) (Map.keys store')
-  assertEqual
-    "entries roundtrip"
-    (map toJSON (Map.elems store))
-    (map toJSON (Map.elems store'))
-  assertEqual
-    "notes came back"
-    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store))
-    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store'))
-  assertBool
-    "nothing needs re-fetching"
-    (not (any needsDiscussion (Map.elems store')))
-
-  -- The wrapper really is on disk, not just in memory.
-  written <- BL.lines <$> BL.readFile path
-  case written of
-    [] -> assertFailure "nothing was written"
-    (line : _) -> case eitherDecode line :: Either String Value of
-      Left err -> assertFailure err
-      Right (Object o) -> do
-        assertBool "has a ticket field" ("ticket" `elem` map fst (KM.toList o))
-        assertBool "has a discussion field" ("discussion" `elem` map fst (KM.toList o))
-      Right _ -> assertFailure "expected a JSON object per line"
+  withSqliteStore path $ \db -> do
+    Right store' <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual "entries" (Map.keys store) (Map.keys store')
+    assertEqual
+      "nothing still wants its discussion"
+      []
+      (Map.keys (Map.filter needsDiscussion store'))
+    assertEqual
+      "notes came back"
+      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store))
+      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store'))
 
 -- | Re-fetching a record must not throw away the discussion we already have.
 mergeKeepsDiscussion :: Assertion
@@ -594,29 +530,31 @@ changedRecordIsStale = do
 --
 -- This is a full cycle rather than an in-memory check, because the store on
 -- disk is what a second run actually sees, and a timestamp that did not
--- survive encoding would make every run re-fetch everything.
+-- survive being written would make every run re-fetch everything.
 secondRunAsksForNothing :: Assertion
 secondRunAsksForNothing = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let path = dir </> "store"
+  let path = dir </> "gitlab.db"
 
   -- First run: fetch the records, fetch their notes, write.
-  writeStore path (Map.map (setDiscussion notes) (mergeRecords Map.empty issues))
+  withSqliteStore path $ \db ->
+    storeSaveAll db (Map.map (setDiscussion notes) (mergeRecords Map.empty issues))
 
   -- Second run: read that back, and let GitLab hand us the same records over
   -- again, which it does for anything modified within a second of our newest.
-  Right stored <- readStore path :: IO (Either String (Store Issue))
-  let merged = mergeRecords stored issues
-  assertEqual "no entries appeared or vanished" (Map.keys stored) (Map.keys merged)
-  assertEqual
-    "every re-fetched record was one we already had"
-    (length issues)
-    (alreadyCurrent stored issues)
-  assertEqual
-    "nothing is requested a second time"
-    []
-    (Map.keys (Map.filter needsDiscussion merged))
+  withSqliteStore path $ \db -> do
+    Right stored <- storeLoadWithoutNotes db :: IO (Either String (Store Issue))
+    let merged = mergeRecords stored issues
+    assertEqual "no entries appeared or vanished" (Map.keys stored) (Map.keys merged)
+    assertEqual
+      "every re-fetched record was one we already had"
+      (length issues)
+      (alreadyCurrent stored issues)
+    assertEqual
+      "nothing is requested a second time"
+      []
+      (Map.keys (Map.filter needsDiscussion merged))
 
 -- | And the converse: a record that really did change is the only one asked
 -- about again, so a run costs requests in proportion to what moved.
@@ -624,9 +562,11 @@ onlyChangedIsRefetched :: Assertion
 onlyChangedIsRefetched = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let path = dir </> "store"
-  writeStore path (Map.map (setDiscussion notes) (mergeRecords Map.empty issues))
-  Right stored <- readStore path :: IO (Either String (Store Issue))
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db ->
+    storeSaveAll db (Map.map (setDiscussion notes) (mergeRecords Map.empty issues))
+  Right stored <-
+    withSqliteStore path storeLoadWithoutNotes :: IO (Either String (Store Issue))
 
   case issues of
     [] -> assertFailure "fixture is empty"
@@ -682,8 +622,8 @@ sqliteRoundtrips _ path = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> 
         assertEqual "keys" (Map.keys store) (Map.keys store')
         assertEqual
           "entries, discussions and timestamps"
-          (map toJSON (Map.elems store))
-          (map toJSON (Map.elems store'))
+          (map entryJson (Map.elems store))
+          (map entryJson (Map.elems store'))
         assertBool
           "nothing needs re-fetching that did not before"
           (map needsDiscussion (Map.elems store) == map needsDiscussion (Map.elems store'))
@@ -695,25 +635,6 @@ sqliteStartsEmpty = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
     case loaded of
       Left err -> assertFailure ("a fresh database should be empty, got: " <> err)
       Right store -> assertEqual "empty" 0 (Map.size store)
-
--- | Whichever backend a run used, the next run has to see the same thing.
-backendsAgree :: Assertion
-backendsAgree = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-
-  jsonl <- openJsonLinesStore (dir </> "tickets.jsonl") (dir </> "mrs.jsonl")
-  storeSaveAll jsonl store
-  Right fromJsonl <- storeLoad jsonl :: IO (Either String (Store Issue))
-
-  withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
-    Right fromSqlite <- storeLoad db :: IO (Either String (Store Issue))
-    assertEqual
-      "the two backends disagree"
-      (map toJSON (Map.elems fromJsonl))
-      (map toJSON (Map.elems fromSqlite))
 
 -- | The reason for the backend at all: a checkpoint must not rewrite the
 -- whole store, and must not lose the part it did not write.
@@ -746,8 +667,8 @@ sqliteWritesOnlyChanged = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> 
       Right settled <- storeLoad db :: IO (Either String (Store Issue))
       assertEqual
         "an empty changed set still wrote something"
-        (map toJSON (Map.elems reread))
-        (map toJSON (Map.elems settled))
+        (map entryJson (Map.elems reread))
+        (map entryJson (Map.elems settled))
 
 sqliteSurvivesReopen :: Assertion
 sqliteSurvivesReopen = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
@@ -760,8 +681,8 @@ sqliteSurvivesReopen = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
     Right reread <- storeLoad db :: IO (Either String (Store Issue))
     assertEqual
       "what a later run reads"
-      (map toJSON (Map.elems store))
-      (map toJSON (Map.elems reread))
+      (map entryJson (Map.elems store))
+      (map entryJson (Map.elems reread))
 
 -- | Sharing is the point of the schema, so it is worth checking it happens
 -- rather than assuming it: the same author on every note must be one row.
@@ -829,8 +750,8 @@ clearIsIdempotent = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
     Right twice <- storeLoad db :: IO (Either String (Store Issue))
     assertEqual
       "the second clearing changed something"
-      (map toJSON (Map.elems once))
-      (map toJSON (Map.elems twice))
+      (map entryJson (Map.elems once))
+      (map entryJson (Map.elems twice))
 
 -- | A store with current discussions, before and after clearing it.
 withClearedStore :: (Store Issue -> Store Issue -> Assertion) -> Assertion
@@ -844,58 +765,6 @@ withClearedStore check = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> d
     runNoLog (clearTimestamps db)
     Right cleared <- storeLoad db :: IO (Either String (Store Issue))
     check before cleared
-
--- | What @--convert@ does, without the command line around it: a store put
--- through the other backend and back has to be the store we started with.
-convertRoundtrips :: Assertion
-convertRoundtrips = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  mrs <- decodeFixture "test/data/mrs.jsonl" :: IO [MergeRequest]
-  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let tickets = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-      requests = mergeRecords Map.empty mrs
-
-  createDirectoryIfMissing True (dir </> "src")
-  createDirectoryIfMissing True (dir </> "back")
-  source <- openJsonLinesStore (dir </> "src" </> "tickets.jsonl") (dir </> "src" </> "mrs.jsonl")
-  storeSaveAll source tickets
-  storeSaveAll source requests
-
-  withSqliteStore (dir </> "out.db") $ \db -> runNoLog (convertStores source db)
-  back <- openJsonLinesStore (dir </> "back" </> "tickets.jsonl") (dir </> "back" </> "mrs.jsonl")
-  withSqliteStore (dir </> "out.db") $ \db -> runNoLog (convertStores db back)
-
-  -- The files themselves, not just what they decode to: a conversion that
-  -- reordered or re-encoded anything would show up here.
-  forM_ ["tickets.jsonl", "mrs.jsonl"] $ \name -> do
-    before <- BL.readFile (dir </> "src" </> name)
-    afterwards <- BL.readFile (dir </> "back" </> name)
-    assertEqual (name <> " changed on the way through sqlite") before afterwards
-
--- | Both ends being the same backend is allowed, and is how a store gets
--- copied or rebuilt.
-convertCopies :: Assertion
-convertCopies = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  let store = mergeRecords Map.empty issues
-  withSqliteStore (dir </> "a.db") $ \a -> do
-    storeSaveAll a store
-    withSqliteStore (dir </> "b.db") $ \b -> do
-      runNoLog (convertStores a b)
-      Right copied <- storeLoad b :: IO (Either String (Store Issue))
-      assertEqual
-        "the copy differs"
-        (map toJSON (Map.elems store))
-        (map toJSON (Map.elems copied))
-
--- | @--input-path@ and @--output-path@ take one path, so a JSON lines store is
--- named by the directory its two files sit in.
-convertNamesJsonlByDirectory :: Assertion
-convertNamesJsonlByDirectory = do
-  pathSpec JsonLinesBackend "/tmp/store"
-    @?= JsonLinesSpec "/tmp/store/tickets.jsonl" "/tmp/store/mrs.jsonl"
-  pathSpec SqliteBackend "/tmp/gitlab.db" @?= SqliteSpec "/tmp/gitlab.db"
-  specPaths (pathSpec SqliteBackend "/tmp/gitlab.db") @?= ["/tmp/gitlab.db"]
 
 -- | Conversions log, and the tests do not care what they say.
 runNoLog :: LogT IO a -> IO a
@@ -937,8 +806,8 @@ splitKeepsAbsence = do
 
 backendFlagParses :: Assertion
 backendFlagParses = do
-  parseBackend "jsonl" @?= Right JsonLinesBackend
   parseBackend "sqlite" @?= Right SqliteBackend
+  parseBackend "sqlite3" @?= Right SqliteBackend
   assertBool "nonsense is rejected" (either (const True) (const False) (parseBackend "postgres"))
 
 -- | A mistyped @--token@ path has to come back as something we can log, not as
@@ -972,22 +841,6 @@ tokenIsStripped = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   writeFile path "  glpat-secret\n"
   readToken path >>= (@?= Right "glpat-secret")
 
-missingFileIsEmpty :: Assertion
-missingFileIsEmpty = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  result <- readStore (dir </> "does-not-exist") :: IO (Either String (Store Issue))
-  case result of
-    Left err -> assertFailure ("expected an empty store, got: " <> err)
-    Right store -> assertEqual "empty" 0 (Map.size store)
-
-corruptFileFails :: Assertion
-corruptFileFails = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
-  let path = dir </> "store"
-  BL.writeFile path "{\"not\": \"an issue\"}\n"
-  result <- readStore path :: IO (Either String (Store Issue))
-  case result of
-    Left err -> assertBool "error names the file and line" ("store:1:" `isInfixOf` err)
-    Right _ -> assertFailure "expected a parse failure"
-
 mergeReplaces :: Assertion
 mergeReplaces = do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
@@ -1003,32 +856,25 @@ latestUpdateIsNewest = do
       expected = maximum [t | Just t <- map recordUpdatedAt issues] :: UTCTime
   assertEqual "newest timestamp" (Just expected) (latestUpdate store)
 
--- | A directory can hold a store of either kind, or one of each left over from
--- a change of backend. The one being written to is the one to read, and that
--- is the newest.
+-- | A directory can hold more than one store: a run pointed at a second
+-- database, or a copy taken before some experiment. The one being written to
+-- is the one to read, and that is the newest.
 detectsNewestStore :: Assertion
 detectsNewestStore = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   let db = dir </> "gitlab.db"
-      tickets = dir </> "tickets.jsonl"
-      mrs = dir </> "mrs.jsonl"
+      other = dir </> "other.db"
       at = UTCTime (fromGregorian 2026 1 1) 0
 
   -- Only the names and the timestamps matter here; nothing is opened.
-  forM_ [db, tickets, mrs] (`writeFile` "")
+  forM_ [db, other] (`writeFile` "")
   setModificationTime db at
-  forM_ [tickets, mrs] (`setModificationTime` addUTCTime 60 at)
+  setModificationTime other (addUTCTime 60 at)
   detected <- detectSpec dir
-  assertEqual "the newer JSON lines pair" (Just (JsonLinesSpec tickets mrs)) detected
+  assertEqual "the newer of the two" (Just (SqliteSpec other)) detected
 
   setModificationTime db (addUTCTime 120 at)
   detected' <- detectSpec dir
-  assertEqual "the newer database" (Just (SqliteSpec db)) detected'
-
-  -- A tie is the case where nothing has been written since both were created.
-  -- SQLite is what a run uses unless told otherwise, so it wins.
-  forM_ [db, tickets, mrs] (`setModificationTime` at)
-  detected'' <- detectSpec dir
-  assertEqual "a tie goes to sqlite" (Just (SqliteSpec db)) detected''
+  assertEqual "the other one, once it is the newer" (Just (SqliteSpec db)) detected'
 
 -- | The case that makes a naive timestamp comparison wrong: a run checkpoints
 -- into the write ahead log and only folds it into the database when it closes,
@@ -1037,13 +883,12 @@ detectsNewestStore = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
 detectsThroughWriteAheadLog :: Assertion
 detectsThroughWriteAheadLog = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   let db = dir </> "gitlab.db"
-      tickets = dir </> "tickets.jsonl"
-      mrs = dir </> "mrs.jsonl"
+      other = dir </> "other.db"
       at = UTCTime (fromGregorian 2026 1 1) 0
 
-  forM_ [db, tickets, mrs, db <> "-wal"] (`writeFile` "")
+  forM_ [db, other, db <> "-wal"] (`writeFile` "")
   setModificationTime db at
-  forM_ [tickets, mrs] (`setModificationTime` addUTCTime 60 at)
+  setModificationTime other (addUTCTime 60 at)
   setModificationTime (db <> "-wal") (addUTCTime 120 at)
   detected <- detectSpec dir
   assertEqual "the store being written to" (Just (SqliteSpec db)) detected
@@ -1059,7 +904,7 @@ detectsNothingToRead = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   missing <- detectSpec (dir </> "not-there")
   assertEqual "a directory that does not exist" Nothing missing
 
-  forM_ ["gitlab.db.bak-20260816", "tickets.jsonl.lock", "notes.txt"] $ \name ->
+  forM_ ["gitlab.db.bak-20260816", "gitlab.db.lock", "notes.txt"] $ \name ->
     writeFile (dir </> name) ""
   backups <- detectSpec dir
   assertEqual "backups and lock files" Nothing backups
@@ -1072,5 +917,14 @@ decodeFixture path = do
   where
     decodeOrFail line = either (assertFailure . (("decoding " <> path <> ": ") <>)) pure (eitherDecode line)
 
-jsonOf :: ToJSON a => a -> Value
-jsonOf = toJSON
+-- | An entry as a value, for comparing one store against another: the record,
+-- the notes hanging off it, and the record version those notes were fetched
+-- for. 'Entry' has no 'Eq' of its own, and this says what "the same entry"
+-- means for these tests without a store format having to say it.
+entryJson :: Record a => Entry a -> Value
+entryJson e =
+  object
+    [ "record" .= toJSON (entryRecord e)
+    , "discussion" .= toJSON (discussionNotes (entryDiscussion e))
+    , "discussion_updated_at" .= toJSON (entryDiscussionFor e)
+    ]

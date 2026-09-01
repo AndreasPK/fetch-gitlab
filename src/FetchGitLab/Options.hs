@@ -4,19 +4,15 @@
 module FetchGitLab.Options
   ( Command (..)
   , Options (..)
-  , ConvertOptions (..)
   , ClearOptions (..)
   , Backend (..)
   , parseBackend
   , backendName
   , optionsParser
-  , convertParser
   , clearParser
   , commandParser
   , commandParserInfo
   , defaultStoreDir
-  , ticketsFile
-  , mrsFile
   , dbFile
   ) where
 
@@ -29,35 +25,32 @@ import System.FilePath ((</>))
 import FetchGitLab.Since (Since, parseSince)
 
 -- | Where a run keeps what it fetches.
+--
+-- There is only one place today. The type is kept so that adding another --
+-- a server rather than a file, say -- is a matter of a constructor and a
+-- 'FetchGitLab.Store.Class.StoreBackend' instance rather than of threading a
+-- choice back through everything that names a store.
 data Backend
-  = -- | A file of tickets and a file of merge requests, one JSON object per
-    -- line. The original format, and still the default.
-    JsonLinesBackend
-  | -- | A single SQLite database. Shares repeated objects and writes only what
+  = -- | A single SQLite database. Shares repeated objects and writes only what
     -- changed at each checkpoint.
     SqliteBackend
   deriving (Eq, Show)
 
--- | Read a @--backend@, @--from@ or @--to@ argument.
+-- | Read a @--backend@ argument.
 parseBackend :: String -> Either String Backend
 parseBackend s = case s of
-  "jsonl" -> Right JsonLinesBackend
-  "jsonlines" -> Right JsonLinesBackend
   "sqlite" -> Right SqliteBackend
   "sqlite3" -> Right SqliteBackend
-  _ -> Left ("unknown backend " <> show s <> ", expected \"jsonl\" or \"sqlite\"")
+  _ -> Left ("unknown backend " <> show s <> ", expected \"sqlite\"")
 
 -- | What to call a backend on the command line and in a log line.
 backendName :: Backend -> Text
-backendName JsonLinesBackend = "jsonl"
 backendName SqliteBackend = "sqlite"
 
 -- | What the command line asked for.
 data Command
   = -- | Fetch from GitLab into a store.
     Fetch Options
-  | -- | Copy a store from one backend to another, touching no network.
-    Convert ConvertOptions
   | -- | Forget when the discussions in a store were fetched, so that the next
     -- run fetches them again.
     ClearTimestamp ClearOptions
@@ -65,29 +58,12 @@ data Command
 
 -- | Which store to clear the discussion timestamps of.
 --
--- The same four ways of naming a store that a fetching run takes, so that
--- clearing one is spelled the same as fetching into it.
+-- The same ways of naming a store that a fetching run takes, so that clearing
+-- one is spelled the same as fetching into it.
 data ClearOptions = ClearOptions
   { clearBackend :: Backend
-  , clearTicketsFile :: Maybe FilePath
-  , clearMrsFile :: Maybe FilePath
   , clearDbFile :: Maybe FilePath
   , clearVerbose :: Bool
-  }
-  deriving (Show)
-
--- | Copying one store into another.
-data ConvertOptions = ConvertOptions
-  { convFrom :: Backend
-    -- ^ Backend to read.
-  , convTo :: Backend
-    -- ^ Backend to write.
-  , convInput :: FilePath
-    -- ^ The store to read: the database file for @sqlite@, the directory
-    -- holding @tickets.jsonl@ and @mrs.jsonl@ for @jsonl@.
-  , convOutput :: FilePath
-    -- ^ Where to write it, named the same way.
-  , convVerbose :: Bool
   }
   deriving (Show)
 
@@ -99,12 +75,6 @@ data Options = Options
     -- ^ Base URL of the GitLab instance.
   , optProject :: Text
     -- ^ Project to fetch from, as @namespace/project@.
-  , optTicketsFile :: Maybe FilePath
-    -- ^ Where to write the issues, in JSON lines format. Defaults to
-    -- @tickets.jsonl@ under 'defaultStoreDir'.
-  , optMrsFile :: Maybe FilePath
-    -- ^ Where to write the merge requests, in JSON lines format. Defaults to
-    -- @mrs.jsonl@ under 'defaultStoreDir'.
   , optBackend :: Backend
     -- ^ Which store format to use.
   , optDbFile :: Maybe FilePath
@@ -153,8 +123,6 @@ optionsParser =
           <> showDefault
           <> help "Project to fetch issues and merge requests from"
       )
-    <*> ticketsOption
-    <*> mrsOption
     <*> backendOption
     <*> dbOption
     <*> optional
@@ -203,47 +171,21 @@ optionsParser =
           )
         <|> pure True
 
--- The four ways of saying which store is meant. Shared so that a maintenance
+-- The ways of saying which store is meant. Shared so that a maintenance
 -- command names a store exactly as a fetching run does.
-
-ticketsOption :: Parser (Maybe FilePath)
-ticketsOption =
-  optional
-    ( strOption
-        ( long "tickets"
-            <> metavar "FILE"
-            <> help
-              ( "Issues file, one JSON object per line, with --backend jsonl "
-                  <> "(default: ~/.fetch-gitlab/tickets.jsonl)"
-              )
-        )
-    )
-
-mrsOption :: Parser (Maybe FilePath)
-mrsOption =
-  optional
-    ( strOption
-        ( long "mrs"
-            <> metavar "FILE"
-            <> help
-              ( "Merge requests file, one JSON object per line, with --backend jsonl "
-                  <> "(default: ~/.fetch-gitlab/mrs.jsonl)"
-              )
-        )
-    )
 
 backendOption :: Parser Backend
 backendOption =
   option
     (eitherReader parseBackend)
     ( long "backend"
-        <> metavar "jsonl|sqlite"
+        <> metavar "sqlite"
         <> value SqliteBackend
         <> showDefaultWith (T.unpack . backendName)
         <> help
-          ( "Which store format. \"sqlite\" is a single database, sharing repeated "
-              <> "objects and writing only what changed at each checkpoint; \"jsonl\" "
-              <> "is the two JSON lines files, rewritten in full each time"
+          ( "Which store format. \"sqlite\", the only one, is a single database "
+              <> "sharing repeated objects and writing only what changed at each "
+              <> "checkpoint"
           )
     )
 
@@ -279,71 +221,17 @@ clearParser =
               <> "run fetches every one of them again"
           )
     )
-    *> (ClearOptions <$> backendOption <*> ticketsOption <*> mrsOption <*> dbOption <*> verboseOption)
-
--- | @--convert@ and what it needs.
---
--- A separate parser rather than a mode of the fetching one, because none of
--- what fetching requires applies: converting talks to no server, so demanding
--- a @--token@ for it would be asking for something that will not be used.
-convertParser :: Parser ConvertOptions
-convertParser =
-  flag'
-    ()
-    ( long "convert"
-        <> help "Copy a store from one backend to another instead of fetching from GitLab"
-    )
-    *> ( ConvertOptions
-          <$> option
-            (eitherReader parseBackend)
-            ( long "from"
-                <> metavar "jsonl|sqlite"
-                <> help "Backend of the store to read"
-            )
-          <*> option
-            (eitherReader parseBackend)
-            ( long "to"
-                <> metavar "jsonl|sqlite"
-                <> help "Backend of the store to write"
-            )
-          <*> strOption
-            ( long "input-path"
-                <> metavar "PATH"
-                <> help
-                  ( "Store to read: the database file for sqlite, the directory "
-                      <> "holding tickets.jsonl and mrs.jsonl for jsonl"
-                  )
-            )
-          <*> strOption
-            ( long "output-path"
-                <> metavar "PATH"
-                <> help "Store to write, named the same way as --input-path"
-            )
-          <*> switch
-            ( long "verbose"
-                <> short 'v'
-                <> help "Log at trace level"
-            )
-       )
+    *> (ClearOptions <$> backendOption <*> dbOption <*> verboseOption)
 
 -- | Either of the two things this program does.
 commandParser :: Parser Command
 commandParser =
-  Convert <$> convertParser
-    <|> ClearTimestamp <$> clearParser
+  ClearTimestamp <$> clearParser
     <|> Fetch <$> optionsParser
 
 -- | Where the stores live unless told otherwise: @~\/.fetch-gitlab@.
 defaultStoreDir :: IO FilePath
 defaultStoreDir = (</> ".fetch-gitlab") <$> getHomeDirectory
-
--- | Where to keep the issues.
-ticketsFile :: Options -> IO FilePath
-ticketsFile = storeFile "tickets.jsonl" . optTicketsFile
-
--- | Where to keep the merge requests.
-mrsFile :: Options -> IO FilePath
-mrsFile = storeFile "mrs.jsonl" . optMrsFile
 
 -- | Where to keep the SQLite database.
 dbFile :: Options -> IO FilePath
@@ -359,8 +247,7 @@ commandParserInfo =
     (commandParser <**> helper)
     ( fullDesc
         <> progDesc
-          ( "Fetch all issues and merge requests of a GitLab project into a store, "
-              <> "or with --convert copy an existing store between backends"
-          )
+          "Fetch all issues and merge requests of a GitLab project into a store"
+
         <> header "fetch-gitlab - dump GitLab issues and merge requests"
     )

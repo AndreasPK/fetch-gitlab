@@ -57,11 +57,12 @@ data LockBusy = LockBusy
 
 -- | The lock file guarding a store file.
 --
--- The lock lives beside the store rather than on it because 'writeStore'
--- renames a temporary file into place: a lock taken on the store file would be
--- left holding the replaced inode, and the next run would open the new one and
--- lock it happily. The lock file itself is only ever created, locked and
--- rewritten in place, so every run ends up contending for the same inode.
+-- The lock lives beside the store rather than on it because a store file is
+-- not guaranteed to stay the same inode: a backend that replaces it by
+-- renaming a temporary file into place would leave the lock holding the
+-- replaced inode, and the next run would open the new one and lock it
+-- happily. The lock file itself is only ever created, locked and rewritten in
+-- place, so every run ends up contending for the same inode.
 lockPath :: FilePath -> FilePath
 lockPath path = path <> ".lock"
 

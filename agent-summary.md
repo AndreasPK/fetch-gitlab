@@ -1,13 +1,13 @@
 # fetch-gitlab
 
-Dumps a GitLab project's issues and merge requests, with their discussions, to
-JSON lines files. Incremental: a second run fetches only what changed.
+Dumps a GitLab project's issues and merge requests, with their discussions,
+into a SQLite database. Incremental: a second run fetches only what changed.
 
 ## Command line
 
 ```
 fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
-             [--tickets FILE] [--mrs FILE] [--since WHEN]
+             [--backend sqlite] [--db FILE] [--since WHEN]
              [--notes | --no-notes] [-v|--verbose]
 ```
 
@@ -16,8 +16,8 @@ fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
 | `--token` | required | Path to a file holding the access token, not the token itself |
 | `--url` | `https://gitlab.haskell.org` | Base URL of the GitLab instance |
 | `--project` | `ghc/ghc` | Project as `namespace/project` |
-| `--tickets` | `~/.fetch-gitlab/tickets.jsonl` | Issue output file |
-| `--mrs` | `~/.fetch-gitlab/mrs.jsonl` | Merge request output file |
+| `--backend` | `sqlite` | Which store format; `sqlite` is the only one |
+| `--db` | `~/.fetch-gitlab/gitlab.db` | Database to fetch into |
 | `--since` | — | Override the incremental timestamp |
 | `--notes` / `--no-notes` | `--notes` | Whether to fetch discussions |
 | `-v`, `--verbose` | off | Log at trace level |
@@ -27,43 +27,35 @@ fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
 `6 months ago`, `3d`). Units run from seconds to years; months and years use
 calendar arithmetic.
 
-## File format
+## What a store holds
 
-One JSON object per line. Issues and merge requests differ only in the name of
-the record field, `ticket` versus `mr`:
+One `Entry` per record. Issues and merge requests share the tables and are told
+apart by `recordKind`, `ticket` versus `mr`:
 
-```json
-{"ticket": {...}, "discussion": [...], "discussion_updated_at": "2026-08-11T09:54:19.873Z"}
-{"mr": {...}, "discussion": [...], "discussion_updated_at": "2026-08-11T09:54:19.873Z"}
-```
-
-- `ticket` / `mr` — the GitLab object as `gitlab-haskell` models it. Fields the
+- the record — the GitLab object as `gitlab-haskell` models it. Fields the
   library does not model are dropped.
-- `discussion` — the notes on that object. Absent if never fetched.
+- its discussion — the notes on that object. Absent if never fetched.
 - `discussion_updated_at` — the record's `updated_at` at the time the
   discussion was fetched. A run compares it against the record's current
   `updated_at` to decide whether the discussion is stale, which is what makes
   an interrupted notes run resumable.
 
-Lines are ordered by `iid`, which is also the key: re-fetching a record
-replaces the old copy and keeps whatever discussion it had.
-
-There is no backwards compatibility with a bare-record format; every line must
-be a wrapper object.
+The key is the `iid`: re-fetching a record replaces the old copy and keeps
+whatever discussion it had.
 
 ## How a run proceeds
 
-1. Resolve the store paths, creating their directory if it does not exist, then
-   take an exclusive lock on both stores. A store already locked by another run
+1. Resolve the store path, creating its directory if it does not exist, then
+   take an exclusive lock on the store. A store already locked by another run
    aborts this one before anything else happens, including reading the token.
-   Then read both files; a file that fails to parse aborts the run rather than
-   being overwritten.
+   Then read it; a store that fails to parse aborts the run rather than being
+   overwritten.
 2. Read the token. A missing, unreadable or empty file is logged and the run
    stops; `readToken` returns `Either Text Text` rather than throwing.
-3. Work out a starting timestamp per file: `--since` if given, otherwise one
-   second before the newest `updated_at` in the file (the second guards
-   against an exclusive comparison), otherwise nothing, meaning fetch
-   everything.
+3. Work out a starting timestamp per record kind: `--since` if given,
+   otherwise one second before the newest `updated_at` stored for it (the
+   second guards against an exclusive comparison), otherwise nothing, meaning
+   fetch everything.
 4. Look up the project through `runGitLabWithManager`, the one call that
    checks the token, so the thousands that follow need not each pay a
    `/version` request to re-establish it.
@@ -135,11 +127,6 @@ MB live and 813 MiB peak heap before, 155 MB and 340 MiB after. Projected to
 `ghc/ghc`'s full history (~42.8k records) that is ~2 GB against ~850 MiB, which
 is the difference between overflowing the 1 GB cap and fitting under it.
 
-`--convert` still loads notes, because copying a store means carrying them
-across. That is the one path whose memory tracks the store rather than the
-record count, and it will not convert a full-history store under the default
-cap.
-
 ## Anti-bot challenges
 
 `waitOutChallenge` wraps both GitLab runners, so every request a run makes is
@@ -180,23 +167,27 @@ means the timestamp was further back than it had to be.
 
 Tests cover a full write, read and re-merge cycle rather than the in-memory
 check alone, because the store on disk is what the next run sees and a
-timestamp that failed to survive encoding would silently make every run
+timestamp that failed to survive being written would silently make every run
 re-fetch everything.
 
-## Backends
+## The store
 
-The default is `sqlite`. `--backend jsonl` gets the older format.
+SQLite is the only backend. `Backend` is kept as a one-constructor type so that
+adding a second — a server rather than a file — is a constructor and a
+`StoreBackend` instance rather than a choice threaded back through everything
+that names a store.
 
 `StoreBackend` has two operations that matter: `storeLoad` reads everything of
 one record kind, and `storeSave` takes the store plus the keys that changed
 since it was loaded. One handle serves both tickets and merge requests; which
-is meant is decided by the `Record` instance the method is used at, which is
-why a SQLite store can be one file and a JSON lines store two.
+is meant is decided by the `Record` instance the method is used at, so a
+backend is free to keep them in one place or two.
 
-The changed-key set is the whole point of the interface. JSON lines ignores it
-and rewrites the file; SQLite upserts those rows and leaves the rest. Measured
-on a checkpoint of 20 objects, JSON lines goes 21 → 749 ms as the store grows
-from 2 to 88 MB while SQLite goes 33 → 71 ms.
+The changed-key set is the whole point of the interface: SQLite upserts those
+rows and leaves the rest, so a checkpoint of 20 objects costs 33 → 71 ms as the
+store grows from 2 to 88 MB. A backend that rewrote the store instead would go
+21 → 749 ms over the same range, which is what the JSON lines backend this
+replaced actually did.
 
 ### How a record is stored relationally without being dissected
 
@@ -225,25 +216,7 @@ Two things learned the hard way, both now pinned by tests:
   the last, and a discussion is in any case an ordered list belonging to one
   record.
 - The queryable columns were ordinary columns first, which stored every note
-  body twice and made the database half again the size of the JSON lines files.
-
-## Converting
-
-`--convert` is a load from one backend and a save into the other, and knows
-nothing about either beyond `StoreBackend` — which is the return on having the
-class. `--input-path`/`--output-path` take one path each, so `pathSpec` reads a
-JSON lines store as the directory holding `tickets.jsonl` and `mrs.jsonl`.
-
-It has its own parser rather than being a mode of the fetching one, since it
-talks to no server and requiring `--token` for it would be asking for something
-that will not be used. Both stores are locked, and a target that already holds
-records stops the conversion rather than being merged into or written over.
-
-Because the default backend changed, `checkForOldStore` stops a run that finds
-JSON lines files where its database should be and points at `--convert`. It
-only fires when nothing was said about where to keep things, since anyone
-naming a store has said what they meant. Without it, upgrading and running
-yesterday's command would spend six hours arriving back where it started.
+  body twice and made the database half again the size of the JSON it holds.
 
 ## The vendored gitlab-haskell
 
@@ -360,23 +333,20 @@ roughly six for `ghc/ghc`. Interrupting it is safe.
 | Module | Role |
 | --- | --- |
 | `FetchGitLab.Options` | optparse-applicative parser, `Command`, `Options`, `Backend` |
-| `FetchGitLab.Convert` | `--convert`, copying a store between backends |
 | `FetchGitLab.ClearTimestamp` | `--clear-timestamp`, forcing discussions to be refetched |
 | `FetchGitLab.Since` | `--since` parsing and resolution against now |
-| `FetchGitLab.Store` | `Record` class, `Entry`, merge, staleness, JSON lines files |
+| `FetchGitLab.Store` | `Record` class, `Entry`, merge, staleness |
 | `FetchGitLab.Store.Class` | `StoreBackend`, the interface a backend implements |
 | `FetchGitLab.Store.Schema` | Entities, relations, lift/splice, the SQL tables |
-| `FetchGitLab.Store.JsonLines` | The JSON lines backend |
 | `FetchGitLab.Store.Sqlite` | The SQLite backend, via sqlite-simple |
 | `FetchGitLab.Store.Backend` | `--backend` to an open store, and the paths to lock |
 | `FetchGitLab.Lock` | Exclusive store locks, `LockInfo` holder record |
-| `FetchGitLab.JsonLines` | JSON lines encoding |
 | `FetchGitLab.Logging` | Terminal and `--log` file loggers at different levels |
 | `FetchGitLab.RateLimit` | Rate limiter and the manager that obeys it |
 | `FetchGitLab.Fetch` | `run`, orchestration, paged record fetch, discussion loop |
 
 `Record` is the class tying a type to the store: `recordKey` (the `iid`),
-`recordUpdatedAt`, and `recordField` (the JSON field name). Instances exist for
+`recordUpdatedAt`, and `recordKind` (the name of the kind). Instances exist for
 `Issue` and `MergeRequest`.
 
 ## Building
