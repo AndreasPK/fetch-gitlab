@@ -81,6 +81,7 @@ test-suite fetch-gitlab-test
                     , filepath             >=1.4  && <1.6
                     , gitlab-haskell
                     , http-client          >=0.7  && <0.8
+                    , http-types           >=0.12 && <0.13
                     , process              >=1.6.3 && <1.7
                     , log-base
                     , tasty                >=1.4  && <1.6

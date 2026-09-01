@@ -13,6 +13,7 @@ module GitLab
     runGitLabDbg,
     runGitLabWithManager,
     runGitLabWithManagerUnchecked,
+    unexpectedStatus,
     module GitLab.Types,
     module GitLab.API.Pipelines,
     module GitLab.API.Groups,
@@ -70,6 +71,7 @@ import GitLab.SystemHooks.GitLabSystemHooks
 import GitLab.SystemHooks.Rules
 import GitLab.SystemHooks.Types
 import GitLab.Types
+import GitLab.WebRequests.GitLabWebCalls (unexpectedStatus)
 import Network.HTTP.Conduit
 import Network.HTTP.Types.Status
 import System.IO
@@ -126,9 +128,17 @@ runGitLabWithManager manager cfg (GitLabT action) = do
         case tokenTest of
           Left err -> return (Left err)
           Right (Left response) ->
-            case responseStatus response of
-              (Status 401 "Unauthorized") -> return $ Left (GitLabError "access token not accepted.")
-              st -> return $ Left (GitLabError ("unexpected HTTP status: " <> T.pack (show st)))
+            -- PATCHED, see PATCHES.md. The 401 case matched the whole status
+            -- line, reason phrase included, so a server that words it
+            -- differently was reported as unexpected rather than as a bad
+            -- token; it now matches the code alone. And the generic case kept
+            -- only the status line, discarding the body -- the part that says
+            -- what actually answered.
+            case statusCode (responseStatus response) of
+              401 -> return $ Left (GitLabError "access token not accepted.")
+              _ ->
+                return $
+                  Left (unexpectedStatus "/version" (responseStatus response) (responseBody response))
           Right (Right _versionInfo) -> func
       goAhead = runExceptT (runReaderT action (GitLabState cfg manager))
   -- No version check without authentication because /version is not public.

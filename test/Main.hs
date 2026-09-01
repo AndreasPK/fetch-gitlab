@@ -11,6 +11,7 @@ import Data.Aeson (FromJSON, Value, eitherDecode, encode, object, toJSON, (.=))
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.IntSet as IntSet
 import Data.List (isInfixOf, nub)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
@@ -29,15 +30,17 @@ import Test.Tasty
 import Test.Tasty.HUnit
 
 import Network.HTTP.Client (HttpException, Response, httpLbs, parseRequest)
+import Network.HTTP.Types.Status (mkStatus, status200, status503)
 
 import GitLab.Types (GitLabError (..), Issue (..), MergeRequest (..), Note (..))
+import GitLab (unexpectedStatus)
 
 import Log (LogLevel (..), LogT, mkLogger, runLogT)
 import Log.Internal.Logger (withLogger)
 import Log.Backend.StandardOutput (withStdOutLogger)
 
 import FetchGitLab.ClearTimestamp (clearTimestamps)
-import FetchGitLab.Fetch (challengeWaits, readToken, waitOutChallenge)
+import FetchGitLab.Fetch (challengeDetail, challengeWaits, readToken, waitOutChallenge)
 import FetchGitLab.Options (Backend (..), parseBackend)
 import FetchGitLab.Store.Backend (StoreSpec (..), detectSpec)
 import FetchGitLab.Lock
@@ -141,6 +144,9 @@ tests =
         [ testCase "a challenge is waited out and retried" challengeIsRetried
         , testCase "any other error is not retried" otherErrorsAreNotRetried
         , testCase "a success is returned untouched" successIsNotRetried
+        , testCase "an interstitial is recognised from the response" challengeIsRecognised
+        , testCase "data and real failures are not mistaken for one" challengeIsNotOverEager
+        , testCase "the version check keeps the body it is refusing" versionCheckKeepsBody
         ]
     , testGroup
         "locking"
@@ -809,6 +815,68 @@ backendFlagParses = do
   parseBackend "sqlite" @?= Right SqliteBackend
   parseBackend "sqlite3" @?= Right SqliteBackend
   assertBool "nonsense is rejected" (either (const True) (const False) (parseBackend "postgres"))
+
+-- | The library hands a challenge back as an ordinary failure on the paths
+-- that do not raise for themselves, so a run has to recognise one from the
+-- response: HTTP 200 with an HTML body that says it is checking you are not a
+-- bot.
+challengeIsRecognised :: Assertion
+challengeIsRecognised = do
+  case challengeDetail status200 anubisPage of
+    Nothing -> assertFailure "an Anubis interstitial was not recognised"
+    Just detail -> do
+      assertBool ("detail names the status: " <> show detail) ("200" `isInfixOf` T.unpack detail)
+      assertBool
+        ("detail quotes the body: " <> show detail)
+        ("anubis" `isInfixOf` T.unpack detail)
+  -- 226 is the top of what the library counts as success, and the marker can
+  -- sit past whatever <head> precedes it.
+  assertBool "a later marker still counts" (isJust (challengeDetail (mkStatus 226 "IM Used") anubisPage))
+
+-- | The ladder costs half an hour, so nothing else may trigger it. A real
+-- failure has to fail on the first try, and data has to be data.
+challengeIsNotOverEager :: Assertion
+challengeIsNotOverEager = do
+  assertEqual "JSON is not a challenge" Nothing (challengeDetail status200 "[{\"iid\": 1}]")
+  assertEqual
+    "an ordinary HTML page is not a challenge"
+    Nothing
+    (challengeDetail status200 "<!doctype html><title>Hello</title>")
+  -- The case that matters most: the same page under an error status is a
+  -- genuine failure, and waiting it out would turn a wrong token or a broken
+  -- proxy into half an hour of silence.
+  assertEqual
+    "an interstitial under 503 is a failure, not a challenge"
+    Nothing
+    (challengeDetail status503 anubisPage)
+  assertEqual "an empty body is not a challenge" Nothing (challengeDetail status200 "")
+
+-- | The @/version@ token check reports a status it has no branch for through
+-- the library's 'unexpectedStatus'. The status line alone points at nothing;
+-- the body is what says whether it was the server, a proxy or an
+-- interstitial, so the message has to carry it.
+versionCheckKeepsBody :: Assertion
+versionCheckKeepsBody = do
+  case unexpectedStatus "/version" status503 anubisPage of
+    GitLabError message -> do
+      assertBool ("message names the path: " <> show message) ("/version" `isInfixOf` T.unpack message)
+      assertBool ("message names the status: " <> show message) ("503" `isInfixOf` T.unpack message)
+      assertBool ("message quotes the body: " <> show message) ("anubis" `isInfixOf` T.unpack message)
+    err -> assertFailure ("an interstitial under 503 must stay an error, got " <> show err)
+  -- The same page as a success is the real thing. Unreachable from the token
+  -- check today, since a success never gets this far, but the classifier must
+  -- agree with 'challengeDetail' about where the line is either way.
+  case unexpectedStatus "/version" status200 anubisPage of
+    GitLabChallengeError _ -> pure ()
+    err -> assertFailure ("an interstitial served as success is a challenge, got " <> show err)
+
+-- | Shaped after what gitlab.haskell.org actually served during a long run.
+anubisPage :: BL.ByteString
+anubisPage =
+  BL.pack $
+    "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+      <> "<title>Making sure you're not a bot!</title>\n</head>\n<body>\n"
+      <> "<div id=\"anubis_challenge\">Checking your browser...</div>\n</body>\n</html>\n"
 
 -- | A mistyped @--token@ path has to come back as something we can log, not as
 -- an exception out of the middle of a run.

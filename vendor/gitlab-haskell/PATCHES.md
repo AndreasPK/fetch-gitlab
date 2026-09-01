@@ -48,6 +48,11 @@ continues to the end, and only that one record is lost. A body that is not a
 JSON array at all has no elements to salvage, so that raises a `GitLabError`
 through the `GitLab` monad rather than being reported as success.
 
+The remaining sharp edge is that a skipped record is recorded only on stderr,
+which does not reach a caller's logger: a store can end up with a gap in it that
+nothing but the terminal ever mentioned. Returning the count of what was skipped
+would close that, and has not been done.
+
 ## 2. `merge_request_source_project_id` is nullable
 
 `src/GitLab/Types.hs`, changed from `Int` to `Maybe Int`.
@@ -60,7 +65,7 @@ is nullable, `targetProjectId` is not. `merge_request_target_project_id` is
 therefore left as `Int`; patch 1 is what keeps an unexpected null there from
 costing more than the one record.
 
-## 3. A single result that fails to decode is an error, and says what came back
+## 3. `Nothing` means the server sent nothing, not that we failed to read it
 
 `gitlabHTTPOne`, same file, which went through `parseOne`:
 
@@ -74,24 +79,44 @@ The error was discarded outright — not even written to stderr, unlike the
 paginated path — so `Right Nothing` meant either "the server does not have
 this" or "the library could not read it", indistinguishable and undiagnosable.
 
-`gitlabHTTPOne` now decodes for itself and raises a `GitLabError` when it
-cannot. `Nothing` is left meaning only "the server does not have this", which
-is what a caller assumes it means: a genuine absence is a 404, and a 404 is not
-a success status, so it returns `Left` before reaching the decode at all.
-`parseOne` had no other callers and was not exported, so it is gone.
+`gitlabHTTPOne` now decides `Nothing` from the response rather than from a
+failure to read it. `Nothing` is returned when the server said there is no
+payload: an explicit `204 No Content`, or any 2xx with an empty body. That is
+the normal outcome of every `DELETE`, so the `Maybe ()` endpoints
+(`deletePipeline`, `deleteMergeRequest'`, `deleteProjectArtifacts` and the rest)
+are now right by construction rather than by accident — upstream reached the
+same answer only because the empty body failed to decode.
 
-The error message names what arrived instead, via `notJson`. The case worth
-naming is an anti-bot interstitial, which `gitlab.haskell.org` served us during
-this work after a few thousand requests: those come back with **HTTP 200** and
-an HTML body, so every check short of parsing says the request succeeded. With
-the old behaviour a run reported
+A body that is there and cannot be read raises a `GitLabError` through the
+`GitLab` monad, so it is reported as the failure it is instead of as an absence
+that never happened. The decode is at `Maybe a`, so a JSON `null` body is
+`Nothing` rather than a failure. `parseOne` had no other callers and was not
+exported, so it is gone.
+
+A 404 stays in `Left`. It is not a success status, so it never reaches any of
+this — and folding it into `Nothing` would make "deleted it" and "it was not
+there" the same value at every delete endpoint. GitLab also answers 404 for a
+resource the token may not see, which is a third thing `Nothing` would erase.
+
+The case this was first written for is an anti-bot interstitial, which
+`gitlab.haskell.org` served us during this work after a few thousand requests:
+those come back with **HTTP 200** and an HTML body, so every check short of
+parsing says the request succeeded. Upstream reported that as
 
 ```
 GitLab request failed: GitLabError "no such project: ghc/ghc"
 ```
 
 which is a long way from the truth and sends whoever reads it after entirely
-the wrong problem. It now reports
+the wrong problem.
+
+## 3a. Naming what came back
+
+`notJson` and `GitLabChallengeError`, in the same file and in
+`src/GitLab/Types.hs`.
+
+Every path that raises for an unreadable body goes through `notJson`, so the
+error says what arrived instead:
 
 ```
 GitLab request failed: GitLabError "the server answered /version with an
@@ -99,19 +124,40 @@ anti-bot interstitial (the request never reached the API) rather than JSON:
 Unexpected \"<!doctype html>...\""
 ```
 
-The challenge cleared on its own once traffic dropped, so it is throttling
-rather than a ban — but it is worth being able to recognise, because the volume
-that triggers it is well within what a cold run makes.
-
 A body that is JSON but not the shape the library expects is named separately,
 since "the server answered with something rather than JSON" is its own kind of
 misleading when the server answered with JSON.
 
-An interstitial also gets its own `GitLabError` constructor,
-`GitLabChallengeError`, rather than only a recognisable message. A challenge is
-transient where every other error in that type is not, so a caller can wait it
-out instead of failing — and that is worth more than a message it would have to
-match on with a substring search that the next wording change would break.
+An interstitial also gets its own constructor, `GitLabChallengeError`, rather
+than only a recognisable message. A challenge is transient where every other
+error in that type is not, so a caller can wait it out instead of failing — and
+that is worth more than a message it would have to match on with a substring
+search that the next wording change would break. The challenge cleared on its
+own once traffic dropped, so it is throttling rather than a ban, but the volume
+that triggers it is well within what a cold run makes.
+
+This covers `gitlabHTTPOne`, `gitlabHTTPMany` and `gitlabGetPage` alike, so a
+challenge on the project lookup, on a discussion or on a record page all reach
+the caller as `GitLabChallengeError`.
+
+The `/version` token check in `runGitLabWithManager` is the odd one out: it
+reads `gitlabVersion`'s response itself rather than through the decoders. A
+challenge there needs nothing extra -- it arrives as a 200 with an HTML body,
+so `gitlabHTTPOne` raises `GitLabChallengeError` before the check reads
+anything. What the check does read are the statuses that are not a success,
+and there it kept only the status line -- `GitLabError "unexpected HTTP
+status: 503 Service Unavailable"` -- and threw away the body, the part that
+says whether that was the server, a proxy or a maintenance page. It now
+reports through `unexpectedStatus`, which keeps the start of the body. Its
+401 case also matched the reason phrase as well as the code, so a server that
+words a 401 differently was reported as an unexpected status rather than as a
+bad token; it now matches the code alone.
+
+An interstitial under an error status is deliberately not a
+`GitLabChallengeError`, there or anywhere else: a challenge is worth waiting
+out precisely because the server claimed success while answering with
+something else, and the same page under a 503 is an outage that has to fail
+on the first try rather than be waited on.
 
 ## 4. A collection can be fetched a page at a time
 
@@ -125,7 +171,7 @@ if it is interrupted, and no say in where the next page starts.
 
 `gitlabGetPage` returns a single page and leaves the rest to the caller. A page
 shorter than the number asked for is the last one. The decoding is shared with
-`gitlabHTTPMany`, so patch 1 applies to both.
+`gitlabHTTPMany` through `decodePage`, so patch 1 applies to both.
 
 Having a say in where the next page starts is the part that matters. Numbered
 pages over a collection that is being edited underneath you are not safe to

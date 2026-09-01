@@ -14,6 +14,7 @@ module GitLab.WebRequests.GitLabWebCalls
     gitlabGetByteStringResponse,
     responseErrorText,
     httpResponseError,
+    unexpectedStatus,
   )
 where
 
@@ -275,12 +276,21 @@ gitlabHTTPOne httpMethod contentType urlPath urlParams contentParams = do
     -- server that answered with something else entirely, which is a long way
     -- from the truth and sends whoever reads it after the wrong problem.
     --
-    -- 'Nothing' is now only ever "the server does not have this". A body that
-    -- cannot be read is an error, and a genuine absence is a 404, which is not
-    -- a success status and so returns Left above.
-    then case eitherDecode (responseBody response) of
-      Left decodeErr -> throwError (notJson urlPath decodeErr (responseBody response))
-      Right x -> return (Right (Just x))
+    -- 'Nothing' is now only ever "the server had nothing to send", decided by
+    -- the status and the body rather than by a failure to read them. A body
+    -- that is there and cannot be read is an error, and a genuine absence is a
+    -- 404, which is not a success status and so returns Left above.
+    then
+      let code = responseStatus response
+       in if code == status204 -- Deliberately nothing
+            || code >= status200 && code < status300 && BSL.null (responseBody response) -- Success status with no body
+            then pure (Right Nothing)
+            else
+              -- Decoded at Maybe a, so a JSON null body is Nothing rather than
+              -- a failure to read one.
+              case eitherDecode (responseBody response) of
+                Left decodeErr -> throwError (notJson urlPath decodeErr (responseBody response))
+                Right r -> pure (Right r)
     else return (Left response)
 
 gitlabHTTPMany ::
@@ -400,17 +410,62 @@ notJson urlPath decodeErr body =
 
     isJson = isJust (decode body :: Maybe Value)
 
-    -- Served with a 200, so the status says nothing about it; the body is all
-    -- there is to go on.
-    isChallenge =
-      looksHtml
-        && any
-          (`T.isInfixOf` beginning)
-          ["not a bot", "anubis", "checking your browser", "captcha"]
+    isChallenge = challengeBody body
 
-    looksHtml = any (`T.isPrefixOf` T.stripStart beginning) ["<!doctype", "<html"]
+    looksHtml = htmlBody body
 
-    beginning = T.toLower (T.decodeUtf8Lenient (BSL.toStrict (BSL.take 4000 body)))
+-- | The first stretch of a body, lowered, which is all the sniffing needs.
+bodyBeginning :: BSL.ByteString -> Text
+bodyBeginning = T.toLower . T.decodeUtf8Lenient . BSL.toStrict . BSL.take 4000
+
+htmlBody :: BSL.ByteString -> Bool
+htmlBody body = any (`T.isPrefixOf` T.stripStart (bodyBeginning body)) ["<!doctype", "<html"]
+
+-- | An anti-bot interstitial, as far as a body can say. Anubis serves one with
+-- a 200, so the status says nothing about it; the body is all there is to go
+-- on, and for the same reason nothing here insists on any particular status.
+challengeBody :: BSL.ByteString -> Bool
+challengeBody body =
+  htmlBody body
+    && any
+      (`T.isInfixOf` bodyBeginning body)
+      ["not a bot", "anubis", "checking your browser", "captcha"]
+
+-- | PATCHED, see PATCHES.md. What to report for a response whose status the
+-- caller has no branch for, without throwing the body away.
+--
+-- The status line alone points nowhere: a 503 could be the server, a proxy in
+-- front of it, or a maintenance page. The body was already in hand and is
+-- what tells them apart, so the start of it is kept.
+unexpectedStatus :: Text -> Status -> BSL.ByteString -> GitLabError
+unexpectedStatus urlPath status body =
+  (if isChallenge then GitLabChallengeError else GitLabError) message
+  where
+    -- The same policy 'notJson' has by construction, being reachable only
+    -- once the status said success: a challenge is an interstitial served as
+    -- a success. The same page under an error status is a real failure -- an
+    -- outage or a proxy that happens to speak HTML -- and a caller that waits
+    -- a challenge out must not wait for that, so it stays a 'GitLabError',
+    -- with the body in the message for whoever reads it.
+    isChallenge = successStatus status && challengeBody body
+
+    message =
+      T.concat
+        [ "the server answered "
+        , urlPath
+        , " with "
+        , description
+        , ": HTTP "
+        , T.pack (show (statusCode status))
+        , " "
+        , T.decodeUtf8Lenient (statusMessage status)
+        , "; the response began "
+        , T.pack (show (BSL.take 300 body))
+        ]
+
+    description
+      | isChallenge = "an anti-bot interstitial (the request never reached the API)"
+      | otherwise = "an unexpected status"
 
 hasNextPage :: Response a -> Bool
 hasNextPage resp =

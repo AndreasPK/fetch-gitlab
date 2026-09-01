@@ -14,6 +14,8 @@ module FetchGitLab.Fetch
   , readToken
   , waitOutChallenge
   , challengeWaits
+  , challengeDetail
+  , orChallenge
   , addUserAgent
   , userAgent
   ) where
@@ -33,13 +35,20 @@ import Data.Ord (Down (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
 import Data.Version (showVersion)
-import Network.HTTP.Client (Manager, Request, Response, requestHeaders, responseStatus)
+import Network.HTTP.Client
+  ( Manager
+  , Request
+  , Response
+  , requestHeaders
+  , responseBody
+  , responseStatus
+  )
 import Network.HTTP.Client.Internal (Manager (..))
 import Network.HTTP.Types.Header (hUserAgent)
-import Network.HTTP.Types.Status (statusCode)
+import Network.HTTP.Types.Status (Status, statusCode)
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
@@ -285,6 +294,54 @@ addUserAgent manager =
 challengeWaits :: [Int]
 challengeWaits = [30, 60, 120, 300, 600, 600]
 
+-- | An anti-bot interstitial, recognised from a response the library handed
+-- back as an ordinary failure.
+--
+-- 'GitLab.API.Issues.projectIssuesPage' and
+-- 'GitLab.API.MergeRequests.mergeRequestsWithPage' go through @gitlabGetPage@,
+-- which raises 'GitLabChallengeError' for itself, so the record fetch never
+-- reaches this. @gitlabGetOne@ and @gitlabGetMany@ hand the response back
+-- instead -- see @vendor\/gitlab-haskell\/PATCHES.md@ -- so the project lookup
+-- and every discussion meet a challenge as a plain 'Left' with a success
+-- status and an HTML body. Recognising it here is what stops a run reading
+-- half an hour of throttling as thousands of records that could not be
+-- fetched.
+--
+-- The status matters as much as the body. A challenge is served with HTTP 200,
+-- which is the whole difficulty with it; an HTML page under a 4xx or a 5xx is
+-- a genuine failure and must not buy itself the retry ladder.
+challengeDetail :: Status -> BL.ByteString -> Maybe Text
+challengeDetail status body
+  | isSuccess && looksHtml && hasMarker = Just detail
+  | otherwise = Nothing
+  where
+    code = statusCode status
+    isSuccess = code >= 200 && code <= 226
+    looksHtml = any (`T.isPrefixOf` T.stripStart beginning) ["<!doctype", "<html"]
+    hasMarker =
+      any (`T.isInfixOf` beginning) ["not a bot", "anubis", "checking your browser", "captcha"]
+    -- Enough of the body to carry the marker past whatever <head> precedes it,
+    -- and no more: this ends up in a log line.
+    beginning = T.toLower (decodeUtf8Lenient (BL.toStrict (BL.take 4000 body)))
+    detail = "HTTP " <> tshow code <> ", body began " <> tshow (T.take 300 beginning)
+
+-- | Raise a challenge the library reported as an ordinary failure, so that
+-- 'waitOutChallenge' waits it out rather than the caller stepping over it.
+--
+-- Every other failure is passed through untouched. A note that genuinely
+-- cannot be fetched should be skipped and asked for again next run, not waited
+-- on for half an hour.
+orChallenge ::
+  GitLab (Either (Response BL.ByteString) a) ->
+  GitLab (Either (Response BL.ByteString) a)
+orChallenge act = do
+  result <- act
+  case result of
+    Left response
+      | Just detail <- challengeDetail (responseStatus response) (responseBody response) ->
+          throwError (GitLabChallengeError detail)
+    _ -> pure result
+
 -- | Run a GitLab action, waiting out an anti-bot challenge rather than failing
 -- on it.
 --
@@ -418,7 +475,7 @@ fetchDiscussions gitlab what backend store fetch = do
     go acc _ pending [] = pure (acc, pending)
     go acc done pending (e : es) = do
       let iid = recordKey (entryRecord e)
-      result <- gitlab (fetch iid)
+      result <- gitlab (orChallenge (fetch iid))
       (acc', pending') <- case result of
         Left err -> do
           logAttention_ $ "Skipping notes for " <> what <> " " <> tshow iid <> ": " <> tshow err
@@ -610,7 +667,7 @@ mrFilters since =
 -- | Look up the project to fetch from, given as @namespace/project@.
 lookupProject :: Text -> GitLab Project
 lookupProject fullPath = do
-  result <- projectWithPathAndName namespace name
+  result <- orChallenge (projectWithPathAndName namespace name)
   case result of
     Left _ -> notFound
     Right Nothing -> notFound
