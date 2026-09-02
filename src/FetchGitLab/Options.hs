@@ -9,11 +9,11 @@ module FetchGitLab.Options
   , parseBackend
   , backendName
   , optionsParser
-  , clearParser
   , commandParser
   , commandParserInfo
   , defaultStoreDir
   , dbFile
+  , tokenFile
   ) where
 
 import Data.Text (Text)
@@ -69,8 +69,9 @@ data ClearOptions = ClearOptions
 
 -- | Everything the tool needs to know to do its job.
 data Options = Options
-  { optTokenFile :: FilePath
-    -- ^ File holding the GitLab personal access token.
+  { optTokenFile :: Maybe FilePath
+    -- ^ File holding the GitLab personal access token. Defaults to
+    -- @gitlab-token@ under 'defaultStoreDir'.
   , optServerUrl :: Text
     -- ^ Base URL of the GitLab instance.
   , optProject :: Text
@@ -107,10 +108,15 @@ defaultProject = "ghc/ghc"
 optionsParser :: Parser Options
 optionsParser =
   build
-    <$> strOption
-      ( long "token"
-          <> metavar "FILE"
-          <> help "File containing the GitLab personal access token"
+    <$> optional
+      ( strOption
+          ( long "token"
+              <> metavar "FILE"
+              <> help
+                ( "File containing the GitLab personal access token "
+                    <> "(default: ~/.fetch-gitlab/gitlab-token)"
+                )
+          )
       )
     <*> option
       text
@@ -236,24 +242,36 @@ verboseOption =
         <> help "Log at trace level"
     )
 
--- | @--clear-timestamp@ and what it needs.
-clearParser :: Parser ClearOptions
-clearParser =
-  flag'
-    ()
-    ( long "clear-timestamp"
-        <> help
-          ( "Forget when the discussions in a store were fetched, so that the next "
-              <> "run fetches every one of them again"
-          )
-    )
-    *> (ClearOptions <$> backendOption <*> dbOption <*> verboseOption)
-
 -- | Either of the two things this program does.
+--
+-- One parser rather than an alternative per command. Two alternatives
+-- sharing options -- @--db@, @--backend@, @-v@ -- parse order-sensitively:
+-- optparse-applicative only backtracks out of a branch that has consumed
+-- nothing, so a shared option followed by a branch-specific one was an
+-- \"Invalid option\" whenever the shared one came first. Everything is
+-- parsed as one grammar instead, and the command is read off afterwards;
+-- the price is that @--clear-timestamp@ quietly accepts and ignores the
+-- fetch-only options.
 commandParser :: Parser Command
-commandParser =
-  ClearTimestamp <$> clearParser
-    <|> Fetch <$> optionsParser
+commandParser = classify <$> clearFlag <*> optionsParser
+  where
+    classify False opts = Fetch opts
+    classify True opts =
+      ClearTimestamp
+        ClearOptions
+          { clearBackend = optBackend opts
+          , clearDbFile = optDbFile opts
+          , clearVerbose = optVerbose opts
+          }
+
+    clearFlag =
+      switch
+        ( long "clear-timestamp"
+            <> help
+              ( "Forget when the discussions in a store were fetched, so that the next "
+                  <> "run fetches every one of them again, instead of fetching"
+              )
+        )
 
 -- | Where the stores live unless told otherwise: @~\/.fetch-gitlab@.
 defaultStoreDir :: IO FilePath
@@ -262,6 +280,10 @@ defaultStoreDir = (</> ".fetch-gitlab") <$> getHomeDirectory
 -- | Where to keep the SQLite database.
 dbFile :: Options -> IO FilePath
 dbFile = storeFile "gitlab.db" . optDbFile
+
+-- | Where to read the access token from.
+tokenFile :: Options -> IO FilePath
+tokenFile = storeFile "gitlab-token" . optTokenFile
 
 storeFile :: FilePath -> Maybe FilePath -> IO FilePath
 storeFile _ (Just given) = pure given

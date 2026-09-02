@@ -6,14 +6,14 @@ into a SQLite database. Incremental: a second run fetches only what changed.
 ## Command line
 
 ```
-fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
+fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE] [--since WHEN]
              [--notes | --no-notes | --pipelines <mr> ] [-v|--verbose]
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--token` | required | Path to a file holding the access token, not the token itself |
+| `--token` | `~/.fetch-gitlab/gitlab-token` | Path to a file holding the access token, not the token itself |
 | `--url` | `https://gitlab.haskell.org` | Base URL of the GitLab instance |
 | `--project` | `ghc/ghc` | Project as `namespace/project` |
 | `--backend` | `sqlite` | Which store format; `sqlite` is the only one |
@@ -27,6 +27,12 @@ fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
 (`2026-08-01T12:00:00Z`), or a relative time (`2 days`, `1 week`,
 `6 months ago`, `3d`). Units run from seconds to years; months and years use
 calendar arithmetic.
+
+`--clear-timestamp` and fetching share one option grammar rather than being
+parser alternatives: alternatives that share options (`--db`, `-v`) parse
+order-sensitively, because optparse-applicative only backtracks out of a
+branch that has consumed nothing. The price is that `--clear-timestamp`
+accepts and ignores the fetch-only flags.
 
 ## What a store holds
 

@@ -91,7 +91,7 @@ import FetchGitLab.Lock
   , lockPath
   , withStoreLocks
   )
-import FetchGitLab.Options (Options (..))
+import FetchGitLab.Options (Options (..), tokenFile)
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
 import FetchGitLab.Store
@@ -204,7 +204,7 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
     fetch :: StoreBackend b => b -> LogT IO ()
     fetch store = do
       token <-
-        liftIO (readToken (optTokenFile opts))
+        liftIO (tokenFile opts >>= readToken)
           >>= either (\err -> abort ("Cannot read the access token: " <> err)) pure
 
       logInfo_ $ "Fetching " <> optProject opts <> " from " <> optServerUrl opts

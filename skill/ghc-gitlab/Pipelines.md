@@ -7,8 +7,11 @@ one per push, so nothing fetches them unasked. **An MR with no rows in
 ## Fetching an MR's pipelines
 
 ```
-fetch-gitlab --token ~/.fetch-gitlab/gitlab-token --pipelines <mr>
+fetch-gitlab --pipelines <mr>
 ```
+
+(The token is read from `~/.fetch-gitlab/gitlab-token` by default;
+`--token FILE` for another.)
 
 One request for the pipeline list, one per pipeline for its jobs, written to
 the default store (`--db FILE` for another). It fetches nothing else — no
