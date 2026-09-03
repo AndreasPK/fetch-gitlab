@@ -312,10 +312,8 @@ Any failure aborts the run rather than skipping: re-running costs a handful
 of requests, so there is no staleness bookkeeping as there is for notes.
 Refetching a merge request's pipelines replaces what was there.
 
-The pipeline tables were schema version 2. Version 1 stores are still opened
-— the versions only differ by added tables, which opening creates — and their
-recorded version deliberately stays 1 so older binaries can open them too
-(`compatibleVersions` in `Store.Schema`).
+The pipeline tables are schema patch 1 (see "Schema versions and patches"
+below): a store that predates them gets them at the next open.
 
 ## Forcing a refetch
 

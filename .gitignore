@@ -14,3 +14,4 @@ gitlab-token
 
 # Scratch space, not for commit
 tmp/
+.ai/scratch
