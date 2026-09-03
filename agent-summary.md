@@ -54,6 +54,9 @@ whatever discussion it had. Repeated objects — users, milestones, labels —
 are interned in their own tables and referenced; the rest of each object is
 kept verbatim, with the queryable columns (`title`, `state`, ...) generated
 from it, so nothing in the database can disagree with the JSON it holds.
+`records` and `notes` also carry `ref`, the row's name in GitLab notation
+(`#123` for a ticket, `!123` for a merge request; on a note, the record it
+belongs to), indexed, so `WHERE ref = '#123'` is the cheap way to name one.
 Pipelines and jobs, when fetched, land in tables of their own.
 
 ## How a run proceeds

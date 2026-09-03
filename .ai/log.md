@@ -205,3 +205,43 @@ Files: `src/FetchGitLab/Store.hs`, `Store/Class.hs`, `Store/Sqlite.hs`,
 `Store/Schema.hs`, `Fetch.hs`, `ClearTimestamp.hs`, `Lock.hs`,
 `test/Main.hs`, `fetch-gitlab.cabal`, the topic files and `README.md`.
 56/56 tests pass.
+
+## 2026-09-03T12:20+00:00 — `ref` columns (patch 3, point 1 of the views plan)
+
+`records` and `notes` gain `ref TEXT GENERATED ALWAYS AS (CASE kind WHEN
+'ticket' THEN '#' ELSE '!' END || iid) VIRTUAL` with indexes `records_ref`
+and `notes_ref (ref, position)`, as schema patch 3 (`refStatements`,
+Schema.hs). Point 1 of the views plan the record-table session wrote
+(`tmp/views.md`, git-ignored): a ref computed inside a view is not indexable
+(one thread by ref 0.33 s), the column with its index is (8 ms). The views
+themselves are that session's patch, appended after this one.
+
+Unguarded on purpose: `ADD COLUMN` is not repeatable, but the column is
+not in the base `CREATE TABLE`, so a fresh store and an old one each run
+the patch exactly once. Putting it in the base schema instead would have
+needed a guard on the `ALTER`s for no gain.
+
+The same patch drops `notes_id`, the index on a note's GitLab id, and the
+base schema stops creating it. Andi's decision, raised by the record-table
+session: 8.3 MB on the real store, and nothing in the binary or the skill
+queries looks a note up by id, since notes are keyed by position. `DROP
+INDEX IF EXISTS` is repeatable, so a fresh store, which never had it, runs
+it as a no-op.
+
+The patch ends with `ANALYZE`, and that becomes the rule for any patch that
+adds an index: the real store had no `sqlite_stat1`, and without it the
+planner starts from the `kind` prefix of a primary key for every query shape
+and walks half the table. Found while testing: `ANALYZE` records nothing
+for an empty table, and a fresh store is empty when its patches run, so the
+patch alone would leave every new store without statistics for good.
+`closeSqliteStore` therefore ends with `PRAGMA optimize` (10 ms; re-analyses
+only what changed enough to matter), which point 3 of the plan had put with
+the views patch.
+
+Verified on the 664 MB copy: migration 0.7 s including `ANALYZE`, both
+indexes in `sqlite_stat1`, `WHERE ref = ?` on either table planned as an
+index search, a 586-note thread counted by ref in 3 ms.
+
+Pinned by "ref names the row in GitLab notation" (fresh store) and the
+patch-2-store assertions in "a store at the old schema loses
+has_discussion" (migration path, where `ANALYZE` has rows to see).

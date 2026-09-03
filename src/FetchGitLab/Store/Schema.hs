@@ -99,6 +99,14 @@ data SchemaPatch = SchemaPatch
 -- * 2. Drop @records.has_discussion@, which "fetched" is now read off
 --   @discussion_updated_at IS NOT NULL@ instead. Guarded, since a store
 --   created after the column was removed never had it.
+-- * 3. Add the generated @ref@ column and its index to @records@ and
+--   @notes@, and drop the @notes_id@ index ('refStatements'). Unguarded:
+--   @ADD COLUMN@ cannot be repeated, but the column is not in the base
+--   schema, so every store runs this exactly once.
+--
+-- A patch that adds an index ends with @ANALYZE@. Without planner statistics
+-- SQLite rates an equality on the leading primary key column as cheap and
+-- walks half a table on @kind = 'ticket'@ rather than using the new index.
 --
 -- Patch 2 is the first that an older executable could not read a patched store
 -- with, which the rule above says should be a 'schemaVersion' bump instead.
@@ -112,6 +120,35 @@ schemaPatches =
   , SchemaPatch
       ["ALTER TABLE records DROP COLUMN has_discussion"]
       (Just "SELECT 1 FROM pragma_table_info('records') WHERE name = 'has_discussion'")
+  , SchemaPatch refStatements Nothing
+  ]
+
+-- | A row's own name in GitLab notation: @#123@ for a ticket, @!123@ for a
+-- merge request, and on a note the record it sits on. Not a link and not a
+-- key: the tables are still keyed by @(kind, iid)@, and the junction and
+-- pipeline tables join on that. It exists so that a query can say
+-- @WHERE ref = '#123'@ and hit an index; the same expression inside a view is
+-- not indexable and scans.
+--
+-- Generated and virtual, like the other queryable columns, so it takes no
+-- space and cannot disagree with the row it names.
+--
+-- The same patch drops @notes_id@, the index on a note's GitLab id. Notes
+-- are keyed by their position in a discussion (see the @notes@ table), so
+-- nothing in the binary or the documented queries ever looks a note up by
+-- id, and the index cost 8 MB on the real store for nothing. The base schema
+-- no longer creates it, so a fresh store has nothing to drop; the statement
+-- is @IF EXISTS@ for that reason.
+refStatements :: [Text]
+refStatements =
+  [ "ALTER TABLE records ADD COLUMN ref TEXT GENERATED ALWAYS AS \
+    \(CASE kind WHEN 'ticket' THEN '#' ELSE '!' END || iid) VIRTUAL"
+  , "ALTER TABLE notes ADD COLUMN ref TEXT GENERATED ALWAYS AS \
+    \(CASE kind WHEN 'ticket' THEN '#' ELSE '!' END || iid) VIRTUAL"
+  , "CREATE INDEX IF NOT EXISTS records_ref ON records (ref)"
+  , "CREATE INDEX IF NOT EXISTS notes_ref ON notes (ref, position)"
+  , "DROP INDEX IF EXISTS notes_id"
+  , "ANALYZE"
   ]
 
 -- | What is lifted out of a ticket or merge request.
@@ -250,7 +287,6 @@ schemaStatements =
     \  type          TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.type')) VIRTUAL,\
     \  noteable_type TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.noteable_type')) VIRTUAL,\
     \  PRIMARY KEY (kind, iid, position))"
-  , "CREATE INDEX IF NOT EXISTS notes_id ON notes (note_id)"
   , "CREATE INDEX IF NOT EXISTS notes_created ON notes (created_at)"
   , "CREATE TABLE IF NOT EXISTS note_users (\
     \  kind     TEXT NOT NULL,\

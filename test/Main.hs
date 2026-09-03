@@ -133,6 +133,7 @@ tests =
         [ testCase "splitting and splicing are inverse" splitSpliceRoundtrips
         , testCase "an absent field is not invented" splitKeepsAbsence
         , testCase "a store at the old schema loses has_discussion" oldStoreLosesHasDiscussion
+        , testCase "ref names the row in GitLab notation" refNamesTheRow
         , testCase "--backend is parsed" backendFlagParses
         ]
     , testGroup
@@ -526,6 +527,12 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
   -- column, and the meta rows saying patch 1 has been applied.
   raw <- SQL.open path
   SQL.execute_ raw oldRecordsTable
+  SQL.execute_ raw "CREATE TABLE notes (kind TEXT NOT NULL, iid INTEGER NOT NULL, position INTEGER NOT NULL, \
+    \rest TEXT NOT NULL, lifted TEXT NOT NULL, \
+    \note_id INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.id')) VIRTUAL, \
+    \created_at TEXT GENERATED ALWAYS AS (json_extract(rest, '$.created_at')) VIRTUAL, \
+    \PRIMARY KEY (kind, iid, position))"
+  SQL.execute_ raw "CREATE INDEX notes_id ON notes (note_id)"
   SQL.execute_ raw "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
   SQL.execute_ raw "INSERT INTO meta VALUES ('schema_version', '1'), ('schema_patch_version', '1')"
   SQL.execute
@@ -549,10 +556,60 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
 
   columns <- do
     raw' <- SQL.open path
-    cols <- SQL.query_ raw' "SELECT name FROM pragma_table_info('records')" :: IO [SQL.Only T.Text]
+    -- xinfo rather than info: generated columns are hidden from the latter.
+    cols <- SQL.query_ raw' "SELECT name FROM pragma_table_xinfo('records')" :: IO [SQL.Only T.Text]
     SQL.close raw'
     pure [c | SQL.Only c <- cols]
   assertBool ("has_discussion is still there: " <> show columns) ("has_discussion" `notElem` columns)
+  assertBool ("ref was not added by patch 3: " <> show columns) ("ref" `elem` columns)
+
+  -- The patch ends with ANALYZE, which only has something to say where rows
+  -- already exist: a store being migrated, not a fresh one.
+  stats <- do
+    raw' <- SQL.open path
+    n <- SQL.query_ raw' "SELECT count(*) FROM sqlite_stat1 WHERE idx = 'records_ref'" :: IO [SQL.Only Int]
+    SQL.close raw'
+    pure n
+  assertBool "the patch ended with ANALYZE" (stats /= [SQL.Only 0])
+
+  gone <- do
+    raw' <- SQL.open path
+    n <- SQL.query_ raw' "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'notes_id'" :: IO [SQL.Only T.Text]
+    SQL.close raw'
+    pure n
+  assertEqual "the notes_id index was dropped" [] gone
+
+-- | @ref@ is the row's own name in GitLab notation, on records and on notes,
+-- and a query by it is indexed: what schema patch 3 promises a reader.
+refNamesTheRow :: Assertion
+refNamesTheRow = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  mrs <- decodeFixture "test/data/mrs.jsonl" :: IO [MergeRequest]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  issue <- firstOf issues
+  mr <- firstOf mrs
+  let path = dir </> "gitlab.db"
+      ticketRef = T.pack ('#' : show (issue_iid issue))
+      mrRef = T.pack ('!' : show (merge_request_iid mr))
+  withSqliteStore path $ \db -> do
+    storeWriteRecords db [issue]
+    storeWriteRecords db [mr]
+    storeWriteDiscussion db issueProxy (issue_iid issue) (fmap encodeTime (issue_updated_at issue)) notes
+
+  raw <- SQL.open path
+  refs <- SQL.query_ raw "SELECT ref FROM records ORDER BY kind" :: IO [SQL.Only T.Text]
+  assertEqual "a ticket is #iid, a merge request !iid" [mrRef, ticketRef] [r | SQL.Only r <- refs]
+  noteRefs <- SQL.query_ raw "SELECT DISTINCT ref FROM notes" :: IO [SQL.Only T.Text]
+  assertEqual "a note is named after its record" [ticketRef] [r | SQL.Only r <- noteRefs]
+  byRef <- SQL.query raw "SELECT count(*) FROM notes WHERE ref = ?" (SQL.Only ticketRef) :: IO [SQL.Only Int]
+  assertEqual "the notes are found by ref" [SQL.Only (length notes)] byRef
+  indexes <-
+    SQL.query_ raw "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('records_ref', 'notes_ref') ORDER BY name" ::
+      IO [SQL.Only T.Text]
+  assertEqual "both indexes exist" ["notes_ref", "records_ref"] [n | SQL.Only n <- indexes]
+  gone <- SQL.query_ raw "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'notes_id'" :: IO [SQL.Only T.Text]
+  assertEqual "a fresh store never gets the notes_id index" [] gone
+  SQL.close raw
 
 -- | The @records@ table as the version before the patch created it: the same
 -- statement with @has_discussion@ still in it. The generated columns are kept

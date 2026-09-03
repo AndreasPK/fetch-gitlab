@@ -44,6 +44,9 @@ Schema versioning is [Schema.md](Schema.md).
   doubled the size of the store; comment in Schema.hs.
 - Notes are keyed `(kind, iid, position)`, never by GitLab's note id;
   comment above the `notes` table.
+- `ref` (`#123` / `!123`, schema patch 3) on `records` and `notes` is a
+  generated, indexed name for queries, not a key: Haskell never reads or
+  writes it, and the junction and pipeline tables do not have it.
 - `discussion_updated_at` and the generated `updated_at` are compared as
   text, so both must come from `encodeTime` (Sqlite.hs), which trims the
   fraction (`.550Z` → `.55Z`); a second encoder makes every discussion read

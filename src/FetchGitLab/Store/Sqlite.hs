@@ -109,8 +109,15 @@ openSqliteStore path = do
 
 -- | Fold the write ahead log back into the database before letting go of it,
 -- so that what is left behind is one file rather than three.
+--
+-- @PRAGMA optimize@ first: it re-analyses whatever this run's writes changed
+-- enough to matter, and nothing otherwise. Without statistics the planner
+-- ignores the indexes a patch adds (see 'schemaPatches'), and the @ANALYZE@ a
+-- patch ends with has nothing to record in a store that was empty when it
+-- ran, which every fresh store was.
 closeSqliteStore :: SqliteStore -> IO ()
 closeSqliteStore st = do
+  execute_ (sqliteConn st) "PRAGMA optimize"
   _ <- (query_ (sqliteConn st) "PRAGMA wal_checkpoint(TRUNCATE)" :: IO [(Int, Int, Int)])
   close (sqliteConn st)
 

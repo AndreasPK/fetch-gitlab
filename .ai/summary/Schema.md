@@ -18,6 +18,12 @@
   not a version bump.
 - A column a view references cannot be dropped: a future drop must drop and
   recreate the views in the same patch.
+- Patch 3 (`refStatements`) also drops the unused `notes_id` index; the
+  base schema no longer creates it.
+- A patch that adds an index ends with `ANALYZE`; patch 3 (`refStatements`)
+  is the first. Without statistics the planner prefers the `kind` prefix of
+  a primary key over any index, however selective. `ANALYZE` sees nothing in
+  a fresh (empty) store, so `closeSqliteStore` also runs `PRAGMA optimize`.
 - `migrate` runs the unapplied patches and writes the count last, in one
   `BEGIN IMMEDIATE` transaction. A store counted higher than the binary
   knows is left alone; lowering the count would repeat a non-repeatable
