@@ -1,67 +1,71 @@
--- Nontrivial queries against a fetch-gitlab SQLite store. SKILL.md has the
--- schema and its gotchas; `.schema` on a store has the exact DDL. The file
--- runs as it stands:
+-- Recipes against a fetch-gitlab SQLite store, schema patch 4 or later
+-- (the view_* views). SKILL.md has the views and gotchas; `.schema` on a
+-- store has the exact DDL. The file runs as it stands:
 --
 --   sqlite3 -readonly ~/.fetch-gitlab/gitlab.db < queries.sql
 --
--- Plain filters (by date, state, label, person, LIKE over text) are not
--- here: write those directly against the generated columns and the
--- record_users / record_labels joins.
+-- Plain filters (by date, state, label, person, ref) are not here: write
+-- those against the views directly.
 
 
--- A record rebuilt as one JSON object with its discussion, oldest first.
--- json_patch merges the lifted tables back into `rest`. A patch value of
--- NULL deletes its key, which is what makes an absent milestone come out
--- absent rather than null; HAVING count(*) > 0 does the same for the list
--- fields, since an empty aggregate would otherwise insert []. On a ticket
--- the merged_by/reviewers subqueries are empty and simply drop out.
---
--- Not byte-exact against what GitLab sent: the store's own reader is what
--- guarantees the round trip. ORDER BY inside an aggregate needs SQLite 3.44
--- or newer.
-SELECT json_patch(
-         r.rest,
-         json_object(
-           'author',    (SELECT json(u.json) FROM record_users ru JOIN users u ON u.row_id = ru.user_row
-                          WHERE ru.kind = r.kind AND ru.iid = r.iid AND ru.field = 'author'),
-           'assignee',  (SELECT json(u.json) FROM record_users ru JOIN users u ON u.row_id = ru.user_row
-                          WHERE ru.kind = r.kind AND ru.iid = r.iid AND ru.field = 'assignee'),
-           'closed_by', (SELECT json(u.json) FROM record_users ru JOIN users u ON u.row_id = ru.user_row
-                          WHERE ru.kind = r.kind AND ru.iid = r.iid AND ru.field = 'closed_by'),
-           'merged_by', (SELECT json(u.json) FROM record_users ru JOIN users u ON u.row_id = ru.user_row
-                          WHERE ru.kind = r.kind AND ru.iid = r.iid AND ru.field = 'merged_by'),
-           'assignees', (SELECT json_group_array(json(u.json) ORDER BY ru.position)
-                           FROM record_users ru JOIN users u ON u.row_id = ru.user_row
-                          WHERE ru.kind = r.kind AND ru.iid = r.iid AND ru.field = 'assignees'
-                         HAVING count(*) > 0),
-           'reviewers', (SELECT json_group_array(json(u.json) ORDER BY ru.position)
-                           FROM record_users ru JOIN users u ON u.row_id = ru.user_row
-                          WHERE ru.kind = r.kind AND ru.iid = r.iid AND ru.field = 'reviewers'
-                         HAVING count(*) > 0),
-           'labels',    (SELECT json_group_array(l.name ORDER BY rl.position)
-                           FROM record_labels rl JOIN labels l ON l.label_id = rl.label_id
-                          WHERE rl.kind = r.kind AND rl.iid = r.iid
-                         HAVING count(*) > 0),
-           'milestone', (SELECT json(m.json) FROM milestones m WHERE m.row_id = r.milestone_row),
-           'discussion',(SELECT json_group_array(
-                                  json_patch(n.rest, json_object(
-                                    'author',      (SELECT json(u.json) FROM note_users nu JOIN users u ON u.row_id = nu.user_row
-                                                     WHERE nu.kind = n.kind AND nu.iid = n.iid
-                                                       AND nu.position = n.position AND nu.field = 'author'),
-                                    'resolved_by', (SELECT json(u.json) FROM note_users nu JOIN users u ON u.row_id = nu.user_row
-                                                     WHERE nu.kind = n.kind AND nu.iid = n.iid
-                                                       AND nu.position = n.position AND nu.field = 'resolved_by')))
-                                  ORDER BY n.created_at)
-                           FROM notes n WHERE n.kind = r.kind AND n.iid = r.iid
-                          HAVING count(*) > 0)
-         )) AS record
-  FROM records r
- WHERE r.kind = 'mr' AND r.iid = 13000;
+-- Search with snippets over descriptions and human notes, one row per
+-- hit, with the record's title. `t` takes several terms. The LIKE on the
+-- raw `rest` column skips the JSON parse for rows that cannot match and
+-- halves the scan, which is why this reads the base tables.
+WITH t(term) AS (VALUES ('interestingDict')),
+hit AS (
+  SELECT r.ref, 0 AS position, t.term,
+         r.title || char(10) || coalesce(r.description, '') AS txt
+    FROM records r JOIN t
+   WHERE r.rest LIKE '%' || t.term || '%'
+     AND (r.title LIKE '%' || t.term || '%' OR r.description LIKE '%' || t.term || '%')
+  UNION ALL
+  SELECT n.ref, n.position, t.term, n.body
+    FROM notes n JOIN t
+   WHERE n.rest LIKE '%' || t.term || '%' AND n.body LIKE '%' || t.term || '%'
+     AND n.system IS NOT 1 AND n.body NOT LIKE '<!-- {"blocked_by"%')
+SELECT h.ref, h.position, r.state, substr(r.title, 1, 50) AS title, h.term,
+       replace(substr(h.txt, max(1, instr(lower(h.txt), lower(h.term)) - 60), 140),
+               char(10), ' ') AS snippet
+  FROM hit h JOIN records r ON r.ref = h.ref
+ ORDER BY h.ref, h.position
+ LIMIT 40;
+
+
+-- Two terms near each other: the second within 300 characters of the
+-- first occurrence of the first. Replaces grep -P over flattened rows.
+SELECT ref, position, author,
+       replace(substr(body, max(1, instr(lower(body), 'noinline') - 150), 300), char(10), ' ') AS around
+  FROM view_notes
+ WHERE NOT system AND NOT is_import AND body LIKE '%noinline%'
+   AND substr(body, max(1, instr(lower(body), 'noinline') - 300), 600) LIKE '%speciali%'
+ LIMIT 20;
+
+
+-- Thread index: who said what, when, how much. Read this before printing
+-- bodies, then fetch the ones you want by seq.
+SELECT seq, author, substr(created_at, 1, 10) AS at, length(text) AS len,
+       substr(replace(text, char(10), ' '), 1, 80) AS head
+  FROM view_ticket
+ WHERE ref = '#27750' AND NOT system
+ ORDER BY seq;
+
+SELECT text FROM view_ticket WHERE ref = '#27750' AND seq = 1;
+
+
+-- What one person said about something. view_people resolves a name to
+-- the username first.
+SELECT ref, position, substr(created_at, 1, 10) AS at,
+       substr(replace(body, char(10), ' '), 1, 100) AS head
+  FROM view_notes
+ WHERE author = 'AndreasK' AND NOT system AND body LIKE '%interestingDict%'
+ ORDER BY created_at DESC
+ LIMIT 20;
 
 
 -- Carrying ALL of several labels: the HAVING count must match the list.
--- (ANY of several is the same without the HAVING, plus DISTINCT.)
-SELECT r.iid, r.state, r.title
+-- (ANY of several is `labels LIKE '%x%' OR labels LIKE '%y%'` on the view.)
+SELECT r.ref, r.state, r.title
   FROM records r
   JOIN record_labels rl ON rl.kind = r.kind AND rl.iid = r.iid
   JOIN labels l ON l.label_id = rl.label_id
@@ -72,28 +76,43 @@ HAVING count(DISTINCT l.name) = 2
  LIMIT 20;
 
 
--- Store coverage: what it holds, how much of the discussion has been
--- fetched, and the watermark an incremental run resumes from. A cold run
--- fetches records first and discussions second, so a store part way through
--- shows records with a NULL discussion_updated_at.
+-- Links with titles, both directions. `rel` is one of mentioned_in,
+-- closed_via, related_to, duplicate_of, duplicated_by; target_ref is NULL
+-- for commits and other projects (target_project says which). Mentions in
+-- prose that GitLab did not log are a `body LIKE '%#23109%'` on view_notes.
+SELECT l.rel, l.target_kind, coalesce(l.target_ref, l.target) AS target, r.state, r.title
+  FROM view_links l LEFT JOIN records r ON r.ref = l.target_ref
+ WHERE l.ref = '#23109'
+ ORDER BY l.created_at;
+
+SELECT l.ref, l.rel, substr(l.created_at, 1, 10) AS at, r.state, r.title
+  FROM view_links l JOIN records r ON r.ref = l.ref
+ WHERE l.target_ref = '#23109'
+ ORDER BY l.created_at;
+
+
+-- Coverage and freshness: what the store holds, how much of the discussion
+-- has been fetched, and the watermark an incremental run resumes from. A
+-- cold run fetches records first and discussions second, so a store part
+-- way through shows records with a NULL discussion_updated_at.
 SELECT kind,
        count(*)                                AS records,
        sum(discussion_updated_at IS NOT NULL)  AS with_notes,
        sum(discussion_updated_at IS NULL)      AS without_notes,
+       sum(discussion_updated_at IS NOT NULL
+           AND discussion_updated_at IS NOT updated_at) AS stale_notes,
        min(created_at)                         AS oldest,
        max(updated_at)                         AS newest
   FROM records
  GROUP BY kind;
 
--- Which records a run still owes notes for, and which have notes gone stale
--- (the record changed after its discussion was fetched).
-SELECT kind, iid, updated_at, title
-  FROM records
- WHERE discussion_updated_at IS NULL
- ORDER BY updated_at DESC
- LIMIT 20;
 
-SELECT kind, iid, discussion_updated_at, updated_at
-  FROM records
- WHERE discussion_updated_at IS NOT NULL AND discussion_updated_at IS NOT updated_at
- LIMIT 20;
+-- Trac import changes unpacked: the migration wrote each field change of
+-- an old ticket as a note whose body is an HTML comment holding JSON.
+SELECT n.ref, n.position, substr(n.created_at, 1, 10) AS at, j.key AS field,
+       substr(json_extract(j.value, '$.old'), 1, 60) AS old,
+       substr(json_extract(j.value, '$.new'), 1, 60) AS new
+  FROM view_notes n, json_each(substr(n.body, 6, length(n.body) - 9)) j
+ WHERE n.ref = '#12996' AND n.is_import
+ ORDER BY n.position DESC, j.key
+ LIMIT 40;

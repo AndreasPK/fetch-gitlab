@@ -5,68 +5,69 @@ description: Query the local fetch-gitlab SQLite store for gitlab.haskell.org ti
 
 # Querying a fetch-gitlab store
 
-`fetch-gitlab` dumps `ghc/ghc`'s issues and merge requests, with their
-discussions, into SQLite — usually `~/.fetch-gitlab/gitlab.db`. Always open it
-read-only: a fetch may be writing, and WAL mode allows readers beside the one
-writer but nothing else. Never write to a store you did not create.
+`fetch-gitlab` dumps `ghc/ghc`'s tickets and merge requests, with their
+discussions, into `~/.fetch-gitlab/gitlab.db`. Open it read-only; never
+write to a store you did not create. No file means no fetch has run yet:
+say so rather than polling. Without `sqlite3`, Python's
+`sqlite3.connect('file:PATH?mode=ro', uri=True)` runs the same SQL.
 
 ```
-sqlite3 -readonly ~/.fetch-gitlab/gitlab.db "SELECT count(*) FROM records"
+sqlite3 -readonly ~/.fetch-gitlab/gitlab.db "SELECT count(*) FROM view_tickets"
 ```
 
-## Schema
+## Views
 
-`records` holds tickets and MRs (`kind` = `'ticket'` or `'mr'`, keyed by
-`iid`); `notes` holds discussions, keyed by `(kind, iid, position)`. Users,
-labels and milestones are interned in their own tables. Everything else is
-JSON in `rest`, with the hot fields (title, state, description, dates,
-web_url, body, …) as generated columns — `.schema` shows the exact DDL.
+A record is named by `ref`: `#123` is a ticket, `!123` a merge request.
 
-Gotchas:
+| view | one row per | columns |
+|---|---|---|
+| `view_tickets` | ticket | `ref, iid, state, title, author, assignees, labels, milestone, created_at, updated_at, closed_at, notes, notes_stale` |
+| `view_mrs` | merge request | the same plus `reviewers, source_branch, target_branch, draft, merge_status, sha, merged_at` |
+| `view_ticket`, `view_mr` | row of one record's thread: header at `seq` 0, then its notes oldest first | `ref, seq, created_at, author, system, text` (rendered Markdown) |
+| `view_notes` | note | `ref, kind, iid, position, created_at, author, author_id, system, is_import, type, resolved, len, body` |
+| `view_links` | cross-reference GitLab logged as a system note | `ref, created_at, rel, target_kind, target_project, target, target_ref` |
+| `view_people` | username | `username, name, user_id` |
 
-- **`iid` is not `id`.** `iid` is the number in `#25166`/`!13000` and the
-  URL; `id` is GitLab's global id. Key on `(kind, iid)`.
-- **Lifted fields are not in `rest`.** `json_extract(rest, '$.author')` is
-  always NULL, likewise assignee(s), reviewers, closed_by, merged_by, labels,
-  milestone. Join `record_users` / `record_labels` / `milestone_row`.
-- **A note's author** joins on three columns, not a note id — and the users
-  table's JSON column is `json`, not `rest`:
+`author` is a username; `assignees`, `reviewers` and `labels` are one
+string each. `system` marks GitLab's own notes ("assigned to @x"),
+`is_import` the Trac migration's. `notes_stale`: the discussion was never
+fetched or is older than the record. `.schema` shows the base tables.
 
-  ```sql
-  SELECT n.created_at, u.username, n.body
-    FROM notes n
-    LEFT JOIN note_users nu ON nu.kind = n.kind AND nu.iid = n.iid
-          AND nu.position = n.position AND nu.field = 'author'
-    LEFT JOIN users u ON u.row_id = nu.user_row
-   WHERE n.kind = 'ticket' AND n.iid = 25166 AND n.system IS NOT 1
-   ORDER BY n.created_at;
-  ```
+## The four calls
 
-- **Notes are stored newest first.** `ORDER BY created_at` to read a
-  conversation; `position` is GitLab's reversed order.
-- **Most notes are system notes** ("assigned to @x"). `system IS NOT 1`
-  keeps what people said; `user_notes_count` counts only those.
-- **Timestamps** are ISO 8601 UTC text with milliseconds and compare
-  correctly as text — but leave the trailing `Z` off the bound (`Z` sorts
-  after `.`, so `>= '…T12:21:43Z'` silently misses records within that
-  second). `date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%S`, or a bare
-  `'2026-08-01'`.
-- **One person, several `users` rows** (interned per JSON shape): match and
-  group by `username`. Nicknames are often not usernames — resolve first with
-  `SELECT DISTINCT username, name FROM users WHERE name LIKE '%…%' OR
-  username LIKE '%…%'`.
-- **`discussion_updated_at IS NULL` means the notes were never fetched**, not
-  that nobody replied. `discussion_updated_at IS NOT updated_at` means they
-  are stale.
+```sql
+SELECT ref, state, title, author, labels FROM view_tickets
+ WHERE state = 'opened' ORDER BY updated_at DESC LIMIT 20;
+-- one record in full; with -noheader the output is a plain transcript
+SELECT text FROM view_ticket WHERE ref = '#25166' AND NOT system ORDER BY seq;
+-- what people said about a term, with a snippet
+SELECT ref, author, substr(body, max(1, instr(lower(body), 'term') - 80), 200)
+  FROM view_notes WHERE NOT system AND NOT is_import AND body LIKE '%term%';
+-- what a record links to; the reverse direction scans every system note (~2 s)
+SELECT rel, target_ref FROM view_links WHERE ref = '#25166';
+SELECT ref, rel FROM view_links WHERE target_ref = '#25166';
+```
 
-Text search is `LIKE` over title/description/body — case-insensitive for
-ASCII, no FTS, a full scan is subsecond. Common words ("layout", "tag") match
-unrelated tickets, so skim candidates' descriptions before trusting a hit;
-for proximity or windowed matching, pipe `sqlite3 -json` into grep or python.
+A batch is `WHERE ref IN ('#1', '!2')`, never a shell loop. A thread can
+run to hundreds of notes with multi-KB bodies: when `notes` is large, list
+`seq, author, length(text)` first, then select the `seq` you want.
 
-`queries.sql` (runs as it stands) keeps the recipes not worth rederiving:
-a record reassembled into one JSON object with its discussion, all-of-several
-labels, store coverage and staleness.
+## Gotchas
 
-`Pipelines.md` covers CI: how to efficiently check an MR's pipeline success
-status, job failure reasons, and fetch the precise CI build logs.
+- Search ids as `'%#3772%'`, `'%!7788%'` or `'%/issues/3772%'`; a bare
+  number matches digits inside SHAs.
+- `LIKE` is a full scan, subsecond warm and ~8 s cold, and case-insensitive
+  for ASCII: no `lower()` around it.
+- Timestamps are ISO text; leave the trailing `Z` off a bound
+  (`>= '2026-08-01T12:00:00'`). A bare date works.
+- Nicknames are not usernames: `view_people WHERE name LIKE '%…%'` first.
+- Ticket URLs are `https://gitlab.haskell.org/ghc/ghc/-/issues/N`, MRs
+  `/-/merge_requests/N`.
+- Read text in the default mode or `-json`; `-box` and `-markdown` pad
+  every line of a body to the widest column.
+
+`queries.sql` (runs as it stands): search with snippets over descriptions
+and notes, two terms near each other, thread index then one note, notes by
+one person, all-of-several labels, links with titles both ways, coverage
+and freshness, Trac import changes. `reassemble.sql` rebuilds a record as
+one JSON object. `Pipelines.md` covers CI status, job failures and logs.
