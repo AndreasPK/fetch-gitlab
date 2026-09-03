@@ -50,7 +50,10 @@ module FetchGitLab.Store.Schema
     -- * The tables themselves
   , schemaStatements
   , schemaVersion
-  , compatibleVersions
+
+    -- * Additions since
+  , schemaPatchVersion
+  , schemaPatches
   ) where
 
 import Data.Text (Text)
@@ -58,22 +61,32 @@ import Data.Text (Text)
 import FetchGitLab.Store.Schema.Pipeline (pipelineSchemaStatements)
 import FetchGitLab.Store.Schema.Types
 
--- | Bumped whenever 'schemaStatements' changes shape. A store written by a
--- version not in 'compatibleVersions' is not read, since the reader would
--- quietly see the wrong columns.
---
--- Version 2 added the pipeline and job tables of
--- "FetchGitLab.Store.Schema.Pipeline".
+-- | Bumped when the schema changes in ways that would break older executables.
+-- Small (compatible) additions are done by patches.
 schemaVersion :: Int
-schemaVersion = 2
+schemaVersion = 1
 
--- | Older versions whose stores this code still reads correctly, because
--- everything since only added tables — opening such a store creates the
--- missing tables and changes nothing it already holds. The recorded version
--- is deliberately left as it was, so a binary of that older version can
--- still open the store as well.
-compatibleVersions :: [Int]
-compatibleVersions = [1]
+-- | Number of patches on top of the base schema this executable applies and
+-- expects.
+schemaPatchVersion :: Int
+schemaPatchVersion = length schemaPatches
+
+-- | Everything added to the schema after the base schema ('schemaStatements').
+-- Every list entry is one SQL statement that migrates the schema by one patch
+-- level.
+-- If we find a store at patch version n, we apply the `drop n schemaPatches`
+-- patches.
+--
+-- Patches only make backwards compatible changes. New tables a old executable
+-- won't read and the like. If we rename/drop parts of the schema we need to bump
+-- the major schema version instead.
+--
+-- Patches:
+-- * Add the pipeline, job, runner and commit tables. Happens to be Idempotent.
+schemaPatches :: [[Text]]
+schemaPatches =
+  [ pipelineSchemaStatements
+  ]
 
 -- | What is lifted out of a ticket or merge request.
 recordSpec :: LiftSpec
@@ -211,5 +224,3 @@ schemaStatements =
     \  PRIMARY KEY (kind, iid, position, field))"
   , "CREATE INDEX IF NOT EXISTS note_users_rev ON note_users (user_row)"
   ]
-    -- Appended last: the jobs table references users, which must exist first.
-    <> pipelineSchemaStatements

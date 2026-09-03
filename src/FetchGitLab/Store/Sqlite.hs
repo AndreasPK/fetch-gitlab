@@ -39,6 +39,7 @@ import qualified Data.IntSet as IntSet
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -46,6 +47,7 @@ import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Time.Clock (UTCTime)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory)
+import Text.Read (readMaybe)
 
 import Database.SQLite.Simple
   ( Connection
@@ -94,13 +96,10 @@ openSqliteStore path = do
   execute_ conn "PRAGMA journal_mode = WAL"
   execute_ conn "PRAGMA synchronous = NORMAL"
   execute_ conn "PRAGMA foreign_keys = ON"
-  -- Write ahead logging lets a reader in while a run is writing, but only one
-  -- writer at a time, and opening a store writes: the schema statements above.
-  -- Without a timeout that collides with a checkpoint as an immediate "database
-  -- is locked" rather than a wait of a few milliseconds.
+  -- If we open the db concurrently with a writer we are willing to wait a few seconds
+  -- rather than failing immediately.
   execute_ conn "PRAGMA busy_timeout = 5000"
-  mapM_ (execute_ conn . Query) schemaStatements
-  checkVersion conn
+  migrate conn
   SqliteStore path conn
     <$> newIORef Map.empty
     <*> newIORef Map.empty
@@ -117,11 +116,43 @@ closeSqliteStore st = do
 withSqliteStore :: FilePath -> (SqliteStore -> IO a) -> IO a
 withSqliteStore path = bracket (openSqliteStore path) closeSqliteStore
 
--- | Refuse a store written by an incompatible schema rather than reading the
--- wrong columns out of it. A store from a version in 'compatibleVersions' is
--- accepted as it is: the schema statements just executed have already created
--- whatever tables it was missing, and its recorded version stays untouched so
--- a binary of that older version can still open it.
+-- | Update the schema to the current patch level.
+--
+-- The store db records it's current patch level, which we compare against the
+-- binaries.
+--
+-- If the store is newer than the binary do nothing.
+-- Otherwise apply the missing patches (schemaPatches).
+--
+-- We check the schema_version too, but a missmatch there is just an error as
+-- these indicate bigger or breaking changes that need to migrated outside of the
+-- binary.
+migrate :: Connection -> IO ()
+migrate conn = do
+  haveMeta <-
+    query_ conn "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'" ::
+      IO [Only Int]
+  applied <-
+    if null haveMeta
+      then pure Nothing
+      else do
+        rows <-
+          query conn "SELECT value FROM meta WHERE key = ?" (Only ("schema_patch_version" :: Text)) ::
+            IO [Only Text]
+        pure (case rows of Only v : _ -> readMaybe (T.unpack v); [] -> Nothing)
+  case applied of
+    Just n | n >= schemaPatchVersion -> checkVersion conn
+    _ -> withTransaction conn $ do
+      mapM_ (execute_ conn . Query) schemaStatements
+      checkVersion conn
+      forM_ (drop (fromMaybe 0 applied) schemaPatches) (mapM_ (execute_ conn . Query))
+      execute
+        conn
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_patch_version', ?)"
+        (Only (show schemaPatchVersion))
+
+-- | Simply fail on major schema version differences for now. We might or might not
+-- allow future binaries to add major version migrations.
 checkVersion :: Connection -> IO ()
 checkVersion conn = do
   stored <- query_ conn "SELECT value FROM meta WHERE key = 'schema_version'"
@@ -132,7 +163,7 @@ checkVersion conn = do
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
         (Only version)
     (Only v : _)
-      | v `elem` accepted -> pure ()
+      | v == version -> pure ()
       | otherwise ->
           ioError . userError $
             "store was written by schema version "
@@ -141,7 +172,6 @@ checkVersion conn = do
               <> show schemaVersion
   where
     version = T.pack (show schemaVersion)
-    accepted = version : map (T.pack . show) compatibleVersions
 
 -- | How many rows each table holds. Says whether the sharing the schema is
 -- built around is actually happening.
