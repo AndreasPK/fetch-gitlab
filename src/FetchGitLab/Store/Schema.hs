@@ -52,6 +52,7 @@ module FetchGitLab.Store.Schema
   , schemaVersion
 
     -- * Additions since
+  , SchemaPatch (..)
   , schemaPatchVersion
   , schemaPatches
   ) where
@@ -71,21 +72,46 @@ schemaVersion = 1
 schemaPatchVersion :: Int
 schemaPatchVersion = length schemaPatches
 
+-- | One step of the schema's history: the statements that take a store one
+-- patch level on, and what makes them apply.
+data SchemaPatch = SchemaPatch
+  { patchStatements :: [Text]
+    -- ^ Executed in the order given.
+  , patchGuard :: Maybe Text
+    -- ^ A query run first; the statements run only if it returns a row.
+    -- 'Nothing' for a patch that applies to every store, which is every patch
+    -- whose statements are @IF NOT EXISTS@ or otherwise repeatable. A guard is
+    -- what lets a patch that undoes part of the base schema exist at all: a
+    -- store created today never had the thing to undo, and unguarded @ALTER
+    -- TABLE ... DROP COLUMN@ would fail on it.
+  }
+
 -- | Everything added to the schema after the base schema ('schemaStatements').
--- Every list entry is one SQL statement that migrates the schema by one patch
--- level.
 -- If we find a store at patch version n, we apply the `drop n schemaPatches`
 -- patches.
 --
--- Patches only make backwards compatible changes. New tables a old executable
--- won't read and the like. If we rename/drop parts of the schema we need to bump
--- the major schema version instead.
+-- A patch is appended, never edited: a store may already have run it.
 --
 -- Patches:
--- * Add the pipeline, job, runner and commit tables. Happens to be Idempotent.
-schemaPatches :: [[Text]]
+--
+-- * 1. Add the pipeline, job, runner and commit tables. Happens to be
+--   idempotent.
+-- * 2. Drop @records.has_discussion@, which "fetched" is now read off
+--   @discussion_updated_at IS NOT NULL@ instead. Guarded, since a store
+--   created after the column was removed never had it.
+--
+-- Patch 2 is the first that an older executable could not read a patched store
+-- with, which the rule above says should be a 'schemaVersion' bump instead.
+-- It is not one because bumping refuses every store that exists rather than
+-- migrating it, and the only readers are this binary and SQL that a patched
+-- store answers as well as it ever did; see log 2026-09-03 "write-through
+-- store".
+schemaPatches :: [SchemaPatch]
 schemaPatches =
-  [ pipelineSchemaStatements
+  [ SchemaPatch pipelineSchemaStatements Nothing
+  , SchemaPatch
+      ["ALTER TABLE records DROP COLUMN has_discussion"]
+      (Just "SELECT 1 FROM pragma_table_info('records') WHERE name = 'has_discussion'")
   ]
 
 -- | What is lifted out of a ticket or merge request.
@@ -122,9 +148,21 @@ noteSpec =
 -- holds, since every note body was then stored twice.
 --
 -- The real columns are only what SQLite cannot derive: the keys, the lifted
--- references, and the two pieces of bookkeeping that are not part of a record
--- at all — whether its discussion has been fetched, and the @updated_at@ it
--- was fetched for.
+-- references, and the one piece of bookkeeping that is not part of a record at
+-- all — @discussion_updated_at@, the record's @updated_at@ at the time its
+-- notes were fetched. NULL says the notes were never fetched, or that
+-- @--clear-timestamp@ dropped the claim that they are current; both mean the
+-- same thing to a run, which is "fetch them". A discussion that was fetched
+-- and turned out to be empty is therefore indistinguishable from one never
+-- fetched once its stamp is cleared, and that costs one request to find out
+-- again.
+--
+-- @discussion_updated_at@ is compared against the generated
+-- @updated_at@ to decide whether a discussion is stale, so the two must be
+-- written by the same timestamp encoder. Today both go through aeson, which
+-- trims the fraction; see @encodeTime@ in "FetchGitLab.Store.Sqlite" for what
+-- that requires of any new write path, and for why the text does not sort
+-- chronologically.
 --
 -- == Sharing
 --
@@ -160,7 +198,6 @@ schemaStatements =
     \  iid                   INTEGER NOT NULL,\
     \  milestone_row         INTEGER REFERENCES milestones(row_id),\
     \  discussion_updated_at TEXT,\
-    \  has_discussion        INTEGER NOT NULL,\
     \  rest                  TEXT NOT NULL,\
     \  lifted                TEXT NOT NULL,\
     \  id               INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.id')) VIRTUAL,\

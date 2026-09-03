@@ -9,16 +9,16 @@ import Control.Exception (try)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Aeson (FromJSON, Value, eitherDecode, encode, object, toJSON, (.=))
 import qualified Data.ByteString.Lazy.Char8 as BL
-import qualified Data.IntSet as IntSet
-import Data.List (isInfixOf, nub)
+import Data.List (isInfixOf, nub, sort, sortOn)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
+import Data.Text.Encoding (decodeUtf8)
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (..), addUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTime)
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
 import Control.Monad.IO.Class (liftIO)
 import System.Directory (doesFileExist, renameFile, setModificationTime)
 import System.Environment (getArgs, getExecutablePath)
@@ -56,15 +56,9 @@ import FetchGitLab.Store
   ( Entry (..)
   , Record (..)
   , Store
-  , discussionNotes
-  , alreadyCurrent
-  , latestUpdate
-  , mergeRecords
   , needsDiscussion
-  , newEntry
-  , setDiscussion
   )
-import FetchGitLab.Store.Class (StoreBackend (..), storeSaveAll)
+import FetchGitLab.Store.Class (StoreBackend (..))
 import FetchGitLab.Store.Schema
   ( Lifted (..)
   , noteSpec
@@ -72,7 +66,15 @@ import FetchGitLab.Store.Schema
   , spliceObject
   , splitObject
   )
-import FetchGitLab.Store.Sqlite (sqliteTableCounts, withSqliteStore)
+import FetchGitLab.Store.Sqlite
+  ( SqliteStore
+  , encodeTime
+  , sqliteTableCounts
+  , sqliteTimestampTexts
+  , withSqliteStore
+  )
+
+import qualified Database.SQLite.Simple as SQL
 
 -- | Normally the test suite, but 'lockExcludesAnotherProcess' re-runs this
 -- executable as its own lock holding child.
@@ -89,13 +91,13 @@ tests =
     "fetch-gitlab"
     [ testGroup
         "store"
-        [ testCase "merging replaces records with the same iid" mergeReplaces
-        , testCase "latestUpdate finds the newest timestamp" latestUpdateIsNewest
+        [ testCase "writing a record again replaces it" recordWriteReplaces
+        , testCase "the store says where a run resumes from" latestUpdateIsNewest
         ]
     , testGroup
         "discussions"
         [ testCase "an entry with a discussion roundtrips" discussionRoundtrips
-        , testCase "merging keeps the discussion we already have" mergeKeepsDiscussion
+        , testCase "rewriting a record keeps the discussion we already have" recordWriteKeepsDiscussion
         , testCase "a changed record makes its discussion stale" changedRecordIsStale
         , testCase "a second run over unchanged records asks for nothing" secondRunAsksForNothing
         , testCase "only the changed record is asked about again" onlyChangedIsRefetched
@@ -110,11 +112,13 @@ tests =
         [ testCase "issues survive a round trip" (sqliteRoundtrips (Proxy :: Proxy Issue) "test/data/issues.jsonl")
         , testCase "merge requests survive a round trip" (sqliteRoundtrips (Proxy :: Proxy MergeRequest) "test/data/mrs.jsonl")
         , testCase "an empty store reads back empty" sqliteStartsEmpty
-        , testCase "a checkpoint writes only what changed" sqliteWritesOnlyChanged
+        , testCase "a write touches only what it names" sqliteWritesOnlyWhatItNames
         , testCase "reopening finds what was written" sqliteSurvivesReopen
         , testCase "repeated users are shared, not copied" sqliteSharesUsers
-        , testCase "a load without notes still knows what is stale" loadWithoutNotesKnowsStaleness
-        , testCase "rewriting an unloaded entry keeps its notes" keptNotesSurviveRewrite
+        , testCase "the plan agrees with what a reader calls stale" planAgreesWithReader
+        , testCase "both timestamp columns are written by one encoder" timestampsRoundTheSameWay
+        , testCase "a record write leaves a fresher discussion alone" recordWriteLeavesDiscussionAlone
+        , testCase "a discussion stamp is the one the plan gave, not the row's" stampIsThePlansNotTheRows
         , testCase "pipelines and jobs are written, their objects shared" pipelinesAreWritten
         , testCase "rewriting pipelines replaces rather than duplicates" pipelinesRewriteReplaces
         ]
@@ -128,6 +132,7 @@ tests =
         "schema"
         [ testCase "splitting and splicing are inverse" splitSpliceRoundtrips
         , testCase "an absent field is not invented" splitKeepsAbsence
+        , testCase "a store at the old schema loses has_discussion" oldStoreLosesHasDiscussion
         , testCase "--backend is parsed" backendFlagParses
         ]
     , testGroup
@@ -376,55 +381,206 @@ rateLimitCountsRequestsOnce = do
   where
     outcome = either (const "refused") (const "served")
 
--- | A fetch loads without note bodies, but has to make exactly the same
--- decisions about what to fetch as it would with them.
-loadWithoutNotesKnowsStaleness :: Assertion
-loadWithoutNotesKnowsStaleness = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+-- | A run decides what to ask GitLab about in SQL and a reader decides with
+-- 'needsDiscussion'. The two have to agree: if they drift a run either
+-- refetches everything or stops refetching anything, and neither shows up as
+-- a failure anywhere else.
+planAgreesWithReader :: Assertion
+planAgreesWithReader = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let path = dir </> "gitlab.db"
-      -- One entry with a discussion, one without.
-      full = mergeRecords Map.empty issues
-      store = case Map.keys full of
-        (k : _) -> Map.adjust (setDiscussion notes) k full
-        [] -> full
-  withSqliteStore path (`storeSaveAll` store)
-  withSqliteStore path $ \db -> do
-    Right light <- storeLoadWithoutNotes db :: IO (Either String (Store Issue))
-    Right heavy <- storeLoad db :: IO (Either String (Store Issue))
-    assertEqual
-      "which entries a run would ask GitLab about"
-      (Map.map needsDiscussion heavy)
-      (Map.map needsDiscussion light)
-    assertEqual
-      "the notes were not read"
-      (replicate (Map.size light) Nothing)
-      (map (discussionNotes . entryDiscussion) (Map.elems light))
+  assertBool "the fixture needs more than one issue" (length issues > 1)
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    -- One never fetched, one current, one stale, so all three cases are here.
+    storeWriteRecords db issues
+    plan <- storeDiscussionPlan db issueProxy
+    forM_ (drop 1 plan) $ \(iid, stamp) -> storeWriteDiscussion db issueProxy iid stamp notes
+    storeWriteRecords db (take 1 (map bumpIssue (drop 1 issues)))
 
--- | The hole this could have left: an entry loaded without its notes still
--- gets written back whenever its record changes, and writing a record
--- replaces everything hanging off it. If that took the absent notes literally
--- it would delete a discussion that was never in memory to be written back.
-keptNotesSurviveRewrite :: Assertion
-keptNotesSurviveRewrite = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    plan' <- storeDiscussionPlan db issueProxy
+    Right store <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual
+      "which records a run would ask GitLab about"
+      (Map.keys (Map.filter needsDiscussion store))
+      (sort (map fst plan'))
+    assertBool "the case is not trivial" (not (null plan') && length plan' < Map.size store)
+
+-- | The record's @updated_at@ is extracted from the JSON aeson wrote, and the
+-- discussion stamp is 'encodeTime'; a text comparison between them is only
+-- sound while both round a timestamp the same way. Aeson trims the fraction,
+-- so the cases that would catch a second encoder are whole seconds and
+-- trailing zeros, as GitLab actually sends them.
+timestampsRoundTheSameWay :: Assertion
+timestampsRoundTheSameWay = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let path = dir </> "gitlab.db"
-      store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-  withSqliteStore path (`storeSaveAll` store)
+  base <- case issues of
+    (i : _) -> pure i
+    [] -> assertFailure "fixture is empty"
+  let sent =
+        [ ("2023-02-23T15:04:45.000Z", "2023-02-23T15:04:45Z")
+        , ("2023-02-23T15:04:45.100Z", "2023-02-23T15:04:45.1Z")
+        , ("2023-02-23T15:04:45.550Z", "2023-02-23T15:04:45.55Z")
+        , ("2023-02-23T15:04:45.123Z", "2023-02-23T15:04:45.123Z")
+        , ("2023-02-23T15:04:45.123456Z", "2023-02-23T15:04:45.123456Z")
+        ]
+  stamps <- forM (map fst sent) $ \text ->
+    either (assertFailure . ("cannot parse a GitLab timestamp: " ++)) pure $
+      eitherDecode (BL.pack (show text))
+  -- Pins the rounding itself, so a change in aeson's printer is noticed here
+  -- rather than as every discussion turning stale.
+  assertEqual "how aeson writes each" (map snd sent) (map (T.unpack . encodeTime) stamps)
 
-  -- What a run does: load without notes, then write the entries back because
-  -- their records were refetched.
-  withSqliteStore path $ \db -> do
-    Right light <- storeLoadWithoutNotes db :: IO (Either String (Store Issue))
-    storeSaveAll db (light :: Store Issue)
-
-  withSqliteStore path $ \db -> do
-    Right reread <- storeLoad db :: IO (Either String (Store Issue))
+  let variants = zipWith (\iid t -> base {issue_iid = iid, issue_updated_at = Just t}) [1 ..] stamps
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    -- Through the write path a run uses: the stamp is the text the plan
+    -- handed out, which is where the two encoders would part company.
+    fillStore db issueProxy variants notes
+    rows <- sqliteTimestampTexts db
+    assertEqual "one row per variant" (length variants) (length rows)
+    forM_ rows $ \(_, iid, updated, stamp) ->
+      assertEqual ("record " ++ show iid ++ " stamp disagrees with its updated_at") updated stamp
     assertEqual
-      "the discussions survived being written back without being loaded"
-      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store))
-      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems reread))
+      "the texts SQLite holds"
+      (map (Just . T.pack . snd) sent)
+      [updated | (_, _, updated, _) <- rows]
+
+-- | The hole the old design left: a run held the whole store and wrote entries
+-- back from it, so a run that had not read the notes could write "no notes"
+-- over the notes another writer had just fetched. A write now states one thing
+-- — this record, as GitLab has it — and a second writer on the same file is
+-- the way to check it, since one handle could have got away with remembering.
+recordWriteLeavesDiscussionAlone :: Assertion
+recordWriteLeavesDiscussionAlone = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  issue <- firstOf issues
+  let path = dir </> "gitlab.db"
+      iid = issue_iid issue
+
+  withSqliteStore path $ \db -> fillStore db issueProxy [issue] notes
+  before <- withSqliteStore path (entryAt iid) :: IO (Entry Issue)
+
+  -- Another run has the same record come round again and writes it.
+  withSqliteStore path $ \db -> storeWriteRecords db [issue]
+  rewritten <- withSqliteStore path (entryAt iid) :: IO (Entry Issue)
+  assertEqual "a record write changed the discussion" (entryJson before) (entryJson rewritten)
+
+  -- And the other way round: writing a discussion must not put back the
+  -- record version the notes were fetched against.
+  let bumped = bumpIssue issue
+  withSqliteStore path $ \db -> storeWriteRecords db [bumped]
+  withSqliteStore path $ \db ->
+    storeWriteDiscussion db issueProxy iid (fmap encodeTime (issue_updated_at bumped)) (take 1 notes)
+  settled <- withSqliteStore path (entryAt iid) :: IO (Entry Issue)
+  assertEqual
+    "a discussion write changed the record"
+    (toJSON bumped)
+    (toJSON (entryRecord settled))
+  assertEqual
+    "the notes it wrote"
+    (Just (map note_id (take 1 notes)))
+    (fmap (map note_id) (entryNotes settled))
+
+-- | The stamp stored with a discussion is the record version it was planned
+-- against, never the version the row happens to hold when it is written. A
+-- record that moved while the notes were in flight has to come back as stale:
+-- claiming the notes cover an edit they were fetched before would hide that
+-- edit's discussion for good, and one redundant refetch is the cheap way to be
+-- wrong.
+stampIsThePlansNotTheRows :: Assertion
+stampIsThePlansNotTheRows = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  issue <- firstOf issues
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeWriteRecords db [issue]
+    plan <- storeDiscussionPlan db issueProxy
+    (iid, stamp) <- case plan of
+      (p : _) -> pure p
+      [] -> assertFailure "a record with no discussion was not planned for"
+
+    -- The record moves between the plan and the write.
+    storeWriteRecords db [bumpIssue issue]
+    storeWriteDiscussion db issueProxy iid stamp notes
+
+    plan' <- storeDiscussionPlan db issueProxy
+    assertEqual "the record that moved is stale again" [iid] (map fst plan')
+    entry <- entryAt iid db :: IO (Entry Issue)
+    assertEqual
+      "the notes were written all the same"
+      (Just (map note_id notes))
+      (fmap (map note_id) (entryNotes entry))
+
+-- | A store written by the version before @has_discussion@ was dropped is
+-- migrated when it is opened, rather than refused or read with a column that
+-- is no longer written.
+oldStoreLosesHasDiscussion :: Assertion
+oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  issue <- firstOf issues
+  let path = dir </> "gitlab.db"
+      stamp = fmap encodeTime (issue_updated_at issue)
+
+  -- A store as the previous version left it: the records table with the
+  -- column, and the meta rows saying patch 1 has been applied.
+  raw <- SQL.open path
+  SQL.execute_ raw oldRecordsTable
+  SQL.execute_ raw "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+  SQL.execute_ raw "INSERT INTO meta VALUES ('schema_version', '1'), ('schema_patch_version', '1')"
+  SQL.execute
+    raw
+    "INSERT INTO records (kind, iid, discussion_updated_at, has_discussion, rest, lifted) \
+    \ VALUES ('ticket', ?, ?, 1, ?, '[]')"
+    (issue_iid issue, stamp, decodeUtf8 (BL.toStrict (encode (toJSON issue))))
+  SQL.close raw
+
+  withSqliteStore path $ \db -> do
+    Right store <- storeLoad db :: IO (Either String (Store Issue))
+    entry <- entryAt (issue_iid issue) db :: IO (Entry Issue)
+    assertEqual "the store still holds what it held" 1 (Map.size store)
+    assertEqual "the record survived the patch" (toJSON issue) (toJSON (entryRecord entry))
+    assertEqual
+      "and so did its discussion stamp"
+      (issue_updated_at issue)
+      (entryDiscussionFor entry)
+    plan <- storeDiscussionPlan db issueProxy
+    assertEqual "a stamped record is not asked about again" [] (map fst plan)
+
+  columns <- do
+    raw' <- SQL.open path
+    cols <- SQL.query_ raw' "SELECT name FROM pragma_table_info('records')" :: IO [SQL.Only T.Text]
+    SQL.close raw'
+    pure [c | SQL.Only c <- cols]
+  assertBool ("has_discussion is still there: " <> show columns) ("has_discussion" `notElem` columns)
+
+-- | The @records@ table as the version before the patch created it: the same
+-- statement with @has_discussion@ still in it. The generated columns are kept
+-- because the base schema indexes some of them, and running the base
+-- statements over this table is part of what is being tested.
+oldRecordsTable :: SQL.Query
+oldRecordsTable =
+  "CREATE TABLE records (\
+  \  kind                  TEXT NOT NULL,\
+  \  iid                   INTEGER NOT NULL,\
+  \  milestone_row         INTEGER,\
+  \  discussion_updated_at TEXT,\
+  \  has_discussion        INTEGER NOT NULL,\
+  \  rest                  TEXT NOT NULL,\
+  \  lifted                TEXT NOT NULL,\
+  \  id               INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.id')) VIRTUAL,\
+  \  project_id       INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.project_id')) VIRTUAL,\
+  \  title            TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.title')) VIRTUAL,\
+  \  description      TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.description')) VIRTUAL,\
+  \  state            TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.state')) VIRTUAL,\
+  \  created_at       TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.created_at')) VIRTUAL,\
+  \  updated_at       TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.updated_at')) VIRTUAL,\
+  \  closed_at        TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.closed_at')) VIRTUAL,\
+  \  web_url          TEXT    GENERATED ALWAYS AS (json_extract(rest, '$.web_url')) VIRTUAL,\
+  \  user_notes_count INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.user_notes_count')) VIRTUAL,\
+  \  upvotes          INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.upvotes')) VIRTUAL,\
+  \  downvotes        INTEGER GENERATED ALWAYS AS (json_extract(rest, '$.downvotes')) VIRTUAL,\
+  \  PRIMARY KEY (kind, iid))"
 
 -- | An anti-bot challenge is transient, so it is waited out rather than
 -- failed on. The waits are passed in so the test does not have to sit through
@@ -487,51 +643,54 @@ discussionRoundtrips = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   assertBool "fixture has notes" (not (null notes))
 
   let path = dir </> "gitlab.db"
-      store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-  withSqliteStore path (`storeSaveAll` store)
+  withSqliteStore path $ \db -> fillStore db issueProxy issues notes
 
   withSqliteStore path $ \db -> do
-    Right store' <- storeLoad db :: IO (Either String (Store Issue))
-    assertEqual "entries" (Map.keys store) (Map.keys store')
-    assertEqual
-      "nothing still wants its discussion"
-      []
-      (Map.keys (Map.filter needsDiscussion store'))
+    Right store <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual "entries" (sort (nub (map issue_iid issues))) (Map.keys store)
+    plan <- storeDiscussionPlan db issueProxy
+    assertEqual "nothing still wants its discussion" [] (map fst plan)
+    assertBool "and the reader agrees" (not (any needsDiscussion (Map.elems store)))
     assertEqual
       "notes came back"
-      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store))
-      (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems store'))
+      (replicate (Map.size store) (Just (map note_id notes)))
+      (map (fmap (map note_id) . entryNotes) (Map.elems store))
 
 -- | Re-fetching a record must not throw away the discussion we already have.
-mergeKeepsDiscussion :: Assertion
-mergeKeepsDiscussion = do
+recordWriteKeepsDiscussion :: Assertion
+recordWriteKeepsDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let withNotes = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-      merged = mergeRecords withNotes issues
-  assertEqual "same entries" (Map.keys withNotes) (Map.keys merged)
-  assertEqual
-    "discussions survived"
-    (map (fmap length . discussionNotes . entryDiscussion) (Map.elems withNotes))
-    (map (fmap length . discussionNotes . entryDiscussion) (Map.elems merged))
-  assertBool "and are still current" (not (any needsDiscussion (Map.elems merged)))
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    fillStore db issueProxy issues notes
+    Right before <- storeLoad db :: IO (Either String (Store Issue))
+    storeWriteRecords db issues
+    Right rewritten <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual "same entries" (Map.keys before) (Map.keys rewritten)
+    assertEqual
+      "discussions survived"
+      (map entryJson (Map.elems before))
+      (map entryJson (Map.elems rewritten))
+    plan <- storeDiscussionPlan db issueProxy
+    assertEqual "and are still current" [] (map fst plan)
 
 -- | If the record changed after we fetched its discussion, we have to look
 -- again; that is what lets an interrupted notes run resume.
 changedRecordIsStale :: Assertion
-changedRecordIsStale = do
+changedRecordIsStale = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  case issues of
-    [] -> assertFailure "fixture is empty"
-    (issue : _) -> do
-      let entry = setDiscussion notes (newEntry issue)
-      assertBool "current right after fetching" (not (needsDiscussion entry))
+  issue <- firstOf issues
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    fillStore db issueProxy [issue] notes
+    plan <- storeDiscussionPlan db issueProxy
+    assertEqual "current right after fetching" [] (map fst plan)
 
-      let touched = entry {entryRecord = bump (entryRecord entry)}
-      assertBool "stale once the record moves" (needsDiscussion touched)
-  where
-    bump i = i {issue_updated_at = fmap (addUTCTime 60) (issue_updated_at i)}
+    storeWriteRecords db [bumpIssue issue]
+    plan' <- storeDiscussionPlan db issueProxy
+    assertEqual "stale once the record moves" [issue_iid issue] (map fst plan')
+    entry <- entryAt (issue_iid issue) db :: IO (Entry Issue)
+    assertBool "and the reader agrees" (needsDiscussion entry)
 
 -- | The whole point of storing @discussion_updated_at@: a run over a project
 -- that has not moved must not spend a single request on notes it already has.
@@ -546,23 +705,18 @@ secondRunAsksForNothing = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> 
   let path = dir </> "gitlab.db"
 
   -- First run: fetch the records, fetch their notes, write.
-  withSqliteStore path $ \db ->
-    storeSaveAll db (Map.map (setDiscussion notes) (mergeRecords Map.empty issues))
+  withSqliteStore path $ \db -> fillStore db issueProxy issues notes
 
-  -- Second run: read that back, and let GitLab hand us the same records over
-  -- again, which it does for anything modified within a second of our newest.
+  -- Second run: let GitLab hand us the same records over again, which it does
+  -- for anything modified within a second of our newest.
   withSqliteStore path $ \db -> do
-    Right stored <- storeLoadWithoutNotes db :: IO (Either String (Store Issue))
-    let merged = mergeRecords stored issues
-    assertEqual "no entries appeared or vanished" (Map.keys stored) (Map.keys merged)
-    assertEqual
-      "every re-fetched record was one we already had"
-      (length issues)
-      (alreadyCurrent stored issues)
-    assertEqual
-      "nothing is requested a second time"
-      []
-      (Map.keys (Map.filter needsDiscussion merged))
+    current <- alreadyCurrent db issues
+    assertEqual "every re-fetched record was one we already had" (length issues) current
+    storeWriteRecords db issues
+    plan <- storeDiscussionPlan db issueProxy
+    assertEqual "nothing is requested a second time" [] (map fst plan)
+    held <- storeRecordCount db issueProxy
+    assertEqual "no entries appeared or vanished" (length (nub (map issue_iid issues))) held
 
 -- | And the converse: a record that really did change is the only one asked
 -- about again, so a run costs requests in proportion to what moved.
@@ -570,40 +724,36 @@ onlyChangedIsRefetched :: Assertion
 onlyChangedIsRefetched = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  issue <- firstOf issues
   let path = dir </> "gitlab.db"
-  withSqliteStore path $ \db ->
-    storeSaveAll db (Map.map (setDiscussion notes) (mergeRecords Map.empty issues))
-  Right stored <-
-    withSqliteStore path storeLoadWithoutNotes :: IO (Either String (Store Issue))
+  withSqliteStore path $ \db -> fillStore db issueProxy issues notes
 
-  case issues of
-    [] -> assertFailure "fixture is empty"
-    (issue : _) -> do
-      let touched = issue {issue_updated_at = fmap (addUTCTime 60) (issue_updated_at issue)}
-          merged = mergeRecords stored [touched]
-      assertEqual
-        "only the record that moved"
-        [issue_iid issue]
-        (Map.keys (Map.filter needsDiscussion merged))
-      assertEqual "and it is not counted as current" 0 (alreadyCurrent stored [touched])
+  withSqliteStore path $ \db -> do
+    let touched = bumpIssue issue
+    assertEqual "it is not counted as current" 0 =<< alreadyCurrent db [touched]
+    storeWriteRecords db [touched]
+    plan <- storeDiscussionPlan db issueProxy
+    assertEqual "only the record that moved" [issue_iid issue] (map fst plan)
 
 -- | What a run reports as fetched for nothing.
 countsUnchangedRecords :: Assertion
-countsUnchangedRecords = do
+countsUnchangedRecords = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  let store = mergeRecords Map.empty issues
-  assertEqual "all of them" (length issues) (alreadyCurrent store issues)
-  assertEqual "none against an empty store" 0 (alreadyCurrent (Map.empty :: Store Issue) issues)
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    assertEqual "none against an empty store" 0 =<< alreadyCurrent db issues
+    storeWriteRecords db issues
+    assertEqual "all of them" (length issues) =<< alreadyCurrent db issues
 
 changedIsNotCurrent :: Assertion
-changedIsNotCurrent = do
+changedIsNotCurrent = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  let store = mergeRecords Map.empty issues
-  case issues of
-    [] -> assertFailure "fixture is empty"
-    (issue : rest) -> do
-      let touched = issue {issue_updated_at = fmap (addUTCTime 60) (issue_updated_at issue)}
-      assertEqual "all but the changed one" (length rest) (alreadyCurrent store (touched : rest))
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeWriteRecords db issues
+    case issues of
+      [] -> assertFailure "fixture is empty"
+      (issue : rest) ->
+        assertEqual "all but the changed one" (length rest)
+          =<< alreadyCurrent db (bumpIssue issue : rest)
 
 -- | The claim the SQLite backend has to earn: what comes out is what went in.
 --
@@ -611,30 +761,43 @@ changedIsNotCurrent = do
 -- discussion and the timestamp the staleness check depends on, all three of
 -- which travel through separate tables and have to arrive together.
 sqliteRoundtrips :: forall a. Record a => Proxy a -> FilePath -> Assertion
-sqliteRoundtrips _ path = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+sqliteRoundtrips proxy path = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   records <- decodeFixture path :: IO [a]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
   assertBool (path <> " has no records") (not (null records))
 
-  -- Half the entries get a discussion and half do not, so that both the
-  -- has-notes and the never-fetched case are exercised.
-  let bare = mergeRecords Map.empty records
-      store = Map.mapWithKey (\k e -> if even k then setDiscussion notes e else e) bare
-
   withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
+    storeWriteRecords db records
+    -- Half the entries get a discussion and half do not, so that both the
+    -- fetched and the never-fetched case are exercised.
+    plan <- storeDiscussionPlan db proxy
+    let (fetched, untouched) = everyOther plan
+    forM_ fetched $ \(iid, stamp) -> storeWriteDiscussion db proxy iid stamp notes
+
     reread <- storeLoad db :: IO (Either String (Store a))
     case reread of
       Left err -> assertFailure ("reading the database back failed: " <> err)
-      Right store' -> do
-        assertEqual "keys" (Map.keys store) (Map.keys store')
+      Right store -> do
+        assertEqual "keys" (sort (map recordKey records)) (Map.keys store)
         assertEqual
-          "entries, discussions and timestamps"
-          (map entryJson (Map.elems store))
-          (map entryJson (Map.elems store'))
-        assertBool
-          "nothing needs re-fetching that did not before"
-          (map needsDiscussion (Map.elems store) == map needsDiscussion (Map.elems store'))
+          "the records themselves"
+          (map toJSON (sortOn recordKey records))
+          (map (toJSON . entryRecord) (Map.elems store))
+        forM_ fetched $ \(iid, _) -> do
+          let e = store Map.! iid
+          assertEqual
+            ("the notes of " <> show iid)
+            (Just (map note_id notes))
+            (fmap (map note_id) (entryNotes e))
+          assertBool ("still stale: " <> show iid) (not (needsDiscussion e))
+        forM_ untouched $ \(iid, _) -> do
+          let e = store Map.! iid
+          assertEqual ("notes appeared for " <> show iid) Nothing (fmap (map note_id) (entryNotes e))
+          assertBool ("silently current: " <> show iid) (needsDiscussion e)
+  where
+    everyOther xs = ([x | (n, x) <- indexed, even n], [x | (n, x) <- indexed, odd n])
+      where
+        indexed = zip [0 :: Int ..] xs
 
 sqliteStartsEmpty :: Assertion
 sqliteStartsEmpty = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
@@ -644,37 +807,36 @@ sqliteStartsEmpty = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
       Left err -> assertFailure ("a fresh database should be empty, got: " <> err)
       Right store -> assertEqual "empty" 0 (Map.size store)
 
--- | The reason for the backend at all: a checkpoint must not rewrite the
--- whole store, and must not lose the part it did not write.
-sqliteWritesOnlyChanged :: Assertion
-sqliteWritesOnlyChanged = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+-- | The reason for the backend at all: a write must not rewrite the whole
+-- store, and must not lose the part it did not name.
+sqliteWritesOnlyWhatItNames :: Assertion
+sqliteWritesOnlyWhatItNames = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let store = mergeRecords Map.empty issues
-  case Map.keys store of
+  case map issue_iid issues of
     [] -> assertFailure "fixture is empty"
     (target : others) -> withSqliteStore (dir </> "gitlab.db") $ \db -> do
-      storeSaveAll db store
+      storeWriteRecords db issues
+      stamps <- Map.fromList <$> storeDiscussionPlan db issueProxy
 
-      -- Attach a discussion to one entry and save only that key.
-      let store' = Map.adjust (setDiscussion notes) target store
-      storeSave db store' (IntSet.singleton target)
-
+      -- Give one entry a discussion, and check nothing else moved.
+      storeWriteDiscussion db issueProxy target (Map.findWithDefault Nothing target stamps) notes
       Right reread <- storeLoad db :: IO (Either String (Store Issue))
-      assertEqual "nothing appeared or vanished" (Map.keys store) (Map.keys reread)
+      assertEqual "nothing appeared or vanished" (sort (nub (map issue_iid issues))) (Map.keys reread)
       assertBool
-        "the entry we saved did not gain its discussion"
+        "the entry we wrote did not gain its discussion"
         (not (needsDiscussion (reread Map.! target)))
       assertBool
-        "an entry we did not save was changed"
+        "an entry we did not write was changed"
         (all (\k -> needsDiscussion (reread Map.! k)) others)
 
-      -- A save that claims nothing changed must leave the store alone, which
-      -- is what makes the changed-key set safe to trust.
-      storeSave db (Map.map (setDiscussion notes) store) IntSet.empty
+      -- A record write of the others must leave the one with notes alone, and
+      -- writing nothing must leave everything alone.
+      storeWriteRecords db [i | i <- issues, issue_iid i /= target]
+      storeWriteRecords db ([] :: [Issue])
       Right settled <- storeLoad db :: IO (Either String (Store Issue))
       assertEqual
-        "an empty changed set still wrote something"
+        "a write of other records changed the store"
         (map entryJson (Map.elems reread))
         (map entryJson (Map.elems settled))
 
@@ -683,10 +845,12 @@ sqliteSurvivesReopen = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
   let path = dir </> "gitlab.db"
-      store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-  withSqliteStore path (`storeSaveAll` store)
+  written <- withSqliteStore path $ \db -> do
+    fillStore db issueProxy issues notes
+    storeLoad db :: IO (Either String (Store Issue))
   withSqliteStore path $ \db -> do
     Right reread <- storeLoad db :: IO (Either String (Store Issue))
+    Right store <- pure written
     assertEqual
       "what a later run reads"
       (map entryJson (Map.elems store))
@@ -698,14 +862,11 @@ sqliteSharesUsers :: Assertion
 sqliteSharesUsers = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
-      distinct =
-        length . nub . map (encode . toJSON) $
-          concatMap (\e -> maybe [] (map note_author) (discussionNotes (entryDiscussion e))) (Map.elems store)
-      references = sum (map (maybe 0 length . discussionNotes . entryDiscussion) (Map.elems store))
+  let distinct = length (nub (map (encode . toJSON . note_author) notes))
+      references = length issues * length notes
   assertBool "fixture does not repeat any user" (references > distinct)
   withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
+    fillStore db issueProxy issues notes
     counts <- sqliteTableCounts db
     let stored = maybe 0 id (lookup "users" counts)
         refs = maybe 0 id (lookup "note_users" counts)
@@ -807,8 +968,8 @@ clearKeepsNotes = withClearedStore $ \before cleared -> do
   assertEqual "entries" (Map.keys before) (Map.keys cleared)
   assertEqual
     "the notes changed"
-    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems before))
-    (map (fmap (map note_id) . discussionNotes . entryDiscussion) (Map.elems cleared))
+    (map (fmap (map note_id) . entryNotes) (Map.elems before))
+    (map (fmap (map note_id) . entryNotes) (Map.elems cleared))
   assertEqual
     "the records changed"
     (map (toJSON . entryRecord) (Map.elems before))
@@ -820,9 +981,8 @@ clearIsIdempotent :: Assertion
 clearIsIdempotent = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
   withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
+    fillStore db issueProxy issues notes
     runNoLog (clearTimestamps db)
     Right once <- storeLoad db :: IO (Either String (Store Issue))
     runNoLog (clearTimestamps db)
@@ -837,9 +997,8 @@ withClearedStore :: (Store Issue -> Store Issue -> Assertion) -> Assertion
 withClearedStore check = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
   notes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
-  let store = Map.map (setDiscussion notes) (mergeRecords Map.empty issues)
   withSqliteStore (dir </> "gitlab.db") $ \db -> do
-    storeSaveAll db store
+    fillStore db issueProxy issues notes
     Right before <- storeLoad db :: IO (Either String (Store Issue))
     runNoLog (clearTimestamps db)
     Right cleared <- storeLoad db :: IO (Either String (Store Issue))
@@ -982,20 +1141,28 @@ tokenIsStripped = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   writeFile path "  glpat-secret\n"
   readToken path >>= (@?= Right "glpat-secret")
 
-mergeReplaces :: Assertion
-mergeReplaces = do
+-- | Writing a record the store already has replaces it rather than adding a
+-- second row, which is what makes a page that repeats its anchor harmless.
+recordWriteReplaces :: Assertion
+recordWriteReplaces = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  let (old, rest) = splitAt 1 issues
-      store = mergeRecords (mergeRecords Map.empty old) issues
-  assertEqual "one entry per iid" (length issues) (Map.size store)
-  assertEqual "no duplicates" (length rest + 1) (Map.size store)
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeWriteRecords db (take 1 issues)
+    storeWriteRecords db issues
+    Right store <- storeLoad db :: IO (Either String (Store Issue))
+    assertEqual "one entry per iid" (sort (nub (map issue_iid issues))) (Map.keys store)
+    assertEqual "and the count agrees" (Map.size store) =<< storeRecordCount db issueProxy
 
+-- | Where an incremental run starts is the newest record the store holds, and
+-- it is the store that says so rather than anything a run remembers.
 latestUpdateIsNewest :: Assertion
-latestUpdateIsNewest = do
+latestUpdateIsNewest = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
-  let store = mergeRecords Map.empty issues
-      expected = maximum [t | Just t <- map recordUpdatedAt issues] :: UTCTime
-  assertEqual "newest timestamp" (Just expected) (latestUpdate store)
+  let expected = maximum [t | Just t <- map recordUpdatedAt issues] :: UTCTime
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    assertEqual "an empty store starts from nothing" Nothing =<< storeLatestUpdate db issueProxy
+    storeWriteRecords db issues
+    assertEqual "newest timestamp" (Just expected) =<< storeLatestUpdate db issueProxy
 
 -- | A directory can hold more than one store: a run pointed at a second
 -- database, or a copy taken before some experiment. The one being written to
@@ -1066,6 +1233,46 @@ entryJson :: Record a => Entry a -> Value
 entryJson e =
   object
     [ "record" .= toJSON (entryRecord e)
-    , "discussion" .= toJSON (discussionNotes (entryDiscussion e))
+    , "discussion" .= toJSON (entryNotes e)
     , "discussion_updated_at" .= toJSON (entryDiscussionFor e)
     ]
+
+issueProxy :: Proxy Issue
+issueProxy = Proxy
+
+-- | What a first run leaves behind: the records written, then the discussion
+-- of everything the store asked for, stamped as the plan said.
+fillStore :: Record a => SqliteStore -> Proxy a -> [a] -> [Note] -> IO ()
+fillStore db proxy records notes = do
+  storeWriteRecords db records
+  plan <- storeDiscussionPlan db proxy
+  forM_ plan $ \(iid, stamp) -> storeWriteDiscussion db proxy iid stamp notes
+
+-- | One entry, or a failed assertion if the store does not hold it.
+entryAt :: Record a => Int -> SqliteStore -> IO (Entry a)
+entryAt iid db = do
+  found <- storeLookup db iid
+  case found of
+    Left err -> assertFailure ("reading the store failed: " <> err)
+    Right Nothing -> assertFailure ("the store does not hold " <> show iid)
+    Right (Just e) -> pure e
+
+-- | How many of these records the store already holds at exactly this
+-- version, which is what 'FetchGitLab.Fetch.fetchRecords' reports as fetched
+-- for nothing.
+alreadyCurrent :: Record a => SqliteStore -> [a] -> IO Int
+alreadyCurrent db records = do
+  stored <- storeRecordVersions db (proxyOf records) (map recordKey records)
+  pure (length [r | r <- records, Map.lookup (recordKey r) stored == Just (recordUpdatedAt r)])
+  where
+    proxyOf :: [a] -> Proxy a
+    proxyOf _ = Proxy
+
+-- | A record whose @updated_at@ moved, which is what makes its discussion
+-- stale.
+bumpIssue :: Issue -> Issue
+bumpIssue i = i {issue_updated_at = fmap (addUTCTime 60) (issue_updated_at i)}
+
+firstOf :: [a] -> IO a
+firstOf (x : _) = pure x
+firstOf [] = assertFailure "fixture is empty"

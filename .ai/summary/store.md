@@ -9,9 +9,13 @@ Schema versioning is [Schema.md](Schema.md).
 
 - `Record` (`FetchGitLab.Store`): `recordKey` is the `iid`, `recordKind`
   is `ticket` or `mr`. One handle serves both kinds; the instance at the
-  call site decides which.
-- `StoreBackend`: `storeLoad`, `storeLoadWithoutNotes`, `storeSave` with
-  the changed keys, `storeLookup`, `storeWritePipelines`.
+  call site decides which, or a `Proxy` where there is no record to take it
+  from.
+- `StoreBackend` writes: `storeWriteRecords`, `storeWriteDiscussion`,
+  `storeWritePipelines`, `storeClearDiscussionStamps`. Asks:
+  `storeDiscussionPlan`, `storeRecordCount`, `storeLatestUpdate`,
+  `storeRecordVersions`. Reader's view: `storeLoad`, `storeLookup`,
+  `Entry`, `Store`.
 - `Backend` (`Options`) is a one-constructor type on purpose; its haddock
   says how a second backend is added.
 - `splitObject` / `spliceObject` with a `LiftSpec` split an object into
@@ -20,9 +24,16 @@ Schema versioning is [Schema.md](Schema.md).
 
 ## Invariants
 
-- `storeSave` writes only the keys it is given and nothing else. That is
-  what makes a checkpoint constant-cost as the store grows; see log
-  2026-09-03 "changed-key checkpoints".
+- **A write states one thing the caller just learned, and nothing else.** A
+  record write never touches `discussion_updated_at` or the note rows; a
+  discussion write never touches the record. Nothing writes a snapshot back,
+  so concurrent writers cannot undo each other. See log 2026-09-03
+  "write-through store".
+- Every write is one `BEGIN IMMEDIATE` transaction (`withImmediateTransaction`
+  in Sqlite.hs, whose haddock says why a deferred `BEGIN` plus `busy_timeout`
+  is not enough). Nothing may take the deferred `withTransaction`.
+- "Fetched" is `discussion_updated_at IS NOT NULL`; there is no
+  `has_discussion` column since schema patch 2.
 - Interned objects are keyed on their exact JSON. Two copies of a user with
   different fields are two rows; never merge them.
 - Split and splice are inverses on every fixture and the real store
@@ -33,6 +44,12 @@ Schema versioning is [Schema.md](Schema.md).
   doubled the size of the store; comment in Schema.hs.
 - Notes are keyed `(kind, iid, position)`, never by GitLab's note id;
   comment above the `notes` table.
+- `discussion_updated_at` and the generated `updated_at` are compared as
+  text, so both must come from `encodeTime` (Sqlite.hs), which trims the
+  fraction (`.550Z` → `.55Z`); a second encoder makes every discussion read
+  as stale ("both timestamp columns are written by one encoder"). The text
+  does not sort chronologically: `MAX`/`ORDER BY` on it are off by under a
+  second. Log 2026-09-03 "timestamps round the same way on every path".
 
 ## Pipelines
 

@@ -3,20 +3,32 @@
 
 -- | What a place to keep records has to be able to do.
 --
--- A backend holds tickets and merge requests together: 'storeLoad' and
--- 'storeSave' pick which by the 'Record' instance they are used at, so one
--- handle serves both, whether the backend keeps them in one place or two.
+-- A backend holds tickets and merge requests together: every operation picks
+-- which by the 'Record' instance it is used at, so one handle serves both,
+-- whether the backend keeps them in one place or two. Where a call has no
+-- record to take the instance from it takes a 'Proxy' instead.
+--
+-- == A write states one thing the run just learned
+--
+-- There are two of them: 'storeWriteRecords' says "these records are as GitLab
+-- had them just now", and 'storeWriteDiscussion' says "these are the notes of
+-- record @n@ as of the version I planned against". Neither one restates
+-- anything else about the store, so a run holds no snapshot to write back and
+-- two runs against one store can only duplicate work — never undo it. What a
+-- run still owes is asked for rather than remembered: 'storeDiscussionPlan'.
 module FetchGitLab.Store.Class
   ( StoreBackend (..)
   , SomeStore (..)
-  , storeSaveAll
   ) where
 
 import Data.Aeson (Value)
-import Data.IntSet (IntSet)
-import qualified Data.IntSet as IntSet
+import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Proxy (Proxy)
 import Data.Text (Text)
+import Data.Time.Clock (UTCTime)
+
+import GitLab.Types (Note)
 
 import FetchGitLab.Store (Entry, Record, Store)
 
@@ -30,37 +42,10 @@ class StoreBackend b where
 
   -- | Everything the store holds of one kind of record.
   --
-  -- 'Left' means the store is there but could not be understood, which aborts
-  -- a run: overwriting a store we failed to read would throw away whatever it
-  -- held. A store that does not exist yet is an empty one, not a failure.
+  -- The reader's view, and what the tests compare stores by; a run does not
+  -- use it. 'Left' means the store is there but could not be understood. A
+  -- store that does not exist yet is an empty one, not a failure.
   storeLoad :: Record a => b -> IO (Either String (Store a))
-
-  -- | Write a store back.
-  --
-  -- The second argument is the keys that changed since it was loaded. The
-  -- store passed is still the whole truth, so a backend may ignore the set and
-  -- write all of it; a backend that can write just those entries should,
-  -- because this is called at every checkpoint of a run and the alternative is
-  -- rewriting the whole store each time.
-  --
-  -- Entries not in the store must survive: a run only ever loads, adds to and
-  -- saves, so a key that is absent has not been deleted, it was never there.
-  storeSave :: Record a => b -> Store a -> IntSet -> IO ()
-
-  -- | The same as 'storeLoad', but without reading the notes.
-  --
-  -- Entries whose discussion is in the store come back as 'Kept', which writes
-  -- back as "leave what is there alone". A fetch uses this: notes are three
-  -- quarters of a store and it needs none of their content, only whether a
-  -- discussion is there and what record version it belongs to. Anything that
-  -- has to see the notes themselves must use 'storeLoad' instead.
-  --
-  -- The default reads them, for a backend that cannot do better. That is
-  -- honest rather than merely convenient: 'Kept' promises the notes are safe
-  -- in the store, so a backend that would rewrite the whole thing from what is
-  -- in memory must not claim it.
-  storeLoadWithoutNotes :: Record a => b -> IO (Either String (Store a))
-  storeLoadWithoutNotes = storeLoad
 
   -- | One entry by its 'FetchGitLab.Store.recordKey', with its discussion.
   --
@@ -74,6 +59,63 @@ class StoreBackend b where
   storeLookup :: Record a => b -> Int -> IO (Either String (Maybe (Entry a)))
   storeLookup b key = fmap (Map.lookup key) <$> storeLoad b
 
+  -- | Write records as GitLab just gave them, replacing any older copy.
+  --
+  -- Exactly the record and what hangs off it: never a discussion, never a
+  -- discussion timestamp. A record that is new to the store arrives with no
+  -- timestamp, which is what makes it show up in 'storeDiscussionPlan'; a
+  -- record that was already there keeps whatever stamp and notes it had, so a
+  -- run rewriting a page cannot undo the notes another writer just fetched.
+  --
+  -- One transaction for the whole list: a page is written or it is not.
+  storeWriteRecords :: Record a => b -> [a] -> IO ()
+
+  -- | Write the notes of one record, and stamp it with the record version
+  -- they were fetched for.
+  --
+  -- The stamp is passed in rather than read from the row, and it is the
+  -- @updated_at@ 'storeDiscussionPlan' handed out. In the window between
+  -- planning and writing, another run may have written a newer version of the
+  -- record; stamping these notes with /that/ version would claim they cover
+  -- edits they were fetched before. Using the planned version instead leaves
+  -- the record looking stale, so the race costs one redundant refetch next
+  -- run, which is the cheap direction to be wrong in.
+  --
+  -- 'Nothing' means GitLab gave the record no @updated_at@ at all, so nothing
+  -- can be claimed for the notes and they are fetched again next run.
+  --
+  -- One transaction, so a discussion is whole on disk the moment it is
+  -- written: an interrupted run loses nothing it had fetched.
+  storeWriteDiscussion :: Record a => b -> Proxy a -> Int -> Maybe Text -> [Note] -> IO ()
+
+  -- | The records whose discussion is missing or out of date, each with the
+  -- @updated_at@ to stamp its notes with, newest first.
+  --
+  -- This is the whole of what a run needs to know to fetch notes, and it is a
+  -- query rather than a filter over a loaded store: notes are three quarters
+  -- of a store and a run needs none of their content.
+  storeDiscussionPlan :: Record a => b -> Proxy a -> IO [(Int, Maybe Text)]
+
+  -- | How many records of the kind the store holds. With the length of
+  -- 'storeDiscussionPlan' this is what a run reports as already current.
+  storeRecordCount :: Record a => b -> Proxy a -> IO Int
+
+  -- | The newest @updated_at@ over the records of one kind, which is where an
+  -- incremental run resumes from.
+  storeLatestUpdate :: Record a => b -> Proxy a -> IO (Maybe UTCTime)
+
+  -- | The stored @updated_at@ of each of the given keys the store holds.
+  --
+  -- A key that is not in the map is a record the store does not have; a key
+  -- mapped to 'Nothing' is one GitLab gave no timestamp for. Lets a run count
+  -- how much of a page it fetched for nothing without holding the store.
+  storeRecordVersions :: Record a => b -> Proxy a -> [Int] -> IO (Map Int (Maybe UTCTime))
+
+  -- | Forget when the discussions of one kind were fetched, keeping the notes
+  -- themselves; returns how many records were changed. See
+  -- "FetchGitLab.ClearTimestamp".
+  storeClearDiscussionStamps :: Record a => b -> Proxy a -> IO Int
+
   -- | Write the pipelines of one record, each paired with the jobs it ran.
   --
   -- The record is named by kind and iid exactly as everywhere else, because
@@ -85,7 +127,3 @@ class StoreBackend b where
 
 -- | A backend chosen at run time, once the command line has been read.
 data SomeStore = forall b. StoreBackend b => SomeStore b
-
--- | Save a store without claiming to know what changed in it.
-storeSaveAll :: (StoreBackend b, Record a) => b -> Store a -> IO ()
-storeSaveAll b store = storeSave b store (IntSet.fromList (Map.keys store))

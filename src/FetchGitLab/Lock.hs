@@ -2,10 +2,18 @@
 
 -- | Excluding concurrent runs from the same store files.
 --
--- Two runs sharing a store file would clobber each other: both read the file,
--- both fetch, and whichever writes last silently drops everything the other
--- found. An exclusive lock held for the whole run makes the second run fail
--- immediately instead.
+-- Not because they would lose each other's work. Every write a run makes
+-- states one thing it has just learned and lands in an immediate transaction
+-- of its own, so two runs sharing a store can duplicate work but cannot undo
+-- it; see "FetchGitLab.Store.Class".
+--
+-- What the lock buys is the cost of that duplication. A cold run over a
+-- project the size of GHC's is tens of thousands of requests and the better
+-- part of a day, and two runs against one token double the rate at a server
+-- that answers sustained traffic with an anti-bot challenge — so the second
+-- run would make the first one slower and finish with nothing new. An
+-- exclusive lock held for the whole run turns it away at once instead, and
+-- names the process it is waiting on so the answer is actionable.
 module FetchGitLab.Lock
   ( withStoreLocks
   , LockBusy (..)

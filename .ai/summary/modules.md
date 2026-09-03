@@ -6,11 +6,11 @@
 | `Since` | `--since` grammar and resolution | |
 | `Fetch` | `run`, records, discussions, pipelines, challenge wait | [fetch.md](fetch.md), [network.md](network.md) |
 | `ClearTimestamp` | `--clear-timestamp` | [fetch.md](fetch.md) |
-| `Store` | `Record`, `Entry`, `Discussion`, merge, staleness | [store.md](store.md) |
+| `Store` | `Record`, `Entry`, `needsDiscussion` | [store.md](store.md) |
 | `Store.Class` | `StoreBackend` | [store.md](store.md) |
 | `Store.Backend` | `--backend`/`--db` to an open store and lock paths | [store.md](store.md) |
 | `Store.Sqlite` | the backend, `migrate` | [store.md](store.md), [Schema.md](Schema.md) |
-| `Store.Schema`, `.Pipeline` | tables, `schemaPatches` | [store.md](store.md), [Schema.md](Schema.md) |
+| `Store.Schema`, `.Pipeline` | tables, `SchemaPatch`, `schemaPatches` | [store.md](store.md), [Schema.md](Schema.md) |
 | `Store.Schema.Types` | `LiftSpec`, split/splice | [store.md](store.md) |
 | `Lock` | store locks | [lock.md](lock.md) |
 | `Logging`, `RateLimit` | loggers, limiter, manager | [network.md](network.md) |

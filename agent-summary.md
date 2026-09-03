@@ -45,9 +45,9 @@ and are told apart by `kind`, `ticket` versus `mr`:
   library does not model are dropped.
 - its discussion — the notes on that object. Absent if never fetched.
 - `discussion_updated_at` — the record's `updated_at` at the time the
-  discussion was fetched. A run compares it against the record's current
-  `updated_at` to decide whether the discussion is stale, which is what makes
-  an interrupted notes run resumable.
+  discussion was fetched, and NULL if it never was. A run compares it against
+  the record's current `updated_at` to decide whether the discussion is
+  stale, which is what makes an interrupted notes run resumable.
 
 The key is the `iid`: re-fetching a record replaces the old copy and keeps
 whatever discussion it had. Repeated objects — users, milestones, labels —
@@ -71,20 +71,22 @@ Pipelines and jobs, when fetched, land in tables of their own.
 5. Fetch records a page of 100 at a time, oldest change first, writing each
    page before asking for the next. Stopping halfway is safe: the next run
    asks for exactly what is missing.
-6. Unless `--no-notes`, fetch discussions for every entry that has none or
-   whose record changed. Entries are visited newest first, and the store is
-   written every 20 entries.
+6. Unless `--no-notes`, fetch discussions for every record that has none or
+   whose record changed. Records are visited newest first, and each
+   discussion is written as it arrives.
 
-Every write is a transaction, so an interrupted run leaves the store as of its
-last checkpoint. An object whose notes cannot be fetched is logged and skipped
-rather than aborting the run; the next run retries it.
+Every write is a transaction stating one thing the run just learned — a page
+of records, or one record's notes — so an interrupted run leaves everything
+it had fetched, and a write never undoes another one. An object whose notes
+cannot be fetched is logged and skipped rather than aborting the run; the
+next run retries it.
 
 ## Not asking twice
 
 A discussion is only re-requested once the record's `updated_at` moves past
 the stored `discussion_updated_at`, so a run over an unchanged project issues
 no note requests at all. The counts are logged on both sides of that decision
-— entries already current, never fetched, and stale — so a run that starts
+— records already current, and records to request — so a run that starts
 re-fetching everything says so rather than merely taking six hours.
 
 Records always come back for the second before the store's newest one; the
@@ -96,7 +98,7 @@ large count means the timestamp was further back than it had to be.
 `gitlab.haskell.org` answers sustained traffic with an interstitial page
 served as HTTP 200. A run recognises it and waits it out on a ladder of 30s,
 60s, 2m, 5m, 10m, 10m before giving up. Giving up aborts the run rather than
-skipping the object, since progress is already checkpointed and carrying on
+skipping the object, since everything fetched is already written and carrying on
 would spend the whole ladder again on the next one. Every other error fails
 on the first attempt, so a bad token is reported immediately. The challenge is
 tied to the source address, not the process, so restarting straight away does
@@ -109,11 +111,9 @@ and by `--clear-timestamp`. The file records the holder's pid and start time,
 which is what a run that is turned away reports. The file is left behind on
 exit and is not a stale lock: the operating system releases the real lock
 when the process dies, and the next run overwrites the record. Locking never
-waits; a run that cannot have the lock exits 1.
-
-Requests are capped at 1.5 per second, pagination and retries included.
-Discussions cost one request per object, so a cold run over a large project
-takes hours — roughly six to eight for `ghc/ghc`. Interrupting it is safe.
+waits; a run that cannot have the lock exits 1. Two runs could not corrupt
+a store — every write states one thing the run just fetched — but they would
+spend the same hours twice against one token.
 
 ## Pipelines on request
 
@@ -142,15 +142,16 @@ starting point and points at `--since`.
 ## Size
 
 For `ghc/ghc`, 26,259 issues and 16,539 merge requests, so about 43k note
-requests for a cold run. Sized from a random sample: a complete store is
-roughly 360 MB of tickets and 210 MB of merge requests, ~560 MB in all, or
-~150 MB with `--no-notes`. Notes are about three quarters of the bytes. The
-distribution is heavily tailed — median object ~9 KB, largest past 500 KB —
-so the mean is what to extrapolate from.
+requests for a cold run: six to eight hours at the 1.5 requests a second the
+tool allows itself, pagination and retries included. Interrupting is safe.
+Sized from a random sample, a complete store is roughly 360 MB of tickets and
+210 MB of merge requests, ~560 MB in all, or ~150 MB with `--no-notes`. Notes
+are about three quarters of the bytes; the median object is ~9 KB and the
+largest past 500 KB, so extrapolate from the mean.
 
-A run holds records but not notes in memory, and caps its heap at 1 GB, about
-twice what `ghc/ghc`'s full history needs. Raise it with `+RTS -M4G -RTS` if
-needed; an overflow well under that is a leak worth reporting.
+A run holds a page of records and the list of discussions still to fetch,
+never the store. The 1 GB heap cap is a leak detector, not a limit a project
+can reach.
 
 ## Watching a run
 

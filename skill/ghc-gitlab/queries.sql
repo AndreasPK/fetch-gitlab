@@ -75,13 +75,13 @@ HAVING count(DISTINCT l.name) = 2
 -- Store coverage: what it holds, how much of the discussion has been
 -- fetched, and the watermark an incremental run resumes from. A cold run
 -- fetches records first and discussions second, so a store part way through
--- shows records with has_discussion = 0.
+-- shows records with a NULL discussion_updated_at.
 SELECT kind,
-       count(*)                 AS records,
-       sum(has_discussion)      AS with_notes,
-       sum(has_discussion = 0)  AS without_notes,
-       min(created_at)          AS oldest,
-       max(updated_at)          AS newest
+       count(*)                                AS records,
+       sum(discussion_updated_at IS NOT NULL)  AS with_notes,
+       sum(discussion_updated_at IS NULL)      AS without_notes,
+       min(created_at)                         AS oldest,
+       max(updated_at)                         AS newest
   FROM records
  GROUP BY kind;
 
@@ -89,11 +89,11 @@ SELECT kind,
 -- (the record changed after its discussion was fetched).
 SELECT kind, iid, updated_at, title
   FROM records
- WHERE has_discussion = 0
+ WHERE discussion_updated_at IS NULL
  ORDER BY updated_at DESC
  LIMIT 20;
 
 SELECT kind, iid, discussion_updated_at, updated_at
   FROM records
- WHERE has_discussion = 1 AND discussion_updated_at IS NOT updated_at
+ WHERE discussion_updated_at IS NOT NULL AND discussion_updated_at IS NOT updated_at
  LIMIT 20;

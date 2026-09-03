@@ -3,6 +3,17 @@
 `FetchGitLab.Lock`: `withStoreLocks`, `LockInfo`, `lockPath`. Both a fetch
 and `--clear-timestamp` take it; it never waits.
 
+## Why it exists
+
+- Not to prevent data loss. Since the write-through store, every write
+  states one thing the run learned and is its own immediate transaction, so
+  concurrent runs can only duplicate work; see log 2026-09-03
+  "write-through store". The lock stops two runs spending hours on the same
+  project and doubling the request rate against one token, and lets the
+  second name who is in the way.
+- Hence no `PRAGMA locking_mode = EXCLUSIVE`: a reader must be able to query
+  the store while a run writes it.
+
 ## Invariants
 
 - The lock is on `<store>.lock`, never on the store; `lockPath`'s haddock

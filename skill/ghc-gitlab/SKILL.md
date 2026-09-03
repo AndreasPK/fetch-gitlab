@@ -55,8 +55,9 @@ Gotchas:
   group by `username`. Nicknames are often not usernames — resolve first with
   `SELECT DISTINCT username, name FROM users WHERE name LIKE '%…%' OR
   username LIKE '%…%'`.
-- **`has_discussion = 0` means the notes were never fetched**, not that
-  nobody replied. `discussion_updated_at <> updated_at` means they are stale.
+- **`discussion_updated_at IS NULL` means the notes were never fetched**, not
+  that nobody replied. `discussion_updated_at IS NOT updated_at` means they
+  are stale.
 
 Text search is `LIKE` over title/description/body — case-insensitive for
 ASCII, no FTS, a full scan is subsecond. Common words ("layout", "tag") match

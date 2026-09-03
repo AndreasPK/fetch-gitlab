@@ -41,17 +41,13 @@ overshooting.
 
 ## Incremental fetching
 
-Fetching is incremental. For tickets and merge requests alike the tool
-
-1. reads the existing store, if there is one,
-2. takes the newest `updated_at` in it and asks GitLab only for records
-   modified after that point (everything, if there is no store yet),
-3. merges what comes back into what it had, keyed by the project local `iid`,
-4. writes back what changed.
-
-Step 2 is what `--since` replaces. The timestamp handed to GitLab is one second before the newest one we have, so
-a record modified in the same instant as our newest cannot slip through an
-exclusive comparison. Re-fetching a record we already have just replaces it.
+Fetching is incremental. For tickets and merge requests alike the tool asks
+the store for its newest `updated_at`, asks GitLab only for records modified
+after that point (everything, if there is no store yet), and writes each page
+as it arrives, keyed by the project local `iid`. `--since` replaces the
+timestamp. It is handed to GitLab one second early, so a record modified in
+the same instant as our newest cannot slip through an exclusive comparison;
+re-fetching a record we already have just replaces it.
 
 A store that cannot be read aborts the run rather than being silently written
 over.
@@ -63,23 +59,11 @@ repeatedly during a long run, so the default backs off below it.
 
 ## Memory
 
-A run holds its records in memory but not their notes. Notes are three
-quarters of a store and a run needs none of their content: what to fetch is
-decided from the record's `updated_at` against the stored
-`discussion_updated_at`, and what is fetched is written out at the next
-checkpoint and then dropped. So a run's memory tracks how many records a
-project has, not how much has ever been said about them.
-
-Measured on a store of 17,052 records with 229k notes, loading it for a fetch:
-
-| | live data | peak heap |
-| --- | --- | --- |
-| holding the notes | 301 MB | 813 MiB |
-| not holding them | 155 MB | 340 MiB |
-
-The executable caps its heap at 1 GB, which is roughly twice what `ghc/ghc`'s
-full history needs. Raise it with `+RTS -M4G -RTS` if you need to; a heap
-overflow well under that is a leak worth reporting rather than a large project.
+A run never holds the store: only the page of records it is writing and, for
+the notes phase, the list of records still owed a discussion — an id and a
+timestamp each. Its memory tracks a page and what changed, not the project's
+history. The 1 GB heap cap is far more than that needs; overflowing it is a
+leak worth reporting, not a large project.
 
 ## Anti-bot challenges
 
@@ -106,77 +90,35 @@ run resumes from it.
 
 ## One run at a time
 
-A run reads a store, merges what it fetched into what it read, and writes the
-result back, so two runs sharing a store would each throw away the other's
-work. The store is therefore locked for the length of a run, and a second run
-against it is turned away immediately rather than made to wait:
-
-```
-$ fetch-gitlab --token gitlab-token
-ATTENTION Another fetch-gitlab is already running against ~/.fetch-gitlab/gitlab.db: pid 867046, started 2026-08-16 07:46:45 UTC
-ATTENTION Its lock is held on ~/.fetch-gitlab/gitlab.db.lock; use --db to work on a separate store
-```
-
-The lock is held on a `<file>.lock` beside the store rather than on the store
-itself: a store file is not guaranteed to keep its inode, and a lock on a
-replaced file would stop guarding anything. Each run records its pid and start
-time in the lock file, which is where the message above gets its details.
-
-That lock file is left behind when the run ends and is not a stale lock: the
-lock itself belongs to the running process and the operating system drops it
-when that process exits, however it exits. A leftover file with a long dead pid
-in it holds nothing, and the next run overwrites it.
+In principle we could allow concurrent writes but it would just cause us to run
+into rate limits faster. So we currently use a lock file to prevent concurrent
+fetches that would just duplicate work.
 
 ## Discussions
 
-Unless `--no-notes` is given, each run also fetches the notes on every ticket
-and merge request that has none yet or whose record has changed since the notes
-were last fetched. `discussion_updated_at` records which version of the record
-the discussion belongs to, which is what makes that comparison possible.
+Unless `--no-notes` is given, each run fetches not just the MR/Issue but also
+it's full discussion (notes in gitlab lingo). But we avoid refetching already
+known objects by using time/last_updated based filters on the queries.
 
 This is the expensive part: GitLab has no bulk endpoint for notes, so it costs
 one request per object. A cold run over `ghc/ghc` is roughly 43k requests, about
-eight hours at 1.5 per second. Interrupting is safe — entries are visited newest
-first and the store is checkpointed every 20 objects, so the next run picks up
+eight hours at 1.5 per second. Interrupting is safe — objects are visited newest
+first and each discussion is written as it arrives, so the next run picks up
 where the last left off. An object whose notes fail to fetch is logged and retried on
 the next run rather than aborting.
 
 A run says how much of that it managed to avoid:
 
 ```
-INFO Fetched 6 tickets (5 new or changed, 1 already current), writing 26259 to ...
-INFO Discussions for tickets: 26254 already current, requesting 5 (0 never fetched, 5 changed since)
+INFO Fetched 6 tickets (5 new or changed, 1 already current), store now holds 26259
+INFO Discussions for tickets: 26254 already current, requesting 5
 INFO All 16539 merge requests discussions are up to date, requesting none
 ```
 
-An object is only asked about again once its own `updated_at` moves past the
-`discussion_updated_at` we stored with its notes, so a run costs requests in
-proportion to what actually changed rather than to the size of the project. The
-"already current" count on the record line is the one thing fetched for nothing
-each time, and it is normally 1: `updated_after` is asked from a second before
-our newest record, so whatever sits in that second comes back again.
-
 ## Disk space
 
-Measured against `ghc/ghc` (26,259 issues and 16,539 merge requests, sampled at
-random and sized as the JSON the store keeps), a complete store is about
-
-| | with discussions | `--no-notes` |
-| --- | --- | --- |
-| tickets | ~360 MB | ~110 MB |
-| merge requests | ~210 MB | ~37 MB |
-| total | **~560 MB** | ~150 MB |
-
-Call it half a gigabyte, and 400–700 MB if you want a margin: the mean is what
-drives the total and the distribution has a long tail — the median object costs
-about 9 KB while the largest run past 500 KB. Sharing repeated objects saves
-about what the tables and indexes spend again, so the database lands within a
-couple of percent of the JSON it holds.
-
-Notes are roughly three quarters of that, at about 12 per object and 850 bytes
-each. A checkpoint writes only the entries that changed, so the space a run
-needs beyond the store itself is the write ahead log rather than a second copy
-of it.
+For GHC itself the database is in the 500MB-1GB range currently once all discussion
+are fetched.
 
 ## The store
 
@@ -192,12 +134,11 @@ fetch-gitlab --token gitlab-token --db /srv/ghc.db
 is the only value it takes today. Two things about the one there is are worth
 knowing.
 
-**It writes only what changed.** A checkpoint upserts the entries whose keys
-the run passed and leaves the rest alone, so it costs the same on a full store
-as on an empty one — around 60–70 ms for 20 objects whether the store is 8 MB
-or 88 MB. A store that had to be rewritten from the top would be spending
-seconds per checkpoint by the time it held `ghc/ghc`, against a checkpoint
-every ten.
+**It writes only what the run just learned.** A write says one thing — this
+page of records, or this record's notes — and touches nothing else, so it
+costs the same on a full store as on an empty one, and a second run against
+the same store could only duplicate work, never undo it. The lock (see "One
+run at a time") is about the wasted hours, not about safety.
 
 **It shares repeated objects.** Users and milestones are interned by their
 exact JSON and referred to. In a 5.6 MB store that is 6,749 references to 176
@@ -255,20 +196,11 @@ down to trace, which is a line per HTTP request:
 2026-08-16 10:12:44 TRACE fetch-gitlab: GET https://gitlab.haskell.org/api/v4/projects/ghc%2Fghc?statistics=true
 ```
 
-Requests are capped at 1.5 per second, so lines should arrive about that often.
-Several seconds of silence means the run has stopped rather than that it is
-working through something large, which is the question the file exists to
-answer. It is appended to rather than truncated, and the access token is sent
-as a header, so it never appears in the logged URLs.
-
-The count is honest: one line per request that is actually made. Each of these
-lines is a request GitLab served, so the file doubles as a record of how much
-was asked of the server.
-
-`-v` puts the same trace lines on the terminal instead.
-
-The executable caps its heap at 1 GB; see "Memory" above for what a run
-actually holds and why that is enough.
+Requests are capped at 1.5 per second, so lines should arrive about that
+often; several seconds of silence means the run has stopped, not that it is
+working through something large. The file is appended to, one line per
+request actually made, and the token is sent as a header so it never appears
+in the logged URLs. `-v` puts the same trace lines on the terminal instead.
 
 ## Forcing a refetch
 

@@ -19,12 +19,10 @@ module FetchGitLab.ClearTimestamp
   ) where
 
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import qualified Data.IntSet as IntSet
-import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Time.Clock (UTCTime)
 import System.Exit (exitFailure)
 
 import GitLab.Types (Issue, MergeRequest)
@@ -34,13 +32,7 @@ import Log.Backend.StandardOutput (withStdOutLogger)
 
 import FetchGitLab.Lock (LockBusy (..), LockInfo (..), lockPath, withStoreLocks)
 import FetchGitLab.Options (ClearOptions (..))
-import FetchGitLab.Store
-  ( Entry (..)
-  , Record (..)
-  , Store
-  , latestUpdate
-  , needsDiscussion
-  )
+import FetchGitLab.Store (Record (..))
 import FetchGitLab.Store.Backend (clearSpec, describeSpec, specPaths, withStore)
 import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..))
 
@@ -51,8 +43,8 @@ runClearTimestamp opts = withStdOutLogger $ \logger -> do
   let runLog :: Logger -> LogT IO a -> IO a
       runLog l = runLogT "fetch-gitlab" l (if clearVerbose opts then LogTrace else LogInfo)
 
-  -- Held for the same reason a fetching run holds it: this rewrites the store,
-  -- and a run writing to it at the same time would undo half of the work.
+  -- We use the lock to avoid duplicating work, hours of it in the worst case for
+  -- a full fetch.
   locked <-
     withStoreLocks (specPaths spec) . withStore spec $ \(SomeStore store) ->
       runLog logger $ do
@@ -78,32 +70,24 @@ clearTimestamps backend = do
   clear "merge requests" (Proxy :: Proxy MergeRequest)
   where
     clear :: forall a m'. (Record a, MonadLog m', MonadIO m') => Text -> Proxy a -> m' ()
-    clear what _ = do
-      -- Only the timestamps are rewritten, so the notes never have to be read;
-      -- 'Kept' writes back as "leave the discussion where it is". A store with
-      -- a project's whole history in it will not fit in memory otherwise.
-      loaded <- liftIO (storeLoadWithoutNotes backend :: IO (Either String (Store a)))
-      case loaded of
-        Left err -> do
-          logAttention_ ("Cannot read " <> what <> ": " <> T.pack err)
-          liftIO exitFailure
-        Right store -> do
-          let cleared = Map.map (\e -> e {entryDiscussionFor = Nothing}) store
-              -- Only the entries that claimed to be current need rewriting.
-              touched = IntSet.fromList [k | (k, e) <- Map.toList store, isJust (entryDiscussionFor e)]
-              wanted = length (filter needsDiscussion (Map.elems cleared))
-          liftIO (storeSave backend cleared touched)
-          logInfo_ $
-            "Cleared the discussion timestamp of "
-              <> tshow (IntSet.size touched)
-              <> " of "
-              <> tshow (Map.size store)
-              <> " "
-              <> what
-              <> "; the next run will fetch "
-              <> tshow wanted
-              <> " discussions"
-          reportWatermark what store
+    clear what proxy = do
+      -- One statement, so the notes are never read and a store with a
+      -- project's whole history in it costs no memory to clear.
+      cleared <- liftIO (storeClearDiscussionStamps backend proxy)
+      held <- liftIO (storeRecordCount backend proxy)
+      wanted <- liftIO (length <$> storeDiscussionPlan backend proxy)
+      logInfo_ $
+        "Cleared the discussion timestamp of "
+          <> tshow cleared
+          <> " of "
+          <> tshow held
+          <> " "
+          <> what
+          <> "; the next run will fetch "
+          <> tshow wanted
+          <> " discussions"
+      newest <- liftIO (storeLatestUpdate backend proxy)
+      reportWatermark what newest
 
 -- | Say what the records themselves will be fetched from, and how to go back
 -- further.
@@ -112,8 +96,8 @@ clearTimestamps backend = do
 -- the newest @updated_at@ it holds, which is a property of the records
 -- themselves rather than a timestamp anything could clear: the only way to ask
 -- for records from earlier is @--since@.
-reportWatermark :: (Record a, MonadLog m) => Text -> Store a -> m ()
-reportWatermark what store = case latestUpdate store of
+reportWatermark :: MonadLog m => Text -> Maybe UTCTime -> m ()
+reportWatermark what newest' = case newest' of
   Nothing ->
     logInfo_ ("No " <> what <> " stored, so the next run fetches all of them")
   Just newest ->

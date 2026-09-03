@@ -4,9 +4,10 @@
 
 -- | Fetching issues and merge requests from a GitLab server.
 --
--- Fetching is incremental: whatever is already in the store is read back in,
--- and only records modified since the newest timestamp we have are requested
--- from GitLab.
+-- Fetching is incremental: the store is asked for the newest @updated_at@ it
+-- holds and only records modified since then are requested, and then for which
+-- discussions it is still missing. A run holds a page of records and the plan
+-- for the notes phase, never the store; what it learns it writes out at once.
 module FetchGitLab.Fetch
   ( run
   , serverConfig
@@ -22,7 +23,7 @@ module FetchGitLab.Fetch
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
-import Control.Monad (forM)
+import Control.Monad (forM, forM_, when)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.ByteString.Lazy as BL
@@ -30,10 +31,9 @@ import Data.Aeson (Value, object)
 import qualified Data.Aeson.Types as Aeson
 import Data.Default (def)
 import qualified Data.IntSet as IntSet
-import Data.List (partition, sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
-import Data.Ord (Down (..))
+import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
@@ -65,6 +65,8 @@ import GitLab.Types
   ( AuthMethod (..)
   , GitLabError (..)
   , GitLabServerConfig (..)
+  , Issue
+  , MergeRequest
   , Note
   , OrderBy (..)
   , Project
@@ -94,18 +96,7 @@ import FetchGitLab.Lock
 import FetchGitLab.Options (Options (..), tokenFile)
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
-import FetchGitLab.Store
-  ( Discussion (..)
-  , Entry (..)
-  , Record (..)
-  , Store
-  , alreadyCurrent
-  , latestUpdate
-  , keepDiscussion
-  , mergeRecords
-  , needsDiscussion
-  , setDiscussion
-  )
+import FetchGitLab.Store (Record (..))
 import FetchGitLab.Store.Backend (optionsSpec, specPaths, withStore)
 import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..))
 import Paths_fetch_gitlab (version)
@@ -165,9 +156,12 @@ serverConfig opts token =
 
 -- | Fetch tickets and merge requests and write them into the store.
 --
--- The store is locked for the duration. A run reads it, merges into what it
--- read and writes the result back, so two runs sharing a store would each drop
--- the other's work; the second one is turned away instead.
+-- The store is locked for the duration, and the lock is about time rather than
+-- correctness: two runs against one store cannot corrupt it — every write
+-- states one thing the run just learned, in its own transaction — but they
+-- would spend hours fetching the same project twice and double the request
+-- rate against the one token that is allowed to make them. The second run is
+-- turned away and told who is in the way; see "FetchGitLab.Lock".
 run :: Options -> IO ()
 run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
   let runLog :: LogT IO a -> IO a
@@ -235,30 +229,27 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
       case optPipelines opts of
         Just mr -> fetchPipelines gitlab store prj mr
         Nothing -> do
-          tickets <- loadStore "tickets" store
-          mrs <- loadStore "merge requests" store
-
-          -- An explicit --since overrides what the stores say.
+          -- An explicit --since overrides where the store says to carry on
+          -- from. Nothing else can move the starting point back.
           override <- liftIO $ traverse resolveNow (optSince opts)
-          let ticketsSince = maybe (fetchSince tickets) Just override
-              mrsSince = maybe (fetchSince mrs) Just override
+          storedTickets <- liftIO $ storeLatestUpdate store (Proxy :: Proxy Issue)
+          storedMrs <- liftIO $ storeLatestUpdate store (Proxy :: Proxy MergeRequest)
+          let ticketsSince = maybe (fetchSince storedTickets) Just override
+              mrsSince = maybe (fetchSince storedMrs) Just override
           logSince "tickets" ticketsSince
           logSince "merge requests" mrsSince
 
-          tickets' <- fetchRecords gitlab "tickets" store tickets ticketsSince $ \since ->
+          fetchRecords gitlab "tickets" store ticketsSince $ \since ->
             projectIssuesPage prj (issueFilters since) recordsPerPage
-          mrs' <- fetchRecords gitlab "merge requests" store mrs mrsSince $ \since ->
+          fetchRecords gitlab "merge requests" store mrsSince $ \since ->
             mergeRequestsWithPage prj (mrFilters since) recordsPerPage
 
           if optNotes opts
             then do
-              _ <-
-                fetchDiscussions gitlab "tickets" store tickets' $
-                  \iid -> issueNotes prj iid Nothing Nothing
-              _ <-
-                fetchDiscussions gitlab "merge requests" store mrs' $
-                  \iid -> mergeRequestNotes prj iid Nothing Nothing
-              pure ()
+              fetchDiscussions gitlab "tickets" store (Proxy :: Proxy Issue) $
+                \iid -> issueNotes prj iid Nothing Nothing
+              fetchDiscussions gitlab "merge requests" store (Proxy :: Proxy MergeRequest) $
+                \iid -> mergeRequestNotes prj iid Nothing Nothing
             else logInfo_ "Skipping discussions (--no-notes)"
 
     terminalLevel
@@ -407,24 +398,30 @@ requestAnnouncer = do
     noData :: Value
     noData = object []
 
--- | How many entries to fetch discussions for between checkpoints.
-checkpointEvery :: Int
-checkpointEvery = 20
+-- | How many discussions to fetch between progress lines.
+progressEvery :: Int
+progressEvery = 20
 
--- | Fetch the discussions of every entry that is missing one or whose record
+-- | Fetch the discussions of every record that is missing one or whose record
 -- has changed since we last looked.
 --
--- An entry whose stored discussion still matches its record is skipped, so the
--- one request per object this costs is never spent twice on the same version of
--- an object. The counts are logged: entries already current, entries never
--- fetched, and entries a change made stale. The last of those is the only one
--- that is ever re-requested, and it should track how much the project actually
--- moved since the previous run.
+-- The store says which those are ('storeDiscussionPlan') rather than a run
+-- working it out from a snapshot it holds: notes are three quarters of a store
+-- and a run needs none of their content, only the iids and the record version
+-- to stamp what it fetches with.
 --
--- Entries are visited newest first, so an interrupted run has the most
--- recently touched discussions. The store is written every
--- 'checkpointEvery' entries, which is what makes stopping safe: whatever was
--- fetched is on disk, and the next run picks up the rest.
+-- A record whose stored discussion still matches it is skipped, so the one
+-- request per object this costs is never spent twice on the same version of an
+-- object. The two counts are logged: records already current, and records to
+-- request. The second should track how much the project moved since the
+-- previous run.
+--
+-- Records are visited newest first (approximately: the store orders on text
+-- that does not quite sort chronologically, see @encodeTime@ in
+-- "FetchGitLab.Store.Sqlite"), and each discussion is written in a
+-- transaction of its own as it arrives. That is what makes stopping safe at
+-- any point, and what makes the stamp meaningful: notes and the version they
+-- were fetched for land together or not at all.
 --
 -- A record whose notes cannot be fetched is logged and left alone, so one bad
 -- object does not abort a long run. It will be retried next time.
@@ -433,16 +430,21 @@ fetchDiscussions ::
   (forall b. GitLab b -> m (Either GitLabError b)) ->
   Text ->
   s ->
-  Store a ->
+  Proxy a ->
   -- | Fetch the notes of one record, given its iid.
   (Int -> GitLab (Either (Response BL.ByteString) [Note])) ->
-  m (Store a)
-fetchDiscussions gitlab what backend store fetch = do
-  if null todo
-    then do
+  m ()
+fetchDiscussions gitlab what backend proxy fetch = do
+  plan <- liftIO (storeDiscussionPlan backend proxy)
+  held <- liftIO (storeRecordCount backend proxy)
+  let total = length plan
+      -- Records we are not asking about again, which is the point of storing
+      -- the discussion stamp at all.
+      cached = held - total
+  if null plan
+    then
       logInfo_ $
         "All " <> tshow cached <> " " <> what <> " discussions are up to date, requesting none"
-      pure store
     else do
       logInfo_ $
         "Discussions for "
@@ -451,13 +453,27 @@ fetchDiscussions gitlab what backend store fetch = do
           <> tshow cached
           <> " already current, requesting "
           <> tshow total
-          <> " ("
-          <> tshow (length missing)
-          <> " never fetched, "
-          <> tshow (length stale)
-          <> " changed since)"
-      (final, pending) <- go store 0 IntSet.empty todo
-      liftIO $ storeSave backend final pending
+      forM_ (zip [1 :: Int ..] plan) $ \(done, (iid, stamp)) -> do
+        result <- gitlab (orChallenge (fetch iid))
+        case result of
+          Left err ->
+            logAttention_ $ "Skipping notes for " <> what <> " " <> tshow iid <> ": " <> tshow err
+          Right (Left response) ->
+            logAttention_ $
+              "Skipping notes for "
+                <> what
+                <> " "
+                <> tshow iid
+                <> ": HTTP "
+                <> tshow (statusCode (responseStatus response))
+          Right (Right notes) -> do
+            logTrace_ $ tshow (length notes) <> " notes for " <> what <> " " <> tshow iid
+            -- The stamp the plan gave, not the record as it stands now: see
+            -- 'FetchGitLab.Store.Class.storeWriteDiscussion'.
+            liftIO $ storeWriteDiscussion backend proxy iid stamp notes
+        when (done `mod` progressEvery == 0 && done /= total) $
+          logInfo_ $
+            "Discussions: " <> tshow done <> "/" <> tshow total <> " " <> what
       logInfo_ $
         "Discussions for "
           <> tshow total
@@ -465,59 +481,6 @@ fetchDiscussions gitlab what backend store fetch = do
           <> what
           <> " written to "
           <> storeLocation backend
-      pure final
-  where
-    -- Newest first, and entries GitLab gave no timestamp for last.
-    todo = sortOn (Down . recordUpdatedAt . entryRecord) (filter needsDiscussion (Map.elems store))
-    total = length todo
-    -- Entries we are not asking about again, which is the point of storing
-    -- 'entryDiscussionFor' at all.
-    cached = Map.size store - total
-    (missing, stale) = partition (neverFetched . entryDiscussion) todo
-    neverFetched NeverFetched = True
-    neverFetched _ = False
-
-    -- The third argument is the entries touched since the last checkpoint. A
-    -- backend that can write just those is handed them; one that cannot is
-    -- none the worse off.
-    go acc _ pending [] = pure (acc, pending)
-    go acc done pending (e : es) = do
-      let iid = recordKey (entryRecord e)
-      result <- gitlab (orChallenge (fetch iid))
-      (acc', pending') <- case result of
-        Left err -> do
-          logAttention_ $ "Skipping notes for " <> what <> " " <> tshow iid <> ": " <> tshow err
-          pure (acc, pending)
-        Right (Left response) -> do
-          logAttention_ $
-            "Skipping notes for "
-              <> what
-              <> " "
-              <> tshow iid
-              <> ": HTTP "
-              <> tshow (statusCode (responseStatus response))
-          pure (acc, pending)
-        Right (Right notes) -> do
-          logTrace_ $ tshow (length notes) <> " notes for " <> what <> " " <> tshow iid
-          pure (Map.adjust (setDiscussion notes) iid acc, IntSet.insert iid pending)
-      let done' = done + 1
-      if done' `mod` checkpointEvery == 0 && not (null es)
-        then do
-          liftIO $ storeSave backend acc' pending'
-          logInfo_ $
-            "Discussions: " <> tshow done' <> "/" <> tshow total <> " " <> what <> " (checkpointed)"
-          -- Written, so the notes are the store's problem now rather than
-          -- ours. Holding them for the rest of the run would make a run's
-          -- memory grow with the size of the project's whole history; this
-          -- keeps it flat.
-          go (forgetWritten pending' acc') done' IntSet.empty es
-        else go acc' done' pending' es
-
--- | Drop the note bodies of the entries a checkpoint has just written.
---
--- Only sound because the store was told to write exactly these keys and did.
-forgetWritten :: IntSet.IntSet -> Store a -> Store a
-forgetWritten written store = IntSet.foldl' (flip (Map.adjust keepDiscussion)) store written
 
 -- | Fetch the pipelines of one merge request, and the jobs of each.
 --
@@ -593,16 +556,6 @@ abort msg = do
   logAttention_ msg
   liftIO exitFailure
 
--- | Read a store, aborting if what is there cannot be parsed.
-loadStore :: (Record a, StoreBackend s, MonadLog m, MonadIO m) => Text -> s -> m (Store a)
-loadStore what backend = do
-  result <- liftIO $ storeLoadWithoutNotes backend
-  case result of
-    Left err -> abort ("Cannot read existing " <> what <> ": " <> T.pack err)
-    Right store -> do
-      logInfo_ $ "Read " <> tshow (length store) <> " " <> what <> " from the store"
-      pure store
-
 -- | Fetch a collection a page at a time, writing each page to the store before
 -- asking for the next one.
 --
@@ -629,31 +582,35 @@ loadStore what backend = do
 -- A large count means the timestamp we asked from was further back than it
 -- needed to be.
 fetchRecords ::
+  forall a s m.
   (Record a, StoreBackend s, MonadLog m, MonadIO m) =>
   (forall b. GitLab b -> m (Either GitLabError b)) ->
   Text ->
   s ->
-  Store a ->
   -- | Where to start, or 'Nothing' to fetch the whole collection.
   Maybe UTCTime ->
   -- | One page of records updated at or after the given time, oldest first.
   (Maybe UTCTime -> GitLab [a]) ->
-  m (Store a)
-fetchRecords gitlab what backend original start page = go original start IntSet.empty 0
+  m ()
+fetchRecords gitlab what backend start page = go start IntSet.empty 0
   where
-    go acc anchor seen cached = do
+    proxy = Proxy :: Proxy a
+
+    go anchor seen cached = do
       result <- gitlab (page (addUTCTime (-overlap) <$> anchor))
       records <- either (\err -> abort ("GitLab request failed: " <> tshow err)) pure result
-      let touched = IntSet.fromList (map recordKey records)
-          fresh = filter (not . (`IntSet.member` seen) . recordKey) records
-          seen' = IntSet.union seen touched
-          cached' = cached + alreadyCurrent original fresh
-          acc' = mergeRecords acc records
+      let fresh = filter (not . (`IntSet.member` seen) . recordKey) records
+          seen' = IntSet.union seen (IntSet.fromList (map recordKey records))
           newest = maximumOf (mapMaybe recordUpdatedAt records)
-      liftIO $ storeSave backend acc' touched
+      -- Asked before the page is written, since writing it is what makes the
+      -- answer "current".
+      stored <- liftIO $ storeRecordVersions backend proxy (map recordKey fresh)
+      let cached' = cached + length (filter (unchanged stored) fresh)
+      liftIO $ storeWriteRecords backend records
       if length records < recordsPerPage
         then do
           let fetched = IntSet.size seen'
+          held <- liftIO (storeRecordCount backend proxy)
           logInfo_ $
             "Fetched "
               <> tshow fetched
@@ -664,8 +621,7 @@ fetchRecords gitlab what backend original start page = go original start IntSet.
               <> " new or changed, "
               <> tshow cached'
               <> " already current), store now holds "
-              <> tshow (length acc')
-          pure acc'
+              <> tshow held
         else do
           logInfo_ $
             "Fetching "
@@ -675,7 +631,7 @@ fetchRecords gitlab what backend original start page = go original start IntSet.
               <> " so far, written up to "
               <> maybe "an unknown time" tshow newest
           case newest of
-            Just t | maybe True (t >) anchor -> go acc' (Just t) seen' cached'
+            Just t | maybe True (t >) anchor -> go (Just t) seen' cached'
             -- A whole page of records sharing one instant, so there is no
             -- later time to ask from. Stepping past it is the only way on;
             -- anything it skips has an older timestamp than the store's
@@ -688,7 +644,7 @@ fetchRecords gitlab what backend original start page = go original start IntSet.
                     <> " is stamped "
                     <> tshow t
                     <> "; stepping past it, some may be left for the next run"
-                go acc' (Just (addUTCTime (overlap + tick) t)) seen' cached'
+                go (Just (addUTCTime (overlap + tick) t)) seen' cached'
               Nothing -> do
                 logAttention_ $
                   "GitLab gave no update time for any of the first "
@@ -696,7 +652,11 @@ fetchRecords gitlab what backend original start page = go original start IntSet.
                     <> " "
                     <> what
                     <> ", so there is nothing to page on; stopping here"
-                pure acc'
+
+    -- The store already had this record at exactly this version, which is
+    -- the condition under which writing it changes nothing and its discussion
+    -- stays current. This is what the run fetched for nothing.
+    unchanged stored r = Map.lookup (recordKey r) stored == Just (recordUpdatedAt r)
 
     -- GitLab reads @updated_after@ as "at or after", so asking from exactly
     -- the newest record we hold returns that record again, which is harmless.
@@ -710,12 +670,14 @@ fetchRecords gitlab what backend original start page = go original start IntSet.
 
 -- | Timestamp to request updates from, or 'Nothing' to fetch everything.
 --
--- We go back a second from the newest timestamp we have, so that a record
--- modified in the same instant as our newest one cannot fall through an
+-- We go back a second from the newest timestamp the store holds, so that a
+-- record modified in the same instant as our newest one cannot fall through an
 -- exclusive @updated_after@ comparison. Re-fetching a record we already have is
--- harmless, it just replaces itself.
-fetchSince :: Record a => Store a -> Maybe UTCTime
-fetchSince = fmap (addUTCTime (-1)) . latestUpdate
+-- harmless, it just replaces itself. The second also covers the store's answer
+-- being under a second out: it is a @MAX@ over text that does not sort
+-- chronologically; see @encodeTime@ in "FetchGitLab.Store.Sqlite".
+fetchSince :: Maybe UTCTime -> Maybe UTCTime
+fetchSince = fmap (addUTCTime (-1))
 
 -- | Resolve a @--since@ argument against the current time.
 resolveNow :: Since -> IO UTCTime

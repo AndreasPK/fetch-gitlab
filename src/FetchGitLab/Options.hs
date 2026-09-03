@@ -31,8 +31,8 @@ import FetchGitLab.Since (Since, parseSince)
 -- 'FetchGitLab.Store.Class.StoreBackend' instance rather than of threading a
 -- choice back through everything that names a store.
 data Backend
-  = -- | A single SQLite database. Shares repeated objects and writes only what
-    -- changed at each checkpoint.
+  = -- | A single SQLite database. Sharable substructure in MRs/Tickets are
+    -- shared as independent tables.
     SqliteBackend
   deriving (Eq, Show)
 
@@ -216,8 +216,7 @@ backendOption =
         <> showDefaultWith (T.unpack . backendName)
         <> help
           ( "Which store format. \"sqlite\", the only one, is a single database "
-              <> "sharing repeated objects and writing only what changed at each "
-              <> "checkpoint"
+              <> "sharing repeated objects and writing only what the run just fetched"
           )
     )
 
