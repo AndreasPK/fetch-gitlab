@@ -7,7 +7,8 @@ module Main (main) where
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
-import Data.Aeson (FromJSON, Value, eitherDecode, encode, object, toJSON, (.=))
+import Data.Aeson (FromJSON, Result (..), Value (..), eitherDecode, encode, fromJSON, object, toJSON, (.=))
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
 import Data.List (isInfixOf, nub, sort, sortOn)
 import Data.Maybe (isJust)
@@ -32,7 +33,7 @@ import Test.Tasty.HUnit
 import Network.HTTP.Client (HttpException, Response, httpLbs, parseRequest)
 import Network.HTTP.Types.Status (mkStatus, status200, status503)
 
-import GitLab.Types (GitLabError (..), Issue (..), MergeRequest (..), Note (..))
+import GitLab.Types (GitLabError (..), Issue (..), MergeRequest (..), Note (..), User (..))
 import GitLab (unexpectedStatus)
 
 import Log (LogLevel (..), LogT, mkLogger, runLogT)
@@ -134,6 +135,7 @@ tests =
         , testCase "an absent field is not invented" splitKeepsAbsence
         , testCase "a store at the old schema loses has_discussion" oldStoreLosesHasDiscussion
         , testCase "ref names the row in GitLab notation" refNamesTheRow
+        , testCase "the views answer the common questions" viewsAnswerCommonQuestions
         , testCase "--backend is parsed" backendFlagParses
         ]
     , testGroup
@@ -579,6 +581,13 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
     pure n
   assertEqual "the notes_id index was dropped" [] gone
 
+  views <- do
+    raw' <- SQL.open path
+    n <- SQL.query_ raw' "SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name LIKE 'view\\_%' ESCAPE '\\'" :: IO [SQL.Only Int]
+    SQL.close raw'
+    pure n
+  assertEqual "patch 4 added the seven views" [SQL.Only 7] views
+
 -- | @ref@ is the row's own name in GitLab notation, on records and on notes,
 -- and a query by it is indexed: what schema patch 3 promises a reader.
 refNamesTheRow :: Assertion
@@ -610,6 +619,96 @@ refNamesTheRow = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
   gone <- SQL.query_ raw "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'notes_id'" :: IO [SQL.Only T.Text]
   assertEqual "a fresh store never gets the notes_id index" [] gone
   SQL.close raw
+
+-- | Schema patch 4: the views give an agent at a @sqlite3@ prompt the list,
+-- the thread, the notes, the links and the people without the joins. What
+-- each promises is checked on a fixture record with a hand-made discussion
+-- covering every note shape the views tell apart.
+viewsAnswerCommonQuestions :: Assertion
+viewsAnswerCommonQuestions = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  issues <- decodeFixture "test/data/issues.jsonl" :: IO [Issue]
+  mrs <- decodeFixture "test/data/mrs.jsonl" :: IO [MergeRequest]
+  fixtureNotes <- decodeFixture "test/data/notes.jsonl" :: IO [Note]
+  issue <- firstOf issues
+  mr <- firstOf mrs
+  human <- firstOf fixtureNotes
+  let path = dir </> "gitlab.db"
+      ticketRef = T.pack ('#' : show (issue_iid issue))
+      note sys body = withNote human [("system", Bool sys), ("body", String body)]
+      -- Newest first, as GitLab lists them and the store keeps them.
+      notes =
+        [ note True "mentioned in merge request !16452"
+        , note False "<!-- {\"blocked_by\": []} -->"
+        , note False "two lines\nof text"
+        , note True "marked this issue as related to #99"
+        , note True "marked #77 as a duplicate of this issue"
+        , note True "mentioned in issue haskell/ghcup-hs#391"
+        , note True "set status to **To do**"
+        , note True "mentioned in commit abc123"
+        ]
+  withSqliteStore path $ \db -> do
+    storeWriteRecords db [issue]
+    storeWriteRecords db [mr]
+    storeWriteDiscussion db issueProxy (issue_iid issue) (fmap encodeTime (issue_updated_at issue)) notes
+
+  raw <- SQL.open path
+  tickets <- SQL.query_ raw "SELECT ref, author, notes_stale FROM view_tickets" :: IO [(T.Text, T.Text, Int)]
+  assertEqual
+    "one ticket, its author by username, notes current"
+    [(ticketRef, maybe "" user_username (issue_author issue), 0)]
+    tickets
+  mrRows <- SQL.query_ raw "SELECT ref, author, source_branch, notes_stale FROM view_mrs" :: IO [(T.Text, T.Text, T.Text, Int)]
+  assertEqual
+    "one merge request with its branch, notes never fetched"
+    [(T.pack ('!' : show (merge_request_iid mr)), user_username (merge_request_author mr), merge_request_source_branch mr, 1)]
+    mrRows
+
+  thread <- SQL.query raw "SELECT seq, system, text FROM view_ticket WHERE ref = ? ORDER BY seq" (SQL.Only ticketRef) :: IO [(Int, Int, T.Text)]
+  assertEqual "a header row and one per note, seq counting up" [0 .. length notes] (map (\(s, _, _) -> s) thread)
+  (header, oldestSystem, oldest, prose) <- case thread of
+    (_, _, h) : (_, s1, o) : rest | (_, _, p) : _ <- drop 4 rest -> pure (h, s1, o, p)
+    _ -> assertFailure ("thread too short: " <> show (length thread))
+  assertBool ("the header names the record: " <> T.unpack header) (("# " <> ticketRef <> " " <> issue_title issue <> "\n") `T.isPrefixOf` header)
+  assertBool "the header carries the state" (("\nstate: " <> issue_state issue) `T.isInfixOf` header)
+  assertEqual "seq 1 is the oldest note" 1 oldestSystem
+  assertBool ("a note renders as heading, blank line, body: " <> T.unpack oldest)
+    ("### 1 · " `T.isPrefixOf` oldest && " · system\n\nmentioned in commit abc123\n" `T.isSuffixOf` oldest)
+  assertBool ("a body keeps its newlines: " <> T.unpack prose) ("\n\ntwo lines\nof text\n" `T.isSuffixOf` prose)
+  humanOnly <- SQL.query raw "SELECT count(*) FROM view_ticket WHERE ref = ? AND NOT system" (SQL.Only ticketRef) :: IO [SQL.Only Int]
+  assertEqual "NOT system keeps the header and the two human notes" [SQL.Only 3] humanOnly
+
+  imports <- SQL.query raw "SELECT position, len FROM view_notes WHERE ref = ? AND is_import" (SQL.Only ticketRef) :: IO [(Int, Int)]
+  assertEqual "only the Trac comment is an import, with its length" [(1, T.length "<!-- {\"blocked_by\": []} -->")] imports
+
+  links <-
+    SQL.query
+      raw
+      "SELECT rel, target_kind, target_project, target, target_ref FROM view_links WHERE ref = ? ORDER BY rel, target_kind, target"
+      (SQL.Only ticketRef) ::
+      IO [(T.Text, T.Text, T.Text, T.Text, Maybe T.Text)]
+  assertEqual
+    "every cross-reference form is split into kind, project, target and a joinable ref"
+    [ ("duplicated_by", "ticket", "", "77", Just "#77")
+    , ("mentioned_in", "commit", "", "abc123", Nothing)
+    , ("mentioned_in", "mr", "", "16452", Just "!16452")
+    , ("mentioned_in", "ticket", "haskell/ghcup-hs", "391", Nothing)
+    , ("related_to", "ticket", "", "99", Just "#99")
+    ]
+    links
+
+  people <- SQL.query_ raw "SELECT count(*) FROM view_people" :: IO [SQL.Only Int]
+  distinctUsers <- SQL.query_ raw "SELECT count(DISTINCT username) FROM users" :: IO [SQL.Only Int]
+  assertEqual "one row per username" distinctUsers people
+  SQL.close raw
+
+-- | A fixture note with some of its fields replaced, so one real note can
+-- stand in for every shape a view tells apart.
+withNote :: Note -> [(KM.Key, Value)] -> Note
+withNote n fields = case toJSON n of
+  Object o -> case fromJSON (Object (foldr (uncurry KM.insert) o fields)) of
+    Success n' -> n'
+    Error e -> error ("withNote: " <> e)
+  _ -> error "withNote: a note is not a JSON object"
 
 -- | The @records@ table as the version before the patch created it: the same
 -- statement with @has_discussion@ still in it. The generated columns are kept

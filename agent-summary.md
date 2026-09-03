@@ -59,6 +59,17 @@ from it, so nothing in the database can disagree with the JSON it holds.
 belongs to), indexed, so `WHERE ref = '#123'` is the cheap way to name one.
 Pipelines and jobs, when fetched, land in tables of their own.
 
+Seven views spare a reader the joins: `view_tickets` and `view_mrs` (one row
+per record with author, assignees, labels, milestone and `notes_stale`),
+`view_ticket` and `view_mr` (one record as a thread, a header row then its
+notes oldest first, each row's `text` rendered as Markdown, so
+`SELECT text FROM view_ticket WHERE ref = '#123' ORDER BY seq` prints a
+transcript), `view_notes` (every note with its author, `system`, `is_import`
+for the Trac migration's, and `len`), `view_links` (the cross-references
+GitLab records as system notes, split into `rel`, `target_kind` and a
+joinable `target_ref`) and `view_people`. `Store.Schema.Views` defines them;
+the `ghc-gitlab` skill is written around them.
+
 ## How a run proceeds
 
 1. Take an exclusive lock on the store, creating its directory if it does

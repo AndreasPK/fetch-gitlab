@@ -245,3 +245,35 @@ index search, a 586-note thread counted by ref in 3 ms.
 Pinned by "ref names the row in GitLab notation" (fresh store) and the
 patch-2-store assertions in "a store at the old schema loses
 has_discussion" (migration path, where `ANALYZE` has rows to see).
+
+## 2026-09-03T13:15+00:00 — decision: how do agents query the store?
+
+**Decision.** Schema patch 4 adds seven views (`view_tickets`, `view_mrs`,
+`view_ticket`, `view_mr`, `view_notes`, `view_links`, `view_people`) and the
+`ghc-gitlab` skill is rewritten around them, with detailed recipes in an
+on-demand `queries.sql`. The thread views render each row's `text` in SQL
+(heading line, blank line, body); the column is named `text`, not `body`,
+and the raw body stays in `view_notes`. No `md` column beside a raw body:
+`SELECT *` would then return every note twice.
+
+**Reason.** 415 store queries from the local session logs and a week of
+remote use (`tmp/jq-usage.md`): agents read sqlite3's default output raw
+in 90–95 % of calls, never pipe into `jq`, use `-json` in 15 calls (9 read
+raw), push shaping into SQL (`substr` in a fifth of queries), and leave SQL
+only for search-with-snippet and per-record fan-out. The recurring
+hand-written pieces were the record header (6×), the note-author join
+(15+×), snippet extraction (3×) and thread rendering in Python. Output
+shape measured on a 586-note thread: default 238 KB, `-json` 258 KB,
+`-markdown` 38.7 MB, `-box` 49 MB (padding of multi-line bodies), so the
+rendered column is what makes plain output usable for threads.
+
+Verified on a copy of the real store: full migration from an unpatched
+store (patches 1–4) 2.7 s including `--clear-timestamp`; thread of !15899
+(586 notes) 7 ms; `view_tickets` by ref, author and state each use an
+index; `view_links WHERE target_ref = …` scans the system notes, 2 s, the
+known cost that would justify a materialised links table later. 58/58
+tests.
+
+Files: `src/FetchGitLab/Store/Schema/Views.hs` (new),
+`src/FetchGitLab/Store/Schema.hs`, `fetch-gitlab.cabal`, `test/Main.hs`,
+`agent-summary.md`, `.ai/summary/Schema.md`. Plan: `tmp/skill-view-plan.md`.

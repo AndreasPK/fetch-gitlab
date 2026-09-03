@@ -28,6 +28,7 @@ library
                       FetchGitLab.Store.Schema
                       FetchGitLab.Store.Schema.Pipeline
                       FetchGitLab.Store.Schema.Types
+                      FetchGitLab.Store.Schema.Views
                       FetchGitLab.Store.Sqlite
                       FetchGitLab.Fetch
     -- For the version in the User-Agent header.

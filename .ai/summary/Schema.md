@@ -24,6 +24,14 @@
   is the first. Without statistics the planner prefers the `kind` prefix of
   a primary key over any index, however selective. `ANALYZE` sees nothing in
   a fresh (empty) store, so `closeSqliteStore` also runs `PRAGMA optimize`.
+- Patch 4 (`viewStatements`, `Store.Schema.Views`) adds the seven `view_*`
+  views. They stand on the `ref` indexes and on the statistics from patch 3:
+  the kind filters inside them are plain `kind = '…'`, which without
+  `sqlite_stat1` sends the planner down the `kind` prefix of `note_users`
+  for every query shape. A view is frozen in the store: changing one is a
+  later patch of `DROP VIEW IF EXISTS` + `CREATE VIEW`. Views never go in
+  the base schema, since SQLite resolves a view's columns at create time and
+  the base statements run before the patches that add columns.
 - `migrate` runs the unapplied patches and writes the count last, in one
   `BEGIN IMMEDIATE` transaction. A store counted higher than the binary
   knows is left alone; lowering the count would repeat a non-repeatable

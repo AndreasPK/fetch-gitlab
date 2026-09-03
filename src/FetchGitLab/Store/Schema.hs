@@ -60,6 +60,7 @@ module FetchGitLab.Store.Schema
 import Data.Text (Text)
 
 import FetchGitLab.Store.Schema.Pipeline (pipelineSchemaStatements)
+import FetchGitLab.Store.Schema.Views (viewStatements)
 import FetchGitLab.Store.Schema.Types
 
 -- | Bumped when the schema changes in ways that would break older executables.
@@ -103,6 +104,11 @@ data SchemaPatch = SchemaPatch
 --   @notes@, and drop the @notes_id@ index ('refStatements'). Unguarded:
 --   @ADD COLUMN@ cannot be repeated, but the column is not in the base
 --   schema, so every store runs this exactly once.
+-- * 4. The views for querying by hand ('viewStatements' in
+--   "FetchGitLab.Store.Schema.Views"). @IF NOT EXISTS@, so repeatable. A
+--   view is frozen in the store: changing one is a later patch that drops
+--   and recreates it, and a column a view mentions cannot be dropped until
+--   the view is.
 --
 -- A patch that adds an index ends with @ANALYZE@. Without planner statistics
 -- SQLite rates an equality on the leading primary key column as cheap and
@@ -121,6 +127,7 @@ schemaPatches =
       ["ALTER TABLE records DROP COLUMN has_discussion"]
       (Just "SELECT 1 FROM pragma_table_info('records') WHERE name = 'has_discussion'")
   , SchemaPatch refStatements Nothing
+  , SchemaPatch viewStatements Nothing
   ]
 
 -- | A row's own name in GitLab notation: @#123@ for a ticket, @!123@ for a
