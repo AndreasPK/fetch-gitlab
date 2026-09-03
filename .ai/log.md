@@ -50,3 +50,48 @@ refused with "store was written by schema version 2, this is version 1".
 `.ai/` is committed except `scratch/` and `tmp/` (both in `.gitignore`).
 Topic files live under `summary/`; `Schema.md` moved there with `git mv`.
 Decisions are recorded in this file rather than in an external store.
+
+## 2026-09-03T11:00+00:00 — implementation detail moved out of agent-summary.md
+
+`agent-summary.md` had grown into the implementation summary: function
+names, the `Kept` discussion case, the `managerWrapException` hook, the
+lock's GHC subtleties, the vendored patches. That text now lives in topic
+files under `summary/` — `fetch.md`, `network.md`, `store.md`, `lock.md`,
+`vendored-gitlab-haskell.md`, `modules.md` — and `agent-summary.md` keeps
+only what an agent running or querying the binary needs. The empty
+`summary/implementation.md` placeholder is gone.
+
+One stale claim was corrected in the move: "files are written to
+`<file>.tmp` and renamed into place" described the JSON lines backend. The
+SQLite backend writes in place inside a transaction; the lock still sits
+beside the store so a renaming backend would be safe, and the lock test
+simulates one.
+
+## 2026-09-03T11:30+00:00 — decision: changed-key checkpoints (recorded retrospectively)
+
+**Decision.** `storeSave` takes the set of changed keys and a backend
+writes only those. Made when SQLite replaced the JSON lines backend.
+
+**Reason.** A checkpoint of 20 objects costs 33 → 71 ms as a store grows
+from 2 to 88 MB with upserts; rewriting the store went 21 → 749 ms over the
+same range, which at a checkpoint every ten seconds would not scale to
+`ghc/ghc`.
+
+Files: `src/FetchGitLab/Store/Class.hs`, `src/FetchGitLab/Store/Sqlite.hs`.
+
+## 2026-09-03T11:30+00:00 — notes out of memory (recorded retrospectively)
+
+Loading a 17,052 record store with 229k notes for a fetch: 301 MB live and
+813 MiB peak heap holding the notes, 155 MB and 340 MiB without
+(`storeLoadWithoutNotes` plus `forgetWritten` after each checkpoint).
+Projected to `ghc/ghc`'s ~42.8k records: ~2 GB against ~850 MiB, the
+difference between overflowing the 1 GB cap and fitting under it.
+
+## 2026-09-03T11:30+00:00 — topic files cut to maps
+
+The six topic files written this morning were the moved prose of
+`agent-summary.md` and repeated the haddocks. `AGENTS.md` now defines a
+topic file as a map — locations, cross-module invariants, traps, live
+constraints — with three tests per sentence and a one screen target; the
+files were cut to that. Rationale stays in the code comments where it was
+found to already live, or in this log.

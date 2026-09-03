@@ -2,13 +2,17 @@
 
 Dumps a GitLab project's issues and merge requests, with their discussions,
 into a SQLite database. Incremental: a second run fetches only what changed.
+This file is for agents *using* the binary; how it is built is under
+`.ai/` (start at `.ai/AGENTS.md`).
 
 ## Command line
 
 ```
 fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE] [--since WHEN]
-             [--notes | --no-notes | --pipelines <mr> ] [-v|--verbose]
+             [--notes | --no-notes | --pipelines <mr>] [-v|--verbose] [--log FILE]
+
+fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
 ```
 
 | Flag | Default | Meaning |
@@ -21,23 +25,21 @@ fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
 | `--since` | — | Override the incremental timestamp |
 | `--notes` / `--no-notes` | `--notes` | Whether to fetch discussions |
 | `--pipelines MR` | — | Fetch one merge request's pipelines and jobs instead of records |
-| `-v`, `--verbose` | off | Log at trace level |
+| `--log FILE` | — | Append a trace level log, one line per request, to FILE |
+| `--clear-timestamp` | — | Mark every stored discussion stale so the next run refetches it |
+| `-v`, `--verbose` | off | Log at trace level on the terminal |
 
 `--since` accepts a date (`2026-08-01`), an ISO 8601 timestamp
 (`2026-08-01T12:00:00Z`), or a relative time (`2 days`, `1 week`,
 `6 months ago`, `3d`). Units run from seconds to years; months and years use
 calendar arithmetic.
 
-`--clear-timestamp` and fetching share one option grammar rather than being
-parser alternatives: alternatives that share options (`--db`, `-v`) parse
-order-sensitively, because optparse-applicative only backtracks out of a
-branch that has consumed nothing. The price is that `--clear-timestamp`
-accepts and ignores the fetch-only flags.
+`--clear-timestamp` accepts the fetch-only flags and ignores them.
 
 ## What a store holds
 
-One `Entry` per record. Issues and merge requests share the tables and are told
-apart by `recordKind`, `ticket` versus `mr`:
+One row per record in `records`. Issues and merge requests share the tables
+and are told apart by `kind`, `ticket` versus `mr`:
 
 - the record — the GitLab object as `gitlab-haskell` models it. Fields the
   library does not model are dropped.
@@ -48,245 +50,70 @@ apart by `recordKind`, `ticket` versus `mr`:
   an interrupted notes run resumable.
 
 The key is the `iid`: re-fetching a record replaces the old copy and keeps
-whatever discussion it had.
+whatever discussion it had. Repeated objects — users, milestones, labels —
+are interned in their own tables and referenced; the rest of each object is
+kept verbatim, with the queryable columns (`title`, `state`, ...) generated
+from it, so nothing in the database can disagree with the JSON it holds.
+Pipelines and jobs, when fetched, land in tables of their own.
 
 ## How a run proceeds
 
-1. Resolve the store path, creating its directory if it does not exist, then
-   take an exclusive lock on the store. A store already locked by another run
-   aborts this one before anything else happens, including reading the token.
-   Then read it; a store that fails to parse aborts the run rather than being
-   overwritten.
-2. Read the token. A missing, unreadable or empty file is logged and the run
-   stops; `readToken` returns `Either Text Text` rather than throwing.
+1. Take an exclusive lock on the store, creating its directory if it does
+   not exist. A store already locked by another run aborts this one before
+   anything else happens, including reading the token. A store that fails to
+   open aborts the run rather than being overwritten.
+2. Read the token. A missing, unreadable or empty file is reported and the run
+   stops.
 3. Work out a starting timestamp per record kind: `--since` if given,
-   otherwise one second before the newest `updated_at` stored for it (the
-   second guards against an exclusive comparison), otherwise nothing, meaning
-   fetch everything.
-4. Look up the project through `runGitLabWithManager`, the one call that
-   checks the token, so the thousands that follow need not each pay a
-   `/version` request to re-establish it.
-5. Fetch records a page at a time, oldest change first, writing each page
-   before asking for the next. See "Fetching in batches" below.
+   otherwise one second before the newest `updated_at` stored for it,
+   otherwise nothing, meaning fetch everything.
+4. Check the token against the server once.
+5. Fetch records a page of 100 at a time, oldest change first, writing each
+   page before asking for the next. Stopping halfway is safe: the next run
+   asks for exactly what is missing.
 6. Unless `--no-notes`, fetch discussions for every entry that has none or
    whose record changed. Entries are visited newest first, and the store is
    written every 20 entries.
 
-Files are written to `<file>.tmp` and renamed into place. An object whose notes
-cannot be fetched is logged and skipped rather than aborting the run; the next
-run retries it.
-
-## Fetching in batches
-
-`fetchRecords` asks for one page, merges it, writes it, and only then asks for
-the next. A page is `recordsPerPage` = 100, GitLab's maximum, and one request:
-writing more often would report nothing sooner and cost more requests to fetch
-the same collection. The alternative, one library call that pages internally,
-meant minutes with nothing logged and nothing saved — indistinguishable from a
-wedged run, and all of it lost if stopped.
-
-Pages are anchored on `updated_at` rather than numbered: each request asks for
-records updated at or after the newest one held, sorted ascending. That is what
-makes stopping halfway safe, and it is not a free choice.
-
-- Numbered pages in the default order return the newest records first, so a
-  half-finished run leaves a watermark past everything it had not fetched, and
-  no later run asks for those records again. That is the same permanent silent
-  loss the vendored `gitlabHTTPMany` patch exists to prevent, arrived at from
-  the other direction.
-- Numbered pages sorted by `updated_at` ascending fix the watermark but not the
-  paging: a record edited while we page moves to the end of the collection and
-  shifts a neighbour out of the numbering, unseen.
-
-Anchoring on the timestamp has neither problem, since a record can only move
-forward past an anchor we have already passed, and costs the same number of
-requests. `updated_after` is inclusive, so each page repeats the record it was
-anchored on; the anchor is rewound a further millisecond in case a server reads
-it as exclusive, and the repeats are deduplicated by `iid` against the set seen
-this run. A full page all stamped with one instant would leave nothing later to
-anchor on; that steps past and logs at attention, and the records it skips are
-older than the store's watermark so the next run collects them.
-
-## What a run keeps in memory
-
-`storeLoadWithoutNotes` is what keeps a run's memory proportional to a
-project's record count rather than to its entire history of discussion. Notes
-are three quarters of a store and a fetch needs none of their content: it
-decides what to ask for from `entryDiscussionFor` against the record's
-`updated_at`, and writes what it fetches straight out.
-
-`Discussion` has three cases rather than `Maybe [Note]`. `Kept` means "there is
-a discussion in the store and it was deliberately not read in", which is the
-case that makes this safe: `writeEntry` skips the note delete-and-reinsert for
-a `Kept` entry, so an entry whose record changed can be written back without
-taking absent notes literally and deleting the discussion. `discussionNotes`
-deliberately maps `Kept` to `Nothing` rather than to `[]`, since "not here" and
-"there are none" differ by exactly one silently deleted discussion. There is a
-test for this that fails loudly if the guard is removed.
-
-The discussion loop applies `forgetWritten` after every checkpoint, dropping
-the notes of the entries the store was just told to write. Without it a run
-re-accumulates the whole thing in memory as it goes, which is the same ceiling
-by a different route.
-
-Measured on a 17,052 record store with 229k notes, loading it for a fetch: 301
-MB live and 813 MiB peak heap before, 155 MB and 340 MiB after. Projected to
-`ghc/ghc`'s full history (~42.8k records) that is ~2 GB against ~850 MiB, which
-is the difference between overflowing the 1 GB cap and fitting under it.
-
-## Anti-bot challenges
-
-`waitOutChallenge` wraps both GitLab runners, so every request a run makes is
-covered without the record loop or the discussion loop knowing what a challenge
-is. It retries on `GitLabChallengeError` and nothing else, on the ladder in
-`challengeWaits` — 30s, 60s, 2m, 5m, 10m, 10m, a little under half an hour
-against a run that takes eight.
-
-The constructor comes from the vendored library rather than a substring match
-on the message, because a challenge is transient where every other `GitLabError`
-is not.
-
-Exhausting the ladder aborts the run instead of returning the error. Returning
-it would leave the caller to skip and carry on, spending the whole ladder again
-on the next record and the one after; aborting costs nothing, since progress is
-already checkpointed. Everything else is returned on the first attempt, so a bad
-token still fails immediately.
-
-The case that forced this: a challenge on the startup token check killed a run
-outright, having fetched nothing, because until then the only thing that could
-fail there was a genuinely bad token. Testing found it by starting a run 20
-seconds after a previous run's last refusal.
+Every write is a transaction, so an interrupted run leaves the store as of its
+last checkpoint. An object whose notes cannot be fetched is logged and skipped
+rather than aborting the run; the next run retries it.
 
 ## Not asking twice
 
-`entryDiscussionFor` is what keeps the expensive half of a run proportional to
-what changed: an entry is only re-requested once the record's `updated_at`
-moves past it, so a run over an unchanged project issues no note requests at
-all. The counts are logged on both sides of that decision — entries already
-current, never fetched, and stale — so a run that starts re-fetching everything
-says so rather than merely taking six hours.
+A discussion is only re-requested once the record's `updated_at` moves past
+the stored `discussion_updated_at`, so a run over an unchanged project issues
+no note requests at all. The counts are logged on both sides of that decision
+— entries already current, never fetched, and stale — so a run that starts
+re-fetching everything says so rather than merely taking six hours.
 
-Records are a different matter. `fetchSince` asks from a second before our
-newest, so the records in that second always come back; `alreadyCurrent` counts
-them and the number is logged. It is normally 1 per store and costs no extra
-request, since records arrive in pages rather than one at a time. A large count
-means the timestamp was further back than it had to be.
+Records always come back for the second before the store's newest one; the
+"already current" count on the record line is that, and it is normally 1. A
+large count means the timestamp was further back than it had to be.
 
-Tests cover a full write, read and re-merge cycle rather than the in-memory
-check alone, because the store on disk is what the next run sees and a
-timestamp that failed to survive being written would silently make every run
-re-fetch everything.
+## Anti-bot challenges
 
-## The store
+`gitlab.haskell.org` answers sustained traffic with an interstitial page
+served as HTTP 200. A run recognises it and waits it out on a ladder of 30s,
+60s, 2m, 5m, 10m, 10m before giving up. Giving up aborts the run rather than
+skipping the object, since progress is already checkpointed and carrying on
+would spend the whole ladder again on the next one. Every other error fails
+on the first attempt, so a bad token is reported immediately. The challenge is
+tied to the source address, not the process, so restarting straight away does
+not help.
 
-SQLite is the only backend. `Backend` is kept as a one-constructor type so that
-adding a second — a server rather than a file — is a constructor and a
-`StoreBackend` instance rather than a choice threaded back through everything
-that names a store.
+## Locking
 
-`StoreBackend` has two operations that matter: `storeLoad` reads everything of
-one record kind, and `storeSave` takes the store plus the keys that changed
-since it was loaded. One handle serves both tickets and merge requests; which
-is meant is decided by the `Record` instance the method is used at, so a
-backend is free to keep them in one place or two.
+Each store is guarded by a `<file>.lock` beside it, held for the whole run
+and by `--clear-timestamp`. The file records the holder's pid and start time,
+which is what a run that is turned away reports. The file is left behind on
+exit and is not a stale lock: the operating system releases the real lock
+when the process dies, and the next run overwrites the record. Locking never
+waits; a run that cannot have the lock exits 1.
 
-The changed-key set is the whole point of the interface: SQLite upserts those
-rows and leaves the rest, so a checkpoint of 20 objects costs 33 → 71 ms as the
-store grows from 2 to 88 MB. A backend that rewrote the store instead would go
-21 → 749 ms over the same range, which is what the JSON lines backend this
-replaced actually did.
-
-### How a record is stored relationally without being dissected
-
-`Issue` and `MergeRequest` have some hundred fields between them, nested
-`Pipeline` and `Epic` included, and a field missed would be a field dropped
-from a dump that exists to be faithful. So `Store.Schema` splits rather than
-dissects:
-
-- the objects that repeat — users, milestones, labels — are lifted into their
-  own tables, keyed on their exact JSON so that two copies differing in any
-  field stay two rows (a note's author carries fewer fields than a ticket's),
-- what is left is stored verbatim as `rest`,
-- the columns worth querying are `GENERATED ... VIRTUAL` over `rest`, so they
-  cost no space, can be indexed, and cannot disagree with it.
-
-`splitObject` and `spliceObject` are inverses, and the tests check that on
-every fixture and on the real store: 294 records and 5231 notes come back
-identical. `liftedKeys` records which keys were removed, which is what
-distinguishes an absent field from an empty list — a distinction the staleness
-check depends on.
-
-Two things learned the hard way, both now pinned by tests:
-
-- Notes are keyed by `(kind, iid, position)`, not by GitLab's note id. Keying
-  on the id made a store where one note belongs to several records lose all but
-  the last, and a discussion is in any case an ordered list belonging to one
-  record.
-- The queryable columns were ordinary columns first, which stored every note
-  body twice and made the database half again the size of the JSON it holds.
-
-## The vendored gitlab-haskell
-
-`cabal.project` builds `gitlab-haskell` from `vendor/gitlab-haskell`, a patched
-1.4.0.0. Three upstream bugs, all detailed in `vendor/gitlab-haskell/PATCHES.md`
-and reproduced standalone in `repro/`:
-
-- `gitlabHTTPMany` decoded a page as a whole and, when that failed, returned
-  the pages so far as a **success** and stopped paging. Two mistyped records in
-  `ghc/ghc` cost 1853 of 2353 merge requests, 79%, with no way for the caller
-  to tell. It now decodes element by element, skips the record it cannot read,
-  and pages to the end.
-- `merge_request_source_project_id` was `Int`; GitLab returns null when the
-  source project has been deleted. Now `Maybe Int`. GraphQL confirms
-  `targetProjectId` is non-null, so that one is left alone.
-- `parseOne` discarded the decode error entirely, making "cannot parse"
-  indistinguishable from "does not exist". It now says so on stderr.
-
-The first of those is the one that mattered: because a run's next
-`updated_after` comes from the newest record it holds, and a truncation keeps
-precisely the newest records, everything dropped fell permanently out of reach
-of later runs. Silent, deterministic data loss. After the patch the same query
-returns all 2353.
-
-Two further changes are additions rather than fixes, giving control the library
-does not otherwise offer without changing what the existing functions do:
-
-- `gitlabGetPage`, with `projectIssuesPage` and `mergeRequestsWithPage`, returns
-  a single page instead of paging to the end. This is what "Fetching in batches"
-  above is built on.
-- `runGitLabWithManagerUnchecked` is `runGitLabWithManager` without the
-  `/version` token check it runs before **every** action. One action per record
-  is exactly how discussions are fetched, so that check was doubling the whole
-  discussion phase: around 28,000 extra requests on `ghc/ghc`, four hours at two
-  a second. The checked version is still called once at the start, so a bad
-  token is still reported immediately.
-- `GitLab.WebRequests.GitLabWebCalls` is exposed (a cabal file change only),
-  so endpoints the typed API does not cover — a merge request's pipelines, a
-  pipeline's jobs — can be fetched as raw `Value`s through the library's
-  session, retries and pagination.
-
-## Watching a run
-
-`--log FILE` writes at trace level while the terminal keeps info. The two
-sinks are separate `Logger`s combined with `<>`; `runLogT` is given `LogTrace`
-whenever a file is in use, since a message filtered out there would never reach
-the file, and the terminal logger filters for itself on `lmLevel`.
-
-What makes the file useful is that the rate limited manager announces every
-request at trace level, which also makes it a record of what was asked of the
-server. At 1.5 requests a second, several seconds of silence means stopped
-rather than busy.
-
-The hook is `managerWrapException`, which is not what its name suggests it is
-for. The obvious one, `managerModifyRequest`, runs **twice** per request:
-`responseOpen` applies it to the request it is given and again inside the
-redirect loop before each attempt. That charged two turns of the rate limiter
-per request, so a limit of two a second delivered one, and the log claimed twice
-the traffic actually made. `managerWrapException` wraps the whole of
-`responseOpen` and so runs exactly once per request, retries included; the
-default wrapper is still called, so exceptions are translated as before. The
-test asserts one announcement per request against a refused connection, which
-exercises the hook without needing a server.
+Requests are capped at 1.5 per second, pagination and retries included.
+Discussions cost one request per object, so a cold run over a large project
+takes hours — roughly six to eight for `ghc/ghc`. Interrupting it is safe.
 
 ## Pipelines on request
 
@@ -294,100 +121,44 @@ exercises the hook without needing a server.
 each, instead of fetching records at all. Pipelines are never fetched unasked:
 a project the size of GHC runs a pipeline per push, so following them for
 every merge request would dwarf the records themselves. A run is one request
-for the pipeline list plus one per pipeline for its jobs.
-
-Both are fetched as raw JSON (`gitlabGetMany` at `Value`) rather than through
-the library's typed models, which would silently drop unmodelled fields.
-`Store.Schema.Pipeline` holds the tables: pipelines keyed by their
-project-unique id and carrying the `(kind, iid)` of the record they were
-fetched for; jobs keyed by an autoincrement row with the GitLab id only
-UNIQUE, since the docs do not promise instance-wide ids. A job's `user` and
-`runner` are interned (a runner is interned per observed state — `online` and
-`status` change between fetches), its `commit` goes to a table keyed on the
-sha, and its nested `pipeline` object is dropped as a strict subset of the
-pipelines row. Status, stage, the timestamps and durations are real columns;
-the rest of the object stays verbatim in `rest` under generated columns.
+for the pipeline list plus one per pipeline for its jobs; the objects are
+stored complete, not through the library's typed models.
 
 Any failure aborts the run rather than skipping: re-running costs a handful
-of requests, so there is no staleness bookkeeping as there is for notes.
-Refetching a merge request's pipelines replaces what was there.
-
-The pipeline tables are schema patch 1 (see "Schema versions and patches"
-below): a store that predates them gets them at the next open.
+of requests. Refetching a merge request's pipelines replaces what was there.
+A store from before the pipeline tables existed gains them at the next open.
 
 ## Forcing a refetch
 
-`--clear-timestamp` sets `entryDiscussionFor` to `Nothing` across a store, so
-every discussion is stale and the next run fetches it. The notes are kept —
-only the claim that they are current is dropped — so the store stays usable
-until each is replaced, and repeating the command does nothing the second time.
+`--clear-timestamp` marks every discussion in a store stale, so the next run
+fetches all of them. The notes are kept — only the claim that they are current
+is dropped — so the store stays usable until each is replaced, and repeating
+the command does nothing the second time.
 
-It cannot move where records are fetched from: that comes from `latestUpdate`,
-a property of the records themselves rather than any stored timestamp. The
-command prints the current starting point and points at `--since`.
+It cannot move where records are fetched from: that comes from the newest
+`updated_at` among the records themselves. The command prints the current
+starting point and points at `--since`.
 
 ## Size
 
 For `ghc/ghc`, 26,259 issues and 16,539 merge requests, so about 43k note
-requests and six hours for a cold run. Sized from a random sample: a complete
-store is roughly 360 MB of tickets and 210 MB of merge requests, ~560 MB in
-all, or ~150 MB with `--no-notes`. Notes are about three quarters of the bytes.
-The distribution is heavily tailed — median object ~9 KB, largest past 500 KB —
+requests for a cold run. Sized from a random sample: a complete store is
+roughly 360 MB of tickets and 210 MB of merge requests, ~560 MB in all, or
+~150 MB with `--no-notes`. Notes are about three quarters of the bytes. The
+distribution is heavily tailed — median object ~9 KB, largest past 500 KB —
 so the mean is what to extrapolate from.
 
-## Locking
+A run holds records but not notes in memory, and caps its heap at 1 GB, about
+twice what `ghc/ghc`'s full history needs. Raise it with `+RTS -M4G -RTS` if
+needed; an overflow well under that is a leak worth reporting.
 
-Each store is guarded by a `<file>.lock` beside it, held for the whole run.
-The lock cannot go on the store itself: the store is replaced by a rename at
-every checkpoint, which would leave the lock holding the replaced file while a
-second run locked the new one. The lock file is only ever created, locked and
-rewritten in place.
+## Watching a run
 
-On taking the lock a run writes `{"pid": ..., "started_at": ...}` into the file,
-which is what lets a run that is turned away name what is in its way. The file
-is not deleted on release and its contents are not what grants the lock, so a
-leftover file from a finished run is not a stale lock — the operating system
-releases the real lock when the holding process dies, and the next run
-overwrites the record. Locking never waits; a run that cannot have both stores
-logs and exits 1.
-
-Two subtleties, both of which the tests pin down:
-
-- GHC refuses to open a file twice for writing within one process, so
-  `withStoreLocks` treats an `openFile` "resource busy" as a held lock rather
-  than letting the exception escape. This is why the holder is read back
-  through the handle already open rather than by opening the lock file again.
-- A same process nested lock is caught by that GHC check rather than by the
-  operating system, so the test suite also re-runs its own executable as a
-  child (`--hold-lock`) to exercise the real cross process lock.
-
-Requests are capped at 1.5 per second, enforced in the HTTP manager so
-`gitlab-haskell`'s internal pagination and retries are covered too. Discussions
-cost one request per object, so a cold run over a large project takes hours —
-roughly six for `ghc/ghc`. Interrupting it is safe.
-
-## Modules
-
-| Module | Role |
-| --- | --- |
-| `FetchGitLab.Options` | optparse-applicative parser, `Command`, `Options`, `Backend` |
-| `FetchGitLab.ClearTimestamp` | `--clear-timestamp`, forcing discussions to be refetched |
-| `FetchGitLab.Since` | `--since` parsing and resolution against now |
-| `FetchGitLab.Store` | `Record` class, `Entry`, merge, staleness |
-| `FetchGitLab.Store.Class` | `StoreBackend`, the interface a backend implements |
-| `FetchGitLab.Store.Schema` | Entities, relations, the SQL tables, schema versions |
-| `FetchGitLab.Store.Schema.Types` | The lift/splice machinery (`LiftSpec`, `splitObject`) |
-| `FetchGitLab.Store.Schema.Pipeline` | The pipeline, job, runner and commit tables |
-| `FetchGitLab.Store.Sqlite` | The SQLite backend, via sqlite-simple |
-| `FetchGitLab.Store.Backend` | `--backend` to an open store, and the paths to lock |
-| `FetchGitLab.Lock` | Exclusive store locks, `LockInfo` holder record |
-| `FetchGitLab.Logging` | Terminal and `--log` file loggers at different levels |
-| `FetchGitLab.RateLimit` | Rate limiter and the manager that obeys it |
-| `FetchGitLab.Fetch` | `run`, orchestration, paged record fetch, discussion loop |
-
-`Record` is the class tying a type to the store: `recordKey` (the `iid`),
-`recordUpdatedAt`, and `recordKind` (the name of the kind). Instances exist for
-`Issue` and `MergeRequest`.
+`--log FILE` appends at trace level while the terminal keeps info; `-v` puts
+the trace lines on the terminal instead. Trace is one line per HTTP request,
+so at 1.5 requests a second several seconds of silence means stopped rather
+than busy. The token is sent as a header and never appears in the logged
+URLs.
 
 ## Building
 
@@ -396,4 +167,5 @@ cabal build
 cabal test
 ```
 
-Tests use real GitLab responses in `test/data/` as fixtures and hit no network.
+Tests hit no network. `gitlab-haskell` is built from a patched copy under
+`vendor/`, not from Hackage.
