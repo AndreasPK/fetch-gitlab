@@ -25,7 +25,7 @@ A record is named by `ref`: `#123` is a ticket, `!123` a merge request.
 | `view_mrs` | merge request | the same plus `reviewers, source_branch, target_branch, draft, merge_status, sha, merged_at` |
 | `view_ticket`, `view_mr` | row of one record's thread: header at `seq` 0, then its notes oldest first | `ref, seq, created_at, author, system, text` (rendered Markdown) |
 | `view_notes` | note | `ref, kind, iid, position, created_at, author, author_id, system, is_import, type, resolved, len, body` |
-| `view_links` | cross-reference GitLab logged as a system note | `ref, created_at, rel, target_kind, target_project, target, target_ref` |
+| `view_links` | cross-reference GitLab logged as a system note | `ref, kind, iid, created_at, rel, target_kind, target_project, target, target_ref` |
 | `view_people` | username | `username, name, user_id` |
 
 `author` is a username; `assignees`, `reviewers` and `labels` are one

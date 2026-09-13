@@ -24,7 +24,7 @@ store lock: it will refuse to run beside a full fetch.
 `pipelines` is keyed by the project-unique `pipeline_id`; `kind`/`iid` name
 the MR it was fetched for (`kind` = `'mr'`, `iid` = the `!16366` number).
 Verbatim JSON in `rest` with the useful fields generated from it:
-`pipeline_iid`, `status`, `source`, `ref`, `sha`, `web_url`, `created_at`,
+`pipeline_iid`, `project_id`, `status`, `source`, `ref`, `sha`, `name`, `web_url`, `created_at`,
 `updated_at`.
 
 `jobs` is keyed by an autoincrement `job_row` with the GitLab job id in
