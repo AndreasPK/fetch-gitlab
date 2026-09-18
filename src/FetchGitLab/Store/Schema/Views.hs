@@ -35,6 +35,7 @@
 -- statements run before the patches that add the columns.
 module FetchGitLab.Store.Schema.Views
   ( viewStatements
+  , ciViewStatements
   ) where
 
 import Data.Text (Text)
@@ -247,3 +248,63 @@ viewPeople :: Text
 viewPeople =
   "CREATE VIEW IF NOT EXISTS view_people AS \
   \SELECT username, max(name) AS name, user_id FROM users GROUP BY username"
+
+-- | The views over pipelines and jobs. Part of schema patch 5, after the
+-- statements that create @job_logs@, which @view_jobs@ reads.
+--
+-- These views help answer: What did happen during a pipeline, which jobs failed
+-- and which jobs failed
+-- @view_mr_ci_status@ answers the first half in one row. In @view_jobs@,
+-- @latest@ marks the jobs of that same pipeline, so the second half is
+-- @WHERE iid = ? AND latest AND status = 'failed'@ rather than a correlated
+-- subquery written out again. Filter on @iid@: it reaches the
+-- @pipelines_record@ index, where @ref@ is computed and cannot.
+ciViewStatements :: [Text]
+ciViewStatements = [viewMrCiStatus, viewJobs]
+
+-- | True for the newest pipeline of its merge request. Pipeline ids are
+-- project-wide and ascending, so the highest is the last one created.
+latestPipeline :: Text
+latestPipeline =
+  "(p.pipeline_id = (SELECT max(p2.pipeline_id) FROM pipelines p2 \
+  \                   WHERE p2.kind = p.kind AND p2.iid = p.iid)) AS latest"
+
+-- | One row per merge request (for those having stored pipelines):
+-- The MRs newest known pipeline. With counts based on job result.
+viewMrCiStatus :: Text
+viewMrCiStatus =
+  "CREATE VIEW IF NOT EXISTS view_mr_ci_status AS \
+  \SELECT '!' || p.iid AS ref, p.iid, p.pipeline_id, p.status, p.sha, \
+  \       p.created_at, p.updated_at, \
+  \       (SELECT count(*) FROM pipelines p2 WHERE p2.kind = p.kind AND p2.iid = p.iid) AS pipelines, \
+  \       (SELECT count(*) FROM jobs j WHERE j.pipeline_id = p.pipeline_id) AS jobs, \
+  \       (SELECT count(*) FROM jobs j WHERE j.pipeline_id = p.pipeline_id \
+  \          AND j.status = 'failed' AND j.allow_failure IS NOT 1) AS failed, \
+  \       (SELECT count(*) FROM jobs j WHERE j.pipeline_id = p.pipeline_id \
+  \          AND j.status = 'failed' AND j.allow_failure IS 1) AS failed_allowed, \
+  \       (SELECT count(*) FROM jobs j WHERE j.pipeline_id = p.pipeline_id \
+  \          AND j.status IN ('created', 'pending', 'running', 'waiting_for_resource', 'preparing')) AS unfinished, \
+  \       p.web_url, p.expire_at \
+  \FROM pipelines p \
+  \WHERE p.kind = 'mr' \
+  \  AND p.pipeline_id = (SELECT max(p2.pipeline_id) FROM pipelines p2 \
+  \                        WHERE p2.kind = p.kind AND p2.iid = p.iid)"
+
+-- | One row per job, with the merge request and pipeline it belongs to.
+-- @job_id@ is GitLab's id, the one @--job-log@ takes; @has_log@ says whether
+-- that has been done.
+viewJobs :: Text
+viewJobs =
+  "CREATE VIEW IF NOT EXISTS view_jobs AS \
+  \SELECT '!' || p.iid AS ref, p.iid, p.pipeline_id, " <> latestPipeline <> ", \
+  \       p.status AS pipeline_status, \
+  \       j.id AS job_id, j.name, j.stage, j.status, \
+  \       (j.allow_failure IS 1) AS allow_failure, j.failure_reason, \
+  \       j.started_at, j.finished_at, round(j.duration) AS secs, \
+  \       r.description AS runner, \
+  \       EXISTS (SELECT 1 FROM job_logs l WHERE l.job_id = j.id) AS has_log, \
+  \       j.web_url \
+  \FROM jobs j \
+  \JOIN pipelines p ON p.pipeline_id = j.pipeline_id \
+  \LEFT JOIN runners r ON r.row_id = j.runner_row \
+  \WHERE p.kind = 'mr'"

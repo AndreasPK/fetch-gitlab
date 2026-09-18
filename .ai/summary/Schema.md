@@ -35,7 +35,9 @@
 - Patch 5 (`jobLogAndExpiryStatements`, `Store.Schema.Pipeline`) adds
   `job_logs` and the `jobs_delete_log` trigger, then `expire_at` on
   `pipelines` and `jobs` plus the `UPDATE` that dates the rows a store
-  already holds. A trigger is frozen in the store like a view. Not
+  already holds, then `ciViewStatements` (`Store.Schema.Views`):
+  `view_mr_ci_status` and `view_jobs`, last because they read `job_logs`
+  and `expire_at`. A trigger is frozen in the store like a view. Not
   repeatable, like patch 3: `ADD COLUMN` runs once, and the column is in
   neither the base schema nor patch 1, which is why it must not be added to
   `pipelineSchemaStatements`. `ADD COLUMN` cannot be `NOT NULL` without a

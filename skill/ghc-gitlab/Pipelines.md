@@ -5,6 +5,51 @@ one per push, so nothing fetches them unasked. **An MR with no rows in
 `pipelines` is an MR nobody fetched pipelines for (or fetched them over a
 month ago — see "Expiry"), not an MR without CI.**
 
+## Workflow: what failed in an MR's CI
+
+(To have the whole of this done and summarised by a subagent, use
+`CiFailure.md` instead.)
+
+1. Fetch (refetch if the pipeline may still be running — the store only
+   knows what the last fetch saw):
+
+   ```
+   fetch-gitlab --pipelines 16366
+   ```
+
+2. One row for the MR's newest pipeline:
+
+   ```sql
+   SELECT pipeline_id, status, jobs, failed, failed_allowed, unfinished
+     FROM view_mr_ci_status WHERE iid = 16366;
+   ```
+
+   No row: nothing was fetched. `unfinished > 0`: still running, `failed`
+   can grow. `failed_allowed` jobs failed without failing the pipeline.
+
+3. Its failed jobs:
+
+   ```sql
+   SELECT job_id, name, stage, allow_failure, failure_reason, secs, runner, has_log
+     FROM view_jobs
+    WHERE iid = 16366 AND latest AND status = 'failed'
+    ORDER BY finished_at;
+   ```
+
+4. For a job worth reading, `fetch-gitlab --job-log <job_id>`, then grep the
+   log (see "Fetching a job's log").
+
+`view_mr_ci_status`: one row per MR with pipelines in the store — `ref, iid,
+pipeline_id, status, sha, created_at, updated_at, pipelines, jobs, failed,
+failed_allowed, unfinished, web_url, expire_at`.
+
+`view_jobs`: one row per job of any pipeline — `ref, iid, pipeline_id,
+latest, pipeline_status, job_id, name, stage, status, allow_failure,
+failure_reason, started_at, finished_at, secs, runner, has_log, web_url`.
+`latest` = belongs to the MR's newest pipeline; drop it to see a job's
+history across pushes (`WHERE iid = … AND name = …`). Filter both views on
+`iid`, not `ref`: only `iid` is indexed.
+
 ## Fetching an MR's pipelines
 
 ```
@@ -51,21 +96,6 @@ Four objects are lifted out of a job's `rest`, so `json_extract(rest,
 - the nested `pipeline` object is dropped outright — every field of it is in
   the `pipelines` row.
 
-The failed jobs of an MR's newest pipeline, with who ran them:
-
-```sql
-SELECT j.name, j.stage, round(j.duration) AS secs, j.web_url,
-       json_extract(r.json, '$.description') AS runner
-  FROM jobs j
-  JOIN pipelines p ON p.pipeline_id = j.pipeline_id
-  LEFT JOIN runners r ON r.row_id = j.runner_row
- WHERE p.kind = 'mr' AND p.iid = 16366
-   AND p.pipeline_id = (SELECT max(pipeline_id) FROM pipelines
-                         WHERE kind = 'mr' AND iid = 16366)
-   AND j.status = 'failed'
- ORDER BY j.finished_at;
-```
-
 Gotchas:
 
 - `runner_row IS NULL` means the job never ran (skipped, canceled while
@@ -101,17 +131,7 @@ sqlite3 ~/.fetch-gitlab/gitlab.db \
   "SELECT raw_log FROM job_logs WHERE job_id = <job_id>" | grep -n -i error | tail
 ```
 
-Which failed jobs of an MR have a log, and which still need fetching:
-
-```sql
-SELECT j.id, j.name, j.stage, l.job_id IS NOT NULL AS has_log,
-       length(l.raw_log) AS chars
-  FROM jobs j
-  JOIN pipelines p ON p.pipeline_id = j.pipeline_id
-  LEFT JOIN job_logs l ON l.job_id = j.id
- WHERE p.kind = 'mr' AND p.iid = 16366 AND j.status = 'failed'
- ORDER BY j.id DESC;
-```
+Which failed jobs still need their log fetched: `has_log` in `view_jobs`.
 
 Gotchas:
 

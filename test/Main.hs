@@ -130,6 +130,7 @@ tests =
         , testCase "a stored log is text: LIKE and length see all of it" jobLogIsSearchable
         , testCase "only a job the store holds can be asked about" jobLogNeedsItsJob
         , testCase "refreshing pipelines keeps a job's log" pipelinesRewriteKeepsJobLog
+        , testCase "the CI views report the newest pipeline and its failed jobs" ciViewsReportLatest
         , testCase "deleting a job deletes its log, foreign keys enforced or not" deletingJobDeletesLog
         , testCase "a fetched pipeline, its jobs and its log are kept for a month" fetchedRowsExpireAMonthOn
         , testCase "what has expired is removed and the rest kept" purgeRemovesWhatExpired
@@ -614,7 +615,7 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
     n <- SQL.query_ raw' "SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name LIKE 'view\\_%' ESCAPE '\\'" :: IO [SQL.Only Int]
     SQL.close raw'
     pure n
-  assertEqual "patch 4 added the seven views" [SQL.Only 7] views
+  assertEqual "patch 4 added seven views and patch 5 two" [SQL.Only 9] views
 
 -- | A store written before pipelines could expire gains the column when it is
 -- opened, and the rows it already holds are given a month from the migration
@@ -1222,6 +1223,26 @@ pipelinesRewriteKeepsJobLog = withSystemTempDirectory "fetch-gitlab-test" $ \dir
     storeWriteJobLog db 9002 "the log"
     storeWritePipelines db "mr" 16366 pipelineFixture
   jobLogs path >>= (@?= [(9002, "the log")])
+
+-- | The fixture's newest pipeline is 102 with one failed job; 101's failed
+-- job is history and must not show under @latest@.
+ciViewsReportLatest :: Assertion
+ciViewsReportLatest = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9003 "the log"
+  SQL.withConnection path $ \raw -> do
+    status <-
+      SQL.query_ raw "SELECT ref, pipeline_id, status, pipelines, jobs, failed, failed_allowed, unfinished FROM view_mr_ci_status" ::
+        IO [(T.Text, Int, T.Text, Int, Int, Int, Int, Int)]
+    status @?= [("!16366", 102, "failed", 2, 1, 1, 0, 0)]
+    failed <-
+      SQL.query_ raw "SELECT job_id, runner, has_log FROM view_jobs WHERE iid = 16366 AND latest AND status = 'failed'" ::
+        IO [(Int, T.Text, Int)]
+    failed @?= [(9003, "maki", 1)]
+    older <- SQL.query_ raw "SELECT job_id, has_log FROM view_jobs WHERE NOT latest AND status = 'failed'" :: IO [(Int, Int)]
+    older @?= [(9002, 0)]
 
 -- | A log does not outlive its job. The likeliest delete is one typed into the
 -- sqlite3 shell, which does not enforce foreign keys unless asked to, so this

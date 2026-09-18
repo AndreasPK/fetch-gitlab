@@ -63,7 +63,7 @@ Pipelines, jobs and job logs, when fetched, land in tables of their own, and
 are the one thing a store forgets again: they carry an `expire_at` a month
 out (see "CI data expires").
 
-Seven views spare a reader the joins: `view_tickets` and `view_mrs` (one row
+Nine views spare a reader the joins: `view_tickets` and `view_mrs` (one row
 per record with author, assignees, labels, milestone and `notes_stale`),
 `view_ticket` and `view_mr` (one record as a thread, a header row then its
 notes oldest first, each row's `text` rendered as Markdown, so
@@ -71,7 +71,13 @@ notes oldest first, each row's `text` rendered as Markdown, so
 transcript), `view_notes` (every note with its author, `system`, `is_import`
 for the Trac migration's, and `len`), `view_links` (the cross-references
 GitLab records as system notes, split into `rel`, `target_kind` and a
-joinable `target_ref`) and `view_people`. `Store.Schema.Views` defines them;
+joinable `target_ref`) and `view_people`. Two more cover CI:
+`view_mr_ci_status` (one row per merge request with fetched pipelines: its
+newest pipeline's status and `jobs`/`failed`/`failed_allowed`/`unfinished`
+counts) and `view_jobs` (one row per job, `latest` marking the newest
+pipeline's, `job_id` being what `--job-log` takes, `has_log`); the failed jobs
+of an MR are `SELECT job_id, name FROM view_jobs WHERE iid = N AND latest AND
+status = 'failed'`. `Store.Schema.Views` defines them;
 the `ghc-gitlab` skill is written around them.
 
 ## How a run proceeds

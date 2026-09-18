@@ -1,6 +1,6 @@
 ---
 name: ghc-gitlab
-description: Query the local fetch-gitlab SQLite store for gitlab.haskell.org tickets and MR discussions. Used when asked about ghc issues or merge requests.
+description: Query the local fetch-gitlab SQLite store for gitlab.haskell.org tickets, MR discussions and MR CI results. Used when asked about ghc issues or merge requests, or why an MR's CI pipeline failed.
 ---
 
 # Querying a fetch-gitlab store
@@ -27,6 +27,8 @@ A record is named by `ref`: `#123` is a ticket, `!123` a merge request.
 | `view_notes` | note | `ref, kind, iid, position, created_at, author, author_id, system, is_import, type, resolved, len, body` |
 | `view_links` | cross-reference GitLab logged as a system note | `ref, kind, iid, created_at, rel, target_kind, target_project, target, target_ref` |
 | `view_people` | username | `username, name, user_id` |
+| `view_mr_ci_status` | merge request with fetched pipelines: its newest pipeline | `ref, iid, pipeline_id, status, jobs, failed, failed_allowed, unfinished, …` (see `Pipelines.md`) |
+| `view_jobs` | CI job | `ref, iid, pipeline_id, latest, job_id, name, stage, status, failure_reason, runner, has_log, …` (see `Pipelines.md`) |
 
 `author` is a username; `assignees`, `reviewers` and `labels` are one
 string each. `system` marks GitLab's own notes ("assigned to @x"),
@@ -71,3 +73,7 @@ and notes, two terms near each other, thread index then one note, notes by
 one person, all-of-several labels, links with titles both ways, coverage
 and freshness, Trac import changes. `reassemble.sql` rebuilds a record as
 one JSON object. `Pipelines.md` covers CI status, job failures and fetching job logs.
+
+**"Why did CI fail on !N?"**: read `CiFailure.md` and launch the subagent it
+describes — it fetches the pipelines, picks a failed job, reads the end of
+its log and returns a summary, keeping the log out of your context.

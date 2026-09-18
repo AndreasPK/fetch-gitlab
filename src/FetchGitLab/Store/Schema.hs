@@ -60,7 +60,7 @@ module FetchGitLab.Store.Schema
 import Data.Text (Text)
 
 import FetchGitLab.Store.Schema.Pipeline (jobLogAndExpiryStatements, pipelineSchemaStatements)
-import FetchGitLab.Store.Schema.Views (viewStatements)
+import FetchGitLab.Store.Schema.Views (ciViewStatements, viewStatements)
 import FetchGitLab.Store.Schema.Types
 
 -- | Bumped when the schema changes in ways that would break older executables.
@@ -114,7 +114,9 @@ data SchemaPatch = SchemaPatch
 --   for the rows a store already holds ('jobLogAndExpiryStatements' in
 --   "FetchGitLab.Store.Schema.Pipeline"). Unguarded: @ADD COLUMN@ cannot be
 --   repeated, but the column is in neither the base schema nor patch 1, so
---   every store runs this exactly once.
+--   every store runs this exactly once. Then the views over pipelines and
+--   jobs ('ciViewStatements'), last because they read @job_logs@ and
+--   @expire_at@.
 --
 -- A patch that adds an index ends with @ANALYZE@. Without planner statistics
 -- SQLite rates an equality on the leading primary key column as cheap and
@@ -134,7 +136,7 @@ schemaPatches =
       (Just "SELECT 1 FROM pragma_table_info('records') WHERE name = 'has_discussion'")
   , SchemaPatch refStatements Nothing
   , SchemaPatch viewStatements Nothing
-  , SchemaPatch jobLogAndExpiryStatements Nothing
+  , SchemaPatch (jobLogAndExpiryStatements <> ciViewStatements) Nothing
   ]
 
 -- | A row's own name in GitLab notation: @#123@ for a ticket, @!123@ for a

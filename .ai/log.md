@@ -411,3 +411,26 @@ untouched, and a following `--pipelines 16366` refilled it.
 `ciCounts`), `Fetch.hs` (purge at startup, `fetchTicketsAndMrs`),
 `test/Main.hs`, `README.md`, `agent-summary.md`,
 `skill/ghc-gitlab/Pipelines.md`, `.ai/summary/{store,Schema,fetch,modules}.md`.
+
+## 2026-09-18T09:20+00:00 — decision: CI views: which, and in which patch?
+
+The skill's one CI question — what did this MR's last pipeline do, which
+jobs failed — was a 12-line query with the "newest pipeline" subquery
+written out twice. Two views replace it: `view_mr_ci_status` (one row per
+MR, its newest pipeline, jobs counted as failed / failed-but-allowed /
+unfinished) and `view_jobs` (one row per job, `latest`, `job_id`, `runner`,
+`has_log`). A per-pipeline view was written and dropped: the older pipelines
+are history nobody asked the store about, and `view_jobs` without `latest`
+still reaches them. "Newest" is `max(pipeline_id)`: ids are project-wide and
+ascending, and `created_at` would need the same subquery plus a tiebreak.
+
+They live in `Store.Schema.Views` but run as the tail of patch 5, not in
+patch 4 (frozen: real stores ran it) and not as a patch 6 (patch 5 is still
+unreleased, same reasoning as the expiry entry above). `view_jobs` reads
+`job_logs`, so it could not have come earlier anyway. Filter on `iid`:
+`ref` is computed in the view and reaches no index.
+
+Touched: `Store/Schema/Views.hs`, `Store/Schema.hs`, `test/Main.hs` (view
+count 7 → 9, `ciViewsReportLatest`), `skill/ghc-gitlab/{SKILL,Pipelines}.md`
+(workflow section first; the two long queries it replaces removed),
+`agent-summary.md`, `.ai/summary/Schema.md`.
