@@ -18,6 +18,7 @@ library
     hs-source-dirs:   src
     exposed-modules:  FetchGitLab.Options
                       FetchGitLab.ClearTimestamp
+                      FetchGitLab.JobLog
                       FetchGitLab.Logging
                       FetchGitLab.Lock
                       FetchGitLab.RateLimit
@@ -87,6 +88,7 @@ test-suite fetch-gitlab-test
                     , http-types           >=0.12 && <0.13
                     , process              >=1.6.3 && <1.7
                     , log-base
+                    , optparse-applicative
                     -- For building a store at the previous schema by hand, to
                     -- check the patch that migrates it.
                     , sqlite-simple        >=0.4.18 && <0.5

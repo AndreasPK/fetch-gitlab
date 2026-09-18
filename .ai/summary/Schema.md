@@ -32,6 +32,18 @@
   later patch of `DROP VIEW IF EXISTS` + `CREATE VIEW`. Views never go in
   the base schema, since SQLite resolves a view's columns at create time and
   the base statements run before the patches that add columns.
+- Patch 5 (`jobLogAndExpiryStatements`, `Store.Schema.Pipeline`) adds
+  `job_logs` and the `jobs_delete_log` trigger, then `expire_at` on
+  `pipelines` and `jobs` plus the `UPDATE` that dates the rows a store
+  already holds. A trigger is frozen in the store like a view. Not
+  repeatable, like patch 3: `ADD COLUMN` runs once, and the column is in
+  neither the base schema nor patch 1, which is why it must not be added to
+  `pipelineSchemaStatements`. `ADD COLUMN` cannot be `NOT NULL` without a
+  constant default, so the column is nullable and NULL means "not expired".
+  A patch may rely on the tables of earlier patches, so a test fixture that
+  claims a patch level must really be at it ("a store at the old schema
+  loses has_discussion" and "a store at patch 1 gains expire_at" both run
+  patch 1's statements for that reason).
 - `migrate` runs the unapplied patches and writes the count last, in one
   `BEGIN IMMEDIATE` transaction. A store counted higher than the binary
   knows is left alone; lowering the count would repeat a non-repeatable

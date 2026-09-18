@@ -26,6 +26,7 @@ import Control.Exception (try)
 import Control.Monad (forM, forM_, when)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Aeson (Value, object)
 import qualified Data.Aeson.Types as Aeson
@@ -50,7 +51,7 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Client.Internal (Manager (..))
 import Network.HTTP.Types.Header (hUserAgent)
-import Network.HTTP.Types.Status (Status, statusCode)
+import Network.HTTP.Types.Status (Status, statusCode, statusIsSuccessful)
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory)
@@ -73,7 +74,7 @@ import GitLab.Types
   , SortBy (..)
   , project_id
   )
-import GitLab.WebRequests.GitLabWebCalls (gitlabGetMany)
+import GitLab.WebRequests.GitLabWebCalls (gitlabGetByteStringResponse, gitlabGetMany)
 
 import Log
   ( LogLevel (..)
@@ -86,6 +87,7 @@ import Log
   , runLogT
   )
 
+import FetchGitLab.JobLog (stripControlChars)
 import FetchGitLab.Logging (withFetchLogger)
 import FetchGitLab.Lock
   ( LockBusy (..)
@@ -98,7 +100,7 @@ import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
 import FetchGitLab.Store (Record (..))
 import FetchGitLab.Store.Backend (optionsSpec, specPaths, withStore)
-import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..))
+import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..), describePurged)
 import Paths_fetch_gitlab (version)
 
 -- | How many requests per second we allow ourselves.
@@ -197,6 +199,15 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
 
     fetch :: StoreBackend b => b -> LogT IO ()
     fetch store = do
+      -- The one place a store is purged: under the lock, and before anything
+      -- is fetched, so that no run writes a pipeline and removes it in the
+      -- same breath. @--clear-timestamp@ deliberately does not purge — it is
+      -- the command a damaged store is repaired with.
+      purged <- liftIO (storePurgeExpired store)
+      case describePurged purged of
+        Just what -> logInfo_ what
+        Nothing -> logTrace_ "Nothing in the store has expired"
+
       token <-
         liftIO (tokenFile opts >>= readToken)
           >>= either (\err -> abort ("Cannot read the access token: " <> err)) pure
@@ -226,31 +237,10 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
           (liftIO (runGitLabWithManager manager (serverConfig opts token) (lookupProject (optProject opts))))
           >>= either (\err -> abort ("GitLab request failed: " <> tshow err)) pure
 
-      case optPipelines opts of
-        Just mr -> fetchPipelines gitlab store prj mr
-        Nothing -> do
-          -- An explicit --since overrides where the store says to carry on
-          -- from. Nothing else can move the starting point back.
-          override <- liftIO $ traverse resolveNow (optSince opts)
-          storedTickets <- liftIO $ storeLatestUpdate store (Proxy :: Proxy Issue)
-          storedMrs <- liftIO $ storeLatestUpdate store (Proxy :: Proxy MergeRequest)
-          let ticketsSince = maybe (fetchSince storedTickets) Just override
-              mrsSince = maybe (fetchSince storedMrs) Just override
-          logSince "tickets" ticketsSince
-          logSince "merge requests" mrsSince
-
-          fetchRecords gitlab "tickets" store ticketsSince $ \since ->
-            projectIssuesPage prj (issueFilters since) recordsPerPage
-          fetchRecords gitlab "merge requests" store mrsSince $ \since ->
-            mergeRequestsWithPage prj (mrFilters since) recordsPerPage
-
-          if optNotes opts
-            then do
-              fetchDiscussions gitlab "tickets" store (Proxy :: Proxy Issue) $
-                \iid -> issueNotes prj iid Nothing Nothing
-              fetchDiscussions gitlab "merge requests" store (Proxy :: Proxy MergeRequest) $
-                \iid -> mergeRequestNotes prj iid Nothing Nothing
-            else logInfo_ "Skipping discussions (--no-notes)"
+      case (optJobLog opts, optPipelines opts) of
+        (Just job, _) -> fetchJobLog gitlab store prj job
+        (Nothing, Just mr) -> fetchPipelines gitlab store prj mr
+        (Nothing, Nothing) -> fetchTicketsAndMrs gitlab store prj opts
 
     terminalLevel
       | optVerbose opts = LogTrace
@@ -482,6 +472,41 @@ fetchDiscussions gitlab what backend proxy fetch = do
           <> " written to "
           <> storeLocation backend
 
+-- | An ordinary run: Fetch any changed or missing MRs/Tickets.
+--
+-- We fetch anything that is new since the last `updated_at - 1s`.
+fetchTicketsAndMrs ::
+  forall s m.
+  (StoreBackend s, MonadLog m, MonadIO m) =>
+  (forall b. GitLab b -> m (Either GitLabError b)) ->
+  s ->
+  Project ->
+  Options ->
+  m ()
+fetchTicketsAndMrs gitlab backend prj opts = do
+  -- An explicit --since overrides where the store says to carry on from.
+  -- Nothing else can move the starting point back.
+  override <- liftIO $ traverse resolveNow (optSince opts)
+  storedTickets <- liftIO $ storeLatestUpdate backend (Proxy :: Proxy Issue)
+  storedMrs <- liftIO $ storeLatestUpdate backend (Proxy :: Proxy MergeRequest)
+  let ticketsSince = maybe (fetchSince storedTickets) Just override
+      mrsSince = maybe (fetchSince storedMrs) Just override
+  logSince "tickets" ticketsSince
+  logSince "merge requests" mrsSince
+
+  fetchRecords gitlab "tickets" backend ticketsSince $ \since ->
+    projectIssuesPage prj (issueFilters since) recordsPerPage
+  fetchRecords gitlab "merge requests" backend mrsSince $ \since ->
+    mergeRequestsWithPage prj (mrFilters since) recordsPerPage
+
+  if optNotes opts
+    then do
+      fetchDiscussions gitlab "tickets" backend (Proxy :: Proxy Issue) $
+        \iid -> issueNotes prj iid Nothing Nothing
+      fetchDiscussions gitlab "merge requests" backend (Proxy :: Proxy MergeRequest) $
+        \iid -> mergeRequestNotes prj iid Nothing Nothing
+    else logInfo_ "Skipping discussions (--no-notes)"
+
 -- | Fetch the pipelines of one merge request, and the jobs of each.
 --
 -- Never part of an ordinary run: a project the size of GHC runs a pipeline
@@ -549,6 +574,65 @@ fetchPipelines gitlab backend prj mr = do
 
     pipelineId :: Value -> Maybe Int
     pipelineId = Aeson.parseMaybe (Aeson.withObject "pipeline" (Aeson..: "id"))
+
+-- | Fetch the log of one job into the store, replacing any log held for it.
+-- It is stored cleaned, never as sent: see "FetchGitLab.JobLog".
+--
+-- Checks if the associated job is locally cached before fetching it's log.
+--
+-- Detects Anubis responses via orChallenge since those return HTTP200.
+fetchJobLog ::
+  forall s m.
+  (StoreBackend s, MonadLog m, MonadIO m) =>
+  (forall b. GitLab b -> m (Either GitLabError b)) ->
+  s ->
+  Project ->
+  -- | The job, by its GitLab id.
+  Int ->
+  m ()
+fetchJobLog gitlab backend prj job = do
+  known <- liftIO $ storeHasJob backend job
+  when (not known) $
+    abort
+      ( "Job "
+          <> tshow job
+          <> " is not in "
+          <> storeLocation backend
+          <> "; fetch its merge request with --pipelines first"
+      )
+  result <- gitlab (orChallenge (classify <$> gitlabGetByteStringResponse path []))
+  raw <- case result of
+    Left err -> abort ("Cannot fetch the log of job " <> tshow job <> ": " <> tshow err)
+    Right (Left response) ->
+      abort
+        ( "Cannot fetch the log of job "
+            <> tshow job
+            <> ": HTTP "
+            <> tshow (statusCode (responseStatus response))
+        )
+    Right (Right body) -> pure (BL.toStrict body)
+  -- Whatever the server sent that was not UTF-8 is a replacement character
+  -- after this, and no control character is left, so what is stored is text.
+  let body = stripControlChars (decodeUtf8Lenient raw)
+  liftIO $ storeWriteJobLog backend job body
+  logInfo_ $
+    "Log of job "
+      <> tshow job
+      <> " ("
+      <> tshow (T.count "\n" body)
+      <> " lines, "
+      <> tshow (BS.length raw)
+      <> " bytes as sent) written to "
+      <> storeLocation backend
+  where
+    path = "/projects/" <> tshow (project_id prj) <> "/jobs/" <> tshow job <> "/trace"
+
+    classify response
+      | Just _ <- challengeDetail status (responseBody response) = Left response
+      | statusIsSuccessful status = Right (responseBody response)
+      | otherwise = Left response
+      where
+        status = responseStatus response
 
 -- | Log a reason the run cannot go on, and stop.
 abort :: (MonadLog m, MonadIO m) => Text -> m a

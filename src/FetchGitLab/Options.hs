@@ -91,6 +91,8 @@ data Options = Options
     -- instead of fetching records at all. Pipelines are never fetched
     -- unasked: a project the size of GHC runs one per push, so following
     -- them for every merge request would dwarf the records themselves.
+  , optJobLog :: Maybe Int
+    -- ^ Fetch a job log by the jobs GitLab id. The job must already be cached.
   , optVerbose :: Bool
     -- ^ Log at trace level rather than info level.
   , optLogFile :: Maybe FilePath
@@ -163,19 +165,19 @@ optionsParser =
           )
       )
   where
-    build token url project backend db when_ (notes, pipelines) verbose logFile =
-      Options token url project backend db when_ notes pipelines verbose logFile
+    build token url project backend db when_ (notes, pipelines, jobLog) verbose logFile =
+      Options token url project backend db when_ notes pipelines jobLog verbose logFile
 
     text = T.pack <$> str
 
     since = eitherReader parseSince
 
     -- What a run fetches: records with or without their discussions, or -- an
-    -- entirely separate errand -- one merge request's pipelines. The pipelines
-    -- alternative comes first because the notes flag defaults to True and so
-    -- never fails to parse.
+    -- entirely separate errand -- one merge request's pipelines or one job's
+    -- log. Those alternatives come first because the notes flag defaults to
+    -- True and so never fails to parse.
     modeFlags =
-      (\mr -> (True, Just mr))
+      (\mr -> (True, Just mr, Nothing))
         <$> option
           auto
           ( long "pipelines"
@@ -186,7 +188,19 @@ optionsParser =
                     <> "ever fetched on request"
                 )
           )
-        <|> (\notes -> (notes, Nothing)) <$> notesFlag
+        <|> (\job -> (True, Nothing, Just job))
+          <$> option
+            auto
+            ( long "job-log"
+                <> metavar "JOB_ID"
+                <> help
+                  ( "Fetch the log of this one job, given by its GitLab id, instead "
+                      <> "of fetching records; stored without its terminal control "
+                      <> "characters. The job must be in the store already: fetch its "
+                      <> "merge request with --pipelines first"
+                  )
+            )
+        <|> (\notes -> (notes, Nothing, Nothing)) <$> notesFlag
 
     -- One request per ticket and merge request, so this is by far the
     -- expensive part of a cold run; --no-notes skips it.

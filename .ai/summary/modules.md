@@ -4,7 +4,8 @@
 | --- | --- | --- |
 | `Options` | parser, `Command`, `Options`, `Backend` | below |
 | `Since` | `--since` grammar and resolution | |
-| `Fetch` | `run`, records, discussions, pipelines, challenge wait | [fetch.md](fetch.md), [network.md](network.md) |
+| `Fetch` | `run` and its three branches, the expiry purge, challenge wait | [fetch.md](fetch.md), [network.md](network.md) |
+| `JobLog` | `stripControlChars`, pure; every log goes through it before it is stored | |
 | `ClearTimestamp` | `--clear-timestamp` | [fetch.md](fetch.md) |
 | `Store` | `Record`, `Entry`, `needsDiscussion` | [store.md](store.md) |
 | `Store.Class` | `StoreBackend` | [store.md](store.md) |
@@ -23,6 +24,9 @@ All under `FetchGitLab.`; `app/Main.hs` only dispatches.
   parser alternative: optparse-applicative backtracks only out of a branch
   that consumed nothing, so alternatives sharing `--db` parse
   order-sensitively. Cost: fetch-only flags are accepted and ignored.
+- `--pipelines`, `--job-log` and the notes flags are one alternative
+  (`modeFlags`), so two of them together is a parse error ("--job-log is
+  a mode of its own").
 
 ## Tests
 

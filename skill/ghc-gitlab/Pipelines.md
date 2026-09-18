@@ -2,7 +2,8 @@
 
 Pipelines are only ever fetched on request — a project the size of GHC runs
 one per push, so nothing fetches them unasked. **An MR with no rows in
-`pipelines` is an MR nobody fetched pipelines for, not an MR without CI.**
+`pipelines` is an MR nobody fetched pipelines for (or fetched them over a
+month ago — see "Expiry"), not an MR without CI.**
 
 ## Fetching an MR's pipelines
 
@@ -23,14 +24,14 @@ store lock: it will refuse to run beside a full fetch.
 
 `pipelines` is keyed by the project-unique `pipeline_id`; `kind`/`iid` name
 the MR it was fetched for (`kind` = `'mr'`, `iid` = the `!16366` number).
-Verbatim JSON in `rest` with the useful fields generated from it:
-`pipeline_iid`, `project_id`, `status`, `source`, `ref`, `sha`, `name`, `web_url`, `created_at`,
-`updated_at`.
+Real columns: `expire_at` (see "Expiry"). Verbatim JSON in `rest` with the
+useful fields generated from it: `pipeline_iid`, `project_id`, `status`,
+`source`, `ref`, `sha`, `name`, `web_url`, `created_at`, `updated_at`.
 
 `jobs` is keyed by an autoincrement `job_row` with the GitLab job id in
 `id` (UNIQUE). Real columns: `pipeline_id`, `status`, `stage`,
 `created_at`/`started_at`/`finished_at`/`erased_at`, `duration` and
-`queued_duration` (REAL, seconds). Generated from `rest`: `name`, `ref`,
+`queued_duration` (REAL, seconds), `expire_at`. Generated from `rest`: `name`, `ref`,
 `tag`, `allow_failure`, `coverage`, `failure_reason`, `archived`, `source`,
 `web_url`, `artifacts_expire_at`. Still inside `rest` as JSON:
 `runner_manager`, `artifacts`, `tag_list`, `project`.
@@ -76,22 +77,83 @@ Gotchas:
 
 ## Fetching a job's log
 
-The log ("trace") is not stored — fetch it from the API when needed, using
-the job's `id`:
+Logs are only fetched on request, one job at a time, by the job's `id`:
 
 ```
-curl -s -H "PRIVATE-TOKEN: $(cat ~/.fetch-gitlab/gitlab-token)" \
-  "https://gitlab.haskell.org/api/v4/projects/1/jobs/<job_id>/trace" -o job.log
+fetch-gitlab --job-log <job_id>
 ```
 
-`1` is `ghc/ghc`'s project id (`ghc%2Fghc` URL-encoded also works). The token
-is required — gitlab.haskell.org answers 401 without it, even for public
-jobs. Logs run to megabytes and carry ANSI colour plus CR-overwritten
-progress lines — clean before grepping:
+The job must already be in `jobs` (run `--pipelines <mr>` first); otherwise
+the run says so and downloads nothing. One request, typically megabytes. It
+writes, so it takes the store lock like `--pipelines`.
+
+`job_logs`: `log_id`, `job_id` (= `jobs.id`, UNIQUE), `expire_at`, `raw_log`
+(TEXT). One row per job; fetching again replaces it, which is how to update
+the log of a job that was still running. Refetching pipelines keeps logs;
+deleting a job deletes its log.
+
+The stored log is already clean — no ANSI colour, no `section_start` markers,
+no CR-overwritten progress lines — and its line numbers match GitLab's, so
+grep it directly:
 
 ```
-sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/.*\r//' job.log | grep -n -i error | tail
+sqlite3 ~/.fetch-gitlab/gitlab.db \
+  "SELECT raw_log FROM job_logs WHERE job_id = <job_id>" | grep -n -i error | tail
 ```
 
-The failing part is almost always at the end; GitLab truncates very long
-logs from the top, so the end is also all you may get.
+Which failed jobs of an MR have a log, and which still need fetching:
+
+```sql
+SELECT j.id, j.name, j.stage, l.job_id IS NOT NULL AS has_log,
+       length(l.raw_log) AS chars
+  FROM jobs j
+  JOIN pipelines p ON p.pipeline_id = j.pipeline_id
+  LEFT JOIN job_logs l ON l.job_id = j.id
+ WHERE p.kind = 'mr' AND p.iid = 16366 AND j.status = 'failed'
+ ORDER BY j.id DESC;
+```
+
+Gotchas:
+
+- The failing part is almost always at the end; GitLab truncates very long
+  logs from the top, so the end is also all you may get.
+- A log is megabytes: never `SELECT raw_log` into your context unfiltered.
+  Pipe it through `grep`/`tail`, or cut in SQL with `substr(raw_log, -4000)`.
+- The log as sent (colour codes and all) is not stored. It is almost never
+  what you want; if it is:
+  `curl -s -H "PRIVATE-TOKEN: $(cat ~/.fetch-gitlab/gitlab-token)"
+  "https://gitlab.haskell.org/api/v4/projects/1/jobs/<job_id>/trace"`
+  (`1` is `ghc/ghc`).
+
+## Expiry
+
+CI data is the one thing a store forgets. `pipelines`, `jobs` and `job_logs`
+all carry `expire_at`, a fixed-width UTC string (`2026-10-18T08:50:20Z`) that
+compares and sorts as text. Every write sets it a month ahead; the start of
+the next `fetch-gitlab` run deletes what has passed, with a line saying what
+went. Records and notes never expire.
+
+```sql
+-- what is left of an MR's CI, and for how long
+SELECT p.pipeline_id, p.expire_at, count(j.id) AS jobs,
+       sum(l.job_id IS NOT NULL) AS logs
+  FROM pipelines p
+  LEFT JOIN jobs j ON j.pipeline_id = p.pipeline_id
+  LEFT JOIN job_logs l ON l.job_id = j.id
+ WHERE p.kind = 'mr' AND p.iid = 16366
+ GROUP BY p.pipeline_id;
+```
+
+Gotchas:
+
+- **Missing is ambiguous**: never fetched and expired look identical. Either
+  way, refetch — `--pipelines <mr>` renews the whole MR, `--job-log <id>`
+  renews the log *and* every pipeline and job of its MR (a log dies with its
+  job, so it drags the unit along), never shortening a date already further
+  off.
+- A pipeline row survives while any job of it is unexpired, so you never see
+  a job without its pipeline — the other way round happens.
+- `commits` and `runners` lose the rows no job refers to any more; `users`
+  never expires.
+- The file does not shrink when rows go: the pages are reused, there is no
+  `VACUUM`.

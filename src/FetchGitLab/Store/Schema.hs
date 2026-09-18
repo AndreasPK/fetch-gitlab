@@ -59,7 +59,7 @@ module FetchGitLab.Store.Schema
 
 import Data.Text (Text)
 
-import FetchGitLab.Store.Schema.Pipeline (pipelineSchemaStatements)
+import FetchGitLab.Store.Schema.Pipeline (jobLogAndExpiryStatements, pipelineSchemaStatements)
 import FetchGitLab.Store.Schema.Views (viewStatements)
 import FetchGitLab.Store.Schema.Types
 
@@ -109,6 +109,12 @@ data SchemaPatch = SchemaPatch
 --   view is frozen in the store: changing one is a later patch that drops
 --   and recreates it, and a column a view mentions cannot be dropped until
 --   the view is.
+-- * 5. The @job_logs@ table with the trigger that deletes a log with its
+--   job, and @expire_at@ on @pipelines@ and @jobs@ with a retention period
+--   for the rows a store already holds ('jobLogAndExpiryStatements' in
+--   "FetchGitLab.Store.Schema.Pipeline"). Unguarded: @ADD COLUMN@ cannot be
+--   repeated, but the column is in neither the base schema nor patch 1, so
+--   every store runs this exactly once.
 --
 -- A patch that adds an index ends with @ANALYZE@. Without planner statistics
 -- SQLite rates an equality on the leading primary key column as cheap and
@@ -128,6 +134,7 @@ schemaPatches =
       (Just "SELECT 1 FROM pragma_table_info('records') WHERE name = 'has_discussion'")
   , SchemaPatch refStatements Nothing
   , SchemaPatch viewStatements Nothing
+  , SchemaPatch jobLogAndExpiryStatements Nothing
   ]
 
 -- | A row's own name in GitLab notation: @#123@ for a ticket, @!123@ for a

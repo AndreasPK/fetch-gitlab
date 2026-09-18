@@ -70,4 +70,4 @@ run to hundreds of notes with multi-KB bodies: when `notes` is large, list
 and notes, two terms near each other, thread index then one note, notes by
 one person, all-of-several labels, links with titles both ways, coverage
 and freshness, Trac import changes. `reassemble.sql` rebuilds a record as
-one JSON object. `Pipelines.md` covers CI status, job failures and logs.
+one JSON object. `Pipelines.md` covers CI status, job failures and fetching job logs.

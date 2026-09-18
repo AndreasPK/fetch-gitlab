@@ -54,16 +54,32 @@
 -- id instead, since a commit is immutable and its sha already is a globally
 -- unique id. @author_name@ and @author_email@ are real columns on commits;
 -- the object is otherwise verbatim in @json@.
+--
+-- == Job logs
+--
+-- We store one cleaned up log per job at most.
+--
+-- We cascade job deletions to their logs. Which is also why we UPSERT jobs. This
+-- avoids triggering the delete from the delete-and-insert combination.
+
+-- == Expiry
+--
+-- A pipeline, a job and a log each carry @expire_at@. Which causes us to clean
+-- those up to avoid storing megabytes of logs forever.
 module FetchGitLab.Store.Schema.Pipeline
   ( pipelineSchemaStatements
+  , jobLogAndExpiryStatements
+  , retentionInterval
+  , expirySql
+  , nowSql
   ) where
 
 import Data.Text (Text)
 
 -- | The pipeline and job tables, in an order that can be executed as given
--- (referenced tables first). Part of
--- 'FetchGitLab.Store.Schema.schemaStatements', appended after the main
--- tables because jobs reference the __users__ table created there.
+-- (referenced tables first). Schema patch 1 rather than part of
+-- 'FetchGitLab.Store.Schema.schemaStatements'; it runs after them, and jobs
+-- reference the __users__ table created there.
 pipelineSchemaStatements :: [Text]
 pipelineSchemaStatements =
   [ "CREATE TABLE IF NOT EXISTS pipelines (\
@@ -123,3 +139,55 @@ pipelineSchemaStatements =
   , "CREATE INDEX IF NOT EXISTS jobs_pipeline ON jobs (pipeline_id)"
   , "CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status)"
   ]
+
+-- | The job log table and the @expire_at@ column of all three CI tables,
+-- schema patch 5. Neither is part of the base schema: the table references
+-- __jobs__, and the column is added to tables patch 1 created.
+--
+-- Unguarded, and not repeatable: @ADD COLUMN@ cannot run twice. The column is
+-- in neither the base schema nor 'pipelineSchemaStatements', so every store —
+-- fresh or migrated — runs this exactly once, which is what patch 3 relies on
+-- too.
+--
+-- The @UPDATE@s give the rows a store already holds a retention period from
+-- the migration rather than none: @ADD COLUMN@ cannot be @NOT NULL@ without a
+-- constant default, and @expirySql@ is not constant, so the column arrives
+-- NULL on every existing row. NULL means "not expired" to the purge, so those
+-- rows would otherwise be kept forever.
+--
+-- No @ANALYZE@ and no index on @expire_at@: the only index here is the one
+-- @UNIQUE@ implies, every query of __job_logs__ is an equality on it, and the
+-- purge scans three small tables once per run.
+jobLogAndExpiryStatements :: [Text]
+jobLogAndExpiryStatements =
+  [ -- expire_at comes before raw_log on purpose. A log is megabytes and spills
+    -- into overflow pages, and SQLite reaches a column after it only by
+    -- walking that chain; the purge reads expire_at of every row, so putting
+    -- it first keeps the scan to the table's own pages.
+    "CREATE TABLE IF NOT EXISTS job_logs (\
+    \  log_id    INTEGER PRIMARY KEY,\
+    \  job_id    INTEGER NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,\
+    \  expire_at TEXT NOT NULL,\
+    \  raw_log   TEXT NOT NULL)"
+  , "CREATE TRIGGER IF NOT EXISTS jobs_delete_log AFTER DELETE ON jobs \
+    \ BEGIN DELETE FROM job_logs WHERE job_id = OLD.id; END"
+  , "ALTER TABLE pipelines ADD COLUMN expire_at TEXT"
+  , "ALTER TABLE jobs ADD COLUMN expire_at TEXT"
+  , "UPDATE pipelines SET expire_at = " <> expirySql <> " WHERE expire_at IS NULL"
+  , "UPDATE jobs SET expire_at = " <> expirySql <> " WHERE expire_at IS NULL"
+  ]
+
+-- | How long a pipeline, job or log is kept after being written.
+retentionInterval :: Text
+retentionInterval = "+1 month"
+
+-- | The @expire_at@ every write of a pipeline, job or log stores: now plus
+-- 'retentionInterval'.
+-- Done in SQL to ensure we alway compare time the same way.
+expirySql :: Text
+expirySql = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '" <> retentionInterval <> "')"
+
+-- | Now, in the same format as 'expirySql'. What an @expire_at@ is compared
+-- against to decide that a row has expired.
+nowSql :: Text
+nowSql = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"

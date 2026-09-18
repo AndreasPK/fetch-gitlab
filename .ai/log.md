@@ -277,3 +277,137 @@ tests.
 Files: `src/FetchGitLab/Store/Schema/Views.hs` (new),
 `src/FetchGitLab/Store/Schema.hs`, `fetch-gitlab.cabal`, `test/Main.hs`,
 `agent-summary.md`, `.ai/summary/Schema.md`. Plan: `tmp/skill-view-plan.md`.
+
+## 2026-09-18T08:30+00:00 — decision: job logs: how is a log tied to its job, and what is stored?
+
+**Decision.** `--job-log JOB_ID` stores one log per job in `job_logs (log_id,
+job_id UNIQUE REFERENCES jobs(id) ON DELETE CASCADE, raw_log TEXT)`, schema
+patch 5. The log is always stored with terminal control stripped
+(`FetchGitLab.JobLog.stripControlChars`); there is no option to keep it as
+sent. Three things follow from the foreign key:
+
+- `writeJob` changed from `INSERT OR REPLACE` to an upsert. Measured in
+  sqlite 3.46: a replace on `jobs` deletes the old row, the cascade fires,
+  and the log is gone — so every `--pipelines` refresh would have wiped the
+  logs of that merge request. The upsert also stops `job_row` changing on
+  every rewrite.
+- A trigger `jobs_delete_log` repeats the cascade. `foreign_keys` is per
+  connection and off by default in the `sqlite3` shell, which is where a job
+  is most likely to be deleted; nothing in the binary deletes one.
+- The job must be in the store before its log can be. `fetchJobLog` checks
+  first and aborts with the `--pipelines` hint rather than fetching the job
+  itself: a job object does not name the merge request its pipeline row
+  would have to be filed under.
+
+**Stripping.** Escape sequences (CSI, OSC, short forms), then per line only
+the text after the last carriage return, then remaining control characters
+except tab. Trailing CRs are dropped before the last-CR rule: the sed recipe
+the skill used to give (`s/.*\r//`) empties every CR LF line. Newlines are
+never touched, so line numbers match GitLab's.
+
+**Why only the cleaned log, and why TEXT.** Both variants were built and
+measured on job 2589581 (`ghc/ghc!16366`, a failed Windows job): 4.82 MB and
+54265 lines as sent, 25675 of them carrying control bytes; 4.79 MB cleaned,
+with none. A `--control-chars` flag that stored the bytes as sent was
+dropped, because the log as sent is not text. That one holds a NUL, and as
+`TEXT` every SQL string function stopped at it (`length()` gave 4818240 of
+4820695 bytes, the shell printed 38 lines fewer) although every byte was
+stored. As a `BLOB` that was fixed, but `LIKE` never matches a BLOB and
+every query needed a `CAST`, which is a trap laid for each reader to serve a
+variant almost nobody wants. Storing only the cleaned log makes the column
+honest `TEXT`: `grep`, `LIKE`, `instr` and `substr` just work. The log as
+sent is one request away at `/projects/:id/jobs/:job_id/trace`.
+
+**Not done.** No fetch time is recorded, so a log fetched while its job was
+running cannot be told from a final one except through the job's status.
+Cleaning in SQL (store raw, clean in a view) was started as a prototype and
+abandoned unfinished: stock SQLite has no regex replace and `instr` has no
+offset, so it would have been a split-into-lines-then-recurse construction,
+run on every read. Compression was considered and dropped: stock SQLite has
+no compressed tables (ZIPVFS is commercial, `sqlite-zstd` and `compress.c`
+are loadable extensions), and the skill reads the store with the plain
+shell, which could not read a compressed log back.
+
+**Files.** `JobLog.hs` (new), `Options.hs`, `Fetch.hs` (`fetchJobLog`),
+`Store/Class.hs`, `Store/Sqlite.hs`, `Store/Schema/Pipeline.hs`
+(`jobLogStatements`), `Store/Schema.hs`; the `oldStoreLosesHasDiscussion`
+fixture now really applies patch 1, which it only claimed before.
+
+## 2026-09-18T09:10+00:00 — decision: how long is CI data kept, and what is the unit of expiry?
+
+**Decision.** `pipelines`, `jobs` and `job_logs` carry `expire_at`; every
+write of a row sets it to now + one month, and the start of a fetching run
+removes what has passed (`storePurgeExpired`, `Purged`). The retention period,
+the expiry expression and "now" are SQL, defined once as `retentionInterval` /
+`expirySql` / `nowSql` in `Store.Schema.Pipeline`, in a fixed-width UTC format
+(`2026-10-18T08:50:20Z`) so a text comparison sorts. `encodeTime` is
+deliberately not reused: it trims the fraction and does not sort
+chronologically.
+
+**The unit of expiry is the merge request's pipeline set.** Fetching a job's
+log extends — never shortens — every pipeline of the `(kind, iid)` the job's
+pipeline belongs to, and every job of those pipelines. Two reasons. A log is
+deleted with its job (cascade plus `jobs_delete_log`), so a log fetched on day
+29 of its job's life would be gone on day 30 whatever its own date said.
+And renewing only the one job or the one pipeline would leave a merge request
+holding a partial set, which reads as "this merge request ran one pipeline"
+rather than as "the rest expired"; `--pipelines MR` is the unit a fetch works
+in, so it is the unit expiry works in.
+
+**One call site.** The purge runs in `Fetch.run` only, after the store is open
+and logged and before the token is read, so it is under the store lock, its
+result can be logged (info when something went, trace otherwise), and a reader
+opening the store deletes nothing. `--clear-timestamp` explicitly does not
+purge: it is the command a damaged store is repaired with.
+
+**Order and counting.** Logs, then jobs — which take their own logs by cascade
+and trigger — then the pipelines that have no job left: jobs reference
+pipelines with no `ON DELETE` action and the binary enforces foreign keys, so
+deleting a pipeline under a live job would fail the transaction. An expired
+pipeline with an unexpired job therefore stays, which is the safe direction.
+Counts are the difference of `count(*)` before and after, because `changes()`
+counts neither a cascade nor a trigger. Afterwards, and only if something
+went, `commits` and `runners` lose the rows no job refers to any more; `users`
+is never touched, being shared with the records and notes. The purge also
+drops the in-memory runner intern cache, whose row ids it may have deleted and
+which SQLite hands out again. No `VACUUM`: the pages are reused by what the
+store grows into next.
+
+**Schema: patch 5 was edited, not followed by a patch 6.** Patch 5 was
+uncommitted and no permanent store had run it — the real store was checked
+read-only and is at `schema_patch_version` 4 — so the whole unreleased feature
+set stays one patch rather than two. Patch 5 now creates `job_logs` with
+`expire_at TEXT NOT NULL`, creates the trigger, adds the column to `pipelines`
+and `jobs`, and dates the rows a store already holds. Consequences:
+
+- `expire_at` comes *before* `raw_log` in `job_logs`. A log is megabytes and
+  spills into overflow pages, and SQLite reaches a column behind it only by
+  walking that chain; the purge reads `expire_at` of every row.
+- The patch is no longer repeatable, like patch 3: `ADD COLUMN` runs once, and
+  the column is in neither the base schema nor patch 1 — which is why it must
+  not be added to `pipelineSchemaStatements`, or a fresh store would fail on a
+  duplicate column.
+- `ADD COLUMN` cannot be `NOT NULL` without a constant default and `expirySql`
+  is not constant, so on `pipelines` and `jobs` the column is nullable and
+  arrives NULL. NULL means "not expired" to the purge, never "delete", and the
+  two `UPDATE`s give the rows a store already holds a month from the migration
+  rather than leaving them immortal.
+
+**Verified.** 77 tests, eight of them new, moving time by rewriting
+`expire_at` through a raw connection rather than injecting a clock. Live
+against `ghc/ghc`: `--pipelines 16366` wrote 4 pipelines and 68 jobs at
+`2026-10-18T08:50:20Z`, `--job-log 2589581` wrote the log and pulled all 72
+of those rows up to its own second; with everything set to 2000 the next run
+logged `Removed expired: 4 pipelines, 68 jobs, 1 job log` and left
+`pipelines`, `jobs`, `job_logs`, `runners` and `commits` empty with `users`
+untouched, and a following `--pipelines 16366` refilled it.
+
+**Also done here.** The `(Nothing, Nothing)` branch of `run` is outlined as
+`fetchTicketsAndMrs`, so the dispatch is three one-line alternatives.
+
+**Files.** `Store/Schema/Pipeline.hs` (patch 5, the three SQL definitions),
+`Store/Schema.hs` (patch list haddock), `Store/Class.hs` (`storePurgeExpired`,
+`Purged`, `describePurged`), `Store/Sqlite.hs` (the writes, the purge,
+`ciCounts`), `Fetch.hs` (purge at startup, `fetchTicketsAndMrs`),
+`test/Main.hs`, `README.md`, `agent-summary.md`,
+`skill/ghc-gitlab/Pipelines.md`, `.ai/summary/{store,Schema,fetch,modules}.md`.

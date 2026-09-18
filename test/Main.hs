@@ -11,7 +11,7 @@ import Data.Aeson (FromJSON, Result (..), Value (..), eitherDecode, encode, from
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
 import Data.List (isInfixOf, nub, sort, sortOn)
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import qualified Data.Text as T
@@ -27,6 +27,7 @@ import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.Process (getCurrentPid, getPid, spawnProcess, waitForProcess)
 import System.IO.Temp (withSystemTempDirectory)
+import Options.Applicative (defaultPrefs, execParserPure, getParseResult)
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -42,7 +43,8 @@ import Log.Backend.StandardOutput (withStdOutLogger)
 
 import FetchGitLab.ClearTimestamp (clearTimestamps)
 import FetchGitLab.Fetch (challengeDetail, challengeWaits, readToken, waitOutChallenge)
-import FetchGitLab.Options (Backend (..), parseBackend)
+import FetchGitLab.JobLog (stripControlChars)
+import FetchGitLab.Options (Backend (..), Command (..), Options (..), commandParserInfo, parseBackend)
 import FetchGitLab.Store.Backend (StoreSpec (..), detectSpec)
 import FetchGitLab.Lock
   ( LockBusy (..)
@@ -59,14 +61,16 @@ import FetchGitLab.Store
   , Store
   , needsDiscussion
   )
-import FetchGitLab.Store.Class (StoreBackend (..))
+import FetchGitLab.Store.Class (Purged (..), StoreBackend (..))
 import FetchGitLab.Store.Schema
   ( Lifted (..)
   , noteSpec
   , recordSpec
+  , schemaStatements
   , spliceObject
   , splitObject
   )
+import FetchGitLab.Store.Schema.Pipeline (pipelineSchemaStatements)
 import FetchGitLab.Store.Sqlite
   ( SqliteStore
   , encodeTime
@@ -122,6 +126,27 @@ tests =
         , testCase "a discussion stamp is the one the plan gave, not the row's" stampIsThePlansNotTheRows
         , testCase "pipelines and jobs are written, their objects shared" pipelinesAreWritten
         , testCase "rewriting pipelines replaces rather than duplicates" pipelinesRewriteReplaces
+        , testCase "a job log is kept once, the newest write winning" jobLogIsReplaced
+        , testCase "a stored log is text: LIKE and length see all of it" jobLogIsSearchable
+        , testCase "only a job the store holds can be asked about" jobLogNeedsItsJob
+        , testCase "refreshing pipelines keeps a job's log" pipelinesRewriteKeepsJobLog
+        , testCase "deleting a job deletes its log, foreign keys enforced or not" deletingJobDeletesLog
+        , testCase "a fetched pipeline, its jobs and its log are kept for a month" fetchedRowsExpireAMonthOn
+        , testCase "what has expired is removed and the rest kept" purgeRemovesWhatExpired
+        , testCase "an expired pipeline with a live job is kept whole" purgeKeepsPipelineWithLiveJob
+        , testCase "refetching pipelines renews their expiry" refetchRenewsExpiry
+        , testCase "fetching a log extends its whole merge request" jobLogExtendsMergeRequest
+        , testCase "an expiry further off than a log's is left alone" jobLogNeverShortensExpiry
+        , testCase "purging a store with nothing expired removes nothing" purgeOfFreshStoreDoesNothing
+        ]
+    , testGroup
+        "job log"
+        [ testCase "colour and section markers are stripped" jobLogLosesEscapes
+        , testCase "a rewritten line keeps what was written last" jobLogKeepsLastWrite
+        , testCase "a line ending in CR LF keeps its text" jobLogKeepsCrLfLines
+        , testCase "line numbers survive stripping" jobLogKeepsLineCount
+        , testCase "a sequence cut short does not swallow the log" jobLogSurvivesBrokenSequence
+        , testCase "--job-log is a mode of its own" jobLogFlagParses
         ]
     , testGroup
         "clear-timestamp"
@@ -134,6 +159,7 @@ tests =
         [ testCase "splitting and splicing are inverse" splitSpliceRoundtrips
         , testCase "an absent field is not invented" splitKeepsAbsence
         , testCase "a store at the old schema loses has_discussion" oldStoreLosesHasDiscussion
+        , testCase "a store at patch 1 gains expire_at on what it holds" oldStoreGainsExpiry
         , testCase "ref names the row in GitLab notation" refNamesTheRow
         , testCase "the views answer the common questions" viewsAnswerCommonQuestions
         , testCase "--backend is parsed" backendFlagParses
@@ -536,6 +562,8 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
     \PRIMARY KEY (kind, iid, position))"
   SQL.execute_ raw "CREATE INDEX notes_id ON notes (note_id)"
   SQL.execute_ raw "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+  -- Patch 1 for real, not only the claim: later patches build on its tables.
+  mapM_ (SQL.execute_ raw . SQL.Query) pipelineSchemaStatements
   SQL.execute_ raw "INSERT INTO meta VALUES ('schema_version', '1'), ('schema_patch_version', '1')"
   SQL.execute
     raw
@@ -587,6 +615,44 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
     SQL.close raw'
     pure n
   assertEqual "patch 4 added the seven views" [SQL.Only 7] views
+
+-- | A store written before pipelines could expire gains the column when it is
+-- opened, and the rows it already holds are given a month from the migration
+-- rather than left with no date at all — which the purge reads as "keep
+-- forever".
+--
+-- The fixture is a store really at patch 1: the base statements plus
+-- 'pipelineSchemaStatements', as 'oldStoreLosesHasDiscussion' does, since
+-- patch 5 alters the tables patch 1 creates.
+oldStoreGainsExpiry :: Assertion
+oldStoreGainsExpiry = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  raw <- SQL.open path
+  mapM_ (SQL.execute_ raw . SQL.Query) schemaStatements
+  mapM_ (SQL.execute_ raw . SQL.Query) pipelineSchemaStatements
+  SQL.execute_ raw "INSERT INTO meta VALUES ('schema_version', '1'), ('schema_patch_version', '1')"
+  SQL.execute_
+    raw
+    "INSERT INTO pipelines (pipeline_id, kind, iid, rest) \
+    \ VALUES (101, 'mr', 16366, '{\"id\":101}')"
+  SQL.execute_
+    raw
+    "INSERT INTO jobs (id, pipeline_id, status, stage, created_at, rest) \
+    \ VALUES (9001, 101, 'failed', 'full-build', '2026-07-18T09:20:50.200Z', '{\"id\":9001}')"
+  SQL.close raw
+
+  -- Opening is what migrates; nothing else is asked of the store.
+  withSqliteStore path (const (pure ()))
+
+  forM_ ["pipelines", "jobs"] $ \table -> do
+    (rows, monthOff) <- expiryAMonthOff path table
+    assertEqual (T.unpack table <> ": the row survived") 1 rows
+    assertEqual (T.unpack table <> ": and was given a month") 1 monthOff
+
+  -- The purge must find nothing: a store being migrated does not lose its CI
+  -- data on the first run after the upgrade.
+  purged <- withSqliteStore path storePurgeExpired
+  purged @?= Purged {purgedPipelines = 0, purgedJobs = 0, purgedJobLogs = 0}
 
 -- | @ref@ is the row's own name in GitLab notation, on records and on notes,
 -- and a query by it is indexed: what schema patch 3 promises a reader.
@@ -1105,6 +1171,309 @@ pipelinesRewriteReplaces = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
     storeWritePipelines db "mr" 16366 pipelineFixture
     after <- sqliteTableCounts db
     assertEqual "a rewrite changes no table" before after
+
+-- | A job has one log. Fetching it again -- a job that was still running, or
+-- the same log with its control characters kept this time -- replaces it.
+jobLogIsReplaced :: Assertion
+jobLogIsReplaced = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 "first"
+    storeWriteJobLog db 9002 "second"
+    storeWriteJobLog db 9003 "another job"
+  jobLogs path >>= (@?= [(9002, "second"), (9003, "another job")])
+
+-- | The column is TEXT so that a log can be searched where it lies. That
+-- holds only because a log is stored cleaned: SQL reads a text value as far
+-- as its first NUL and no further, and a log as sent can contain one.
+jobLogIsSearchable :: Assertion
+jobLogIsSearchable = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+      sent = "\ESC[31mcompiling\ESC[0m\NUL\nerror: it br\246ke\n"
+      stored = stripControlChars sent
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 stored
+  raw <- SQL.open path
+  seen <-
+    SQL.query_
+      raw
+      "SELECT typeof(raw_log), length(raw_log), raw_log LIKE '%error: it br_ke%' FROM job_logs"
+  SQL.close raw
+  seen @?= [("text" :: T.Text, T.length stored, True)]
+
+-- | What lets a run turn a job down before downloading its log.
+jobLogNeedsItsJob :: Assertion
+jobLogNeedsItsJob = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
+  withSqliteStore (dir </> "gitlab.db") $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeHasJob db 9002 >>= assertBool "a fetched job is known"
+    storeHasJob db 4242 >>= assertBool "a job never fetched is not" . not
+
+-- | Refreshing a merge request's pipelines is routine and must not cost the
+-- logs. It did while a job was written with INSERT OR REPLACE, which deletes
+-- the row it replaces and so set off the cascade.
+pipelinesRewriteKeepsJobLog :: Assertion
+pipelinesRewriteKeepsJobLog = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 "the log"
+    storeWritePipelines db "mr" 16366 pipelineFixture
+  jobLogs path >>= (@?= [(9002, "the log")])
+
+-- | A log does not outlive its job. The likeliest delete is one typed into the
+-- sqlite3 shell, which does not enforce foreign keys unless asked to, so this
+-- deletes through a connection that enforces them and through one that does
+-- not.
+deletingJobDeletesLog :: Assertion
+deletingJobDeletesLog = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 "goes with foreign keys off"
+    storeWriteJobLog db 9003 "goes with foreign keys on"
+  deleteJob path False 9002
+  jobLogs path >>= (@?= [(9003, "goes with foreign keys on")])
+  deleteJob path True 9003
+  jobLogs path >>= (@?= [])
+  where
+    deleteJob :: FilePath -> Bool -> Int -> IO ()
+    deleteJob path enforce job = do
+      raw <- SQL.open path
+      SQL.execute_ raw (if enforce then "PRAGMA foreign_keys = ON" else "PRAGMA foreign_keys = OFF")
+      SQL.execute raw "DELETE FROM jobs WHERE id = ?" (SQL.Only job)
+      SQL.close raw
+
+-- | What a fetch promises about retention: every row it wrote is kept for a
+-- month from now, and says so in the one fixed-width UTC format the purge
+-- compares as text.
+fetchedRowsExpireAMonthOn :: Assertion
+fetchedRowsExpireAMonthOn = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 "the log"
+  forM_ ["pipelines", "jobs", "job_logs"] $ \table -> do
+    (rows, monthOff) <- expiryAMonthOff path table
+    assertBool (T.unpack table <> " holds rows to check") (rows > 0)
+    assertEqual (T.unpack table <> ": every expiry is a month on") rows monthOff
+
+-- | A month later, what was fetched then is gone and what was fetched since
+-- is not — and the commit and runner rows only the removed jobs referred to
+-- go with them, while the ones a surviving job still needs stay.
+purgeRemovesWhatExpired :: Assertion
+purgeRemovesWhatExpired = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 "goes with its job"
+    storeWriteJobLog db 9003 "stays"
+  -- Pipeline 101 and the two jobs it ran are a month old; pipeline 102, its
+  -- job 9003 and both logs were written just now.
+  setExpiry path "pipelines" past "pipeline_id = 101"
+  setExpiry path "jobs" past "pipeline_id = 101"
+
+  purged <- withSqliteStore path storePurgeExpired
+  -- The log of job 9002 was not expired: it went with its job, which is what
+  -- makes counting rows the only honest way to report a purge.
+  purged @?= Purged {purgedPipelines = 1, purgedJobs = 2, purgedJobLogs = 1}
+
+  raw <- SQL.open path
+  left <- SQL.query_ raw "SELECT pipeline_id FROM pipelines" :: IO [SQL.Only Int]
+  assertEqual "the fresh pipeline is left" [SQL.Only 102] left
+  jobsLeft <- SQL.query_ raw "SELECT id FROM jobs" :: IO [SQL.Only Int]
+  assertEqual "and its job" [SQL.Only 9003] jobsLeft
+  runners <-
+    SQL.query_ raw "SELECT json_extract(json, '$.status') FROM runners" :: IO [SQL.Only T.Text]
+  assertEqual
+    "the runner state only the removed jobs saw is gone"
+    [SQL.Only "busy"]
+    runners
+  commits <- SQL.query_ raw "SELECT count(*) FROM commits" :: IO [SQL.Only Int]
+  assertEqual "the commit job 9003 still names is kept" [SQL.Only 1] commits
+  SQL.close raw
+  jobLogs path >>= (@?= [(9003, "stays")])
+
+-- | A pipeline is only removed once nothing is left to hang off it. Jobs
+-- reference it with no ON DELETE action and this connection enforces foreign
+-- keys, so a purge that took the pipeline while a job of it was still current
+-- would fail — and take the whole transaction with it.
+purgeKeepsPipelineWithLiveJob :: Assertion
+purgeKeepsPipelineWithLiveJob = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> storeWritePipelines db "mr" 16366 pipelineFixture
+  setExpiry path "pipelines" past "pipeline_id = 101"
+  setExpiry path "jobs" past "id = 9001"
+
+  purged <- withSqliteStore path storePurgeExpired
+  purged @?= Purged {purgedPipelines = 0, purgedJobs = 1, purgedJobLogs = 0}
+
+  raw <- SQL.open path
+  left <- SQL.query_ raw "SELECT pipeline_id FROM pipelines ORDER BY pipeline_id" :: IO [SQL.Only Int]
+  assertEqual "both pipelines are still there" [SQL.Only 101, SQL.Only 102] left
+  jobsLeft <- SQL.query_ raw "SELECT id FROM jobs ORDER BY id" :: IO [SQL.Only Int]
+  assertEqual "only the expired job went" [SQL.Only 9002, SQL.Only 9003] jobsLeft
+  SQL.close raw
+
+-- | Fetching a merge request's pipelines again keeps them for another month
+-- from that fetch, rather than from the first one, and the logs of its jobs
+-- are still there afterwards.
+refetchRenewsExpiry :: Assertion
+refetchRenewsExpiry = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> do
+    storeWritePipelines db "mr" 16366 pipelineFixture
+    storeWriteJobLog db 9002 "the log"
+  setExpiry path "pipelines" past "1"
+  setExpiry path "jobs" past "1"
+  withSqliteStore path $ \db -> storeWritePipelines db "mr" 16366 pipelineFixture
+
+  purged <- withSqliteStore path storePurgeExpired
+  purged @?= Purged {purgedPipelines = 0, purgedJobs = 0, purgedJobLogs = 0}
+  jobLogs path >>= (@?= [(9002, "the log")])
+
+-- | A log is deleted with its job, so a log fetched on the last day of its
+-- job's month would be gone the next morning. Fetching one therefore keeps
+-- the whole unit a fetch works in — every pipeline of the merge request and
+-- every job of those pipelines — for as long as the log itself.
+jobLogExtendsMergeRequest :: Assertion
+jobLogExtendsMergeRequest = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> storeWritePipelines db "mr" 16366 pipelineFixture
+  setExpiry path "pipelines" past "1"
+  setExpiry path "jobs" past "1"
+  -- One log, on one job of one of the two pipelines.
+  withSqliteStore path $ \db -> storeWriteJobLog db 9003 "the log"
+
+  purged <- withSqliteStore path storePurgeExpired
+  purged @?= Purged {purgedPipelines = 0, purgedJobs = 0, purgedJobLogs = 0}
+  forM_ ["pipelines", "jobs", "job_logs"] $ \table -> do
+    (rows, monthOff) <- expiryAMonthOff path table
+    assertEqual (T.unpack table <> ": the whole merge request was renewed") rows monthOff
+
+-- | The renewal extends, it does not reset: a pipeline or job somebody has
+-- given a later date keeps it.
+jobLogNeverShortensExpiry :: Assertion
+jobLogNeverShortensExpiry = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  let path = dir </> "gitlab.db"
+  withSqliteStore path $ \db -> storeWritePipelines db "mr" 16366 pipelineFixture
+  setExpiry path "pipelines" farFuture "pipeline_id = 101"
+  setExpiry path "jobs" farFuture "id = 9001"
+  withSqliteStore path $ \db -> storeWriteJobLog db 9003 "the log"
+
+  raw <- SQL.open path
+  kept <-
+    SQL.query_
+      raw
+      "SELECT expire_at FROM pipelines WHERE pipeline_id = 101 \
+      \ UNION ALL SELECT expire_at FROM jobs WHERE id = 9001" ::
+      IO [SQL.Only T.Text]
+  SQL.close raw
+  assertEqual "a later date is left alone" [SQL.Only farFuture, SQL.Only farFuture] kept
+
+-- | Nothing to remove is the ordinary case, and it is not an error: a fresh
+-- store is purged too, since every command begins with one.
+purgeOfFreshStoreDoesNothing :: Assertion
+purgeOfFreshStoreDoesNothing = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+  purged <- withSqliteStore (dir </> "gitlab.db") storePurgeExpired
+  purged @?= Purged {purgedPipelines = 0, purgedJobs = 0, purgedJobLogs = 0}
+
+-- | A date far enough in the past to have expired, written straight into the
+-- column: there is no clock to move, so the tests move the rows instead.
+past :: T.Text
+past = "2000-01-01T00:00:00Z"
+
+-- | And one nothing this century will reach.
+farFuture :: T.Text
+farFuture = "2099-01-01T00:00:00Z"
+
+-- | Set @expire_at@ on the rows of a table a condition picks out, through a
+-- raw connection. The table, the date and the condition are all literals of
+-- this module.
+setExpiry :: FilePath -> T.Text -> T.Text -> T.Text -> IO ()
+setExpiry path table date whose = do
+  raw <- SQL.open path
+  SQL.execute_
+    raw
+    (SQL.Query ("UPDATE " <> table <> " SET expire_at = '" <> date <> "' WHERE " <> whose))
+  SQL.close raw
+
+-- | How many rows a table holds, and how many of them carry an @expire_at@
+-- that is in the fixed format the purge compares as text and between 27 and
+-- 32 days off — "a month on", whichever month it is.
+expiryAMonthOff :: FilePath -> T.Text -> IO (Int, Int)
+expiryAMonthOff path table = do
+  raw <- SQL.open path
+  rows <-
+    SQL.query_
+      raw
+      ( SQL.Query
+          ( "SELECT count(*), \
+            \ sum(expire_at GLOB '????-??-??T??:??:??Z' \
+            \     AND julianday(expire_at) - julianday('now') BETWEEN 27 AND 32) \
+            \ FROM " <> table
+          )
+      ) ::
+      IO [(Int, Maybe Int)]
+  SQL.close raw
+  pure (case rows of (n, ok) : _ -> (n, fromMaybe 0 ok); [] -> (0, 0))
+
+-- | The logs a store holds, by job, read the way a user would.
+jobLogs :: FilePath -> IO [(Int, T.Text)]
+jobLogs path = do
+  raw <- SQL.open path
+  rows <- SQL.query_ raw "SELECT job_id, raw_log FROM job_logs ORDER BY job_id"
+  SQL.close raw
+  pure rows
+
+-- | The first lines of a real trace: colour, and a section marker hidden
+-- behind a carriage return and an erase-line.
+jobLogLosesEscapes :: Assertion
+jobLogLosesEscapes =
+  stripControlChars
+    "\ESC[0KRunning with gitlab-runner 17.0\ESC[0;m\n\
+    \\ESC[0Ksection_start:1700000000:prepare_executor\r\ESC[0K\ESC[0K\ESC[36;1mPreparing the executor\ESC[0;m\ESC[0;m\n\
+    \\ESC]0;window title\BELplain\ESC(B text\n"
+    @?= "Running with gitlab-runner 17.0\nPreparing the executor\nplain text\n"
+
+jobLogKeepsLastWrite :: Assertion
+jobLogKeepsLastWrite =
+  stripControlChars "[ 1 of 9] Foo\r[ 2 of 9] Bar\r[ 9 of 9] Baz\ndone\n"
+    @?= "[ 9 of 9] Baz\ndone\n"
+
+-- | The sed recipe this replaces, @s/.*\\r//@, emptied every such line.
+jobLogKeepsCrLfLines :: Assertion
+jobLogKeepsCrLfLines =
+  stripControlChars "error: it broke\r\nnext\r\r\n" @?= "error: it broke\nnext\n"
+
+-- | So that a line number found in the stored log is one in GitLab's view.
+jobLogKeepsLineCount :: Assertion
+jobLogKeepsLineCount = do
+  let raw = "a\n\ESC[0K\n\rb\n\n\tc\BEL\n"
+  stripControlChars raw @?= "a\n\nb\n\n\tc\n"
+  length (T.lines (stripControlChars raw)) @?= length (T.lines raw)
+
+jobLogSurvivesBrokenSequence :: Assertion
+jobLogSurvivesBrokenSequence = do
+  stripControlChars "\ESC[31\nkept\n" @?= "\nkept\n"
+  stripControlChars "\ESC]0;never closed\nkept\n" @?= "\nkept\n"
+  stripControlChars "kept\ESC" @?= "kept"
+
+-- | One errand per run: a job log is asked for instead of records or
+-- pipelines, not alongside them.
+jobLogFlagParses :: Assertion
+jobLogFlagParses = do
+  parsed ["--job-log", "123"] @?= Just (Just 123)
+  parsed ["--db", "x.db", "--job-log", "123", "-v"] @?= Just (Just 123)
+  parsed [] @?= Just Nothing
+  parsed ["--job-log", "123", "--pipelines", "5"] @?= Nothing
+  parsed ["--job-log", "123", "--no-notes"] @?= Nothing
+  where
+    parsed args = case getParseResult (execParserPure defaultPrefs commandParserInfo args) of
+      Just (Fetch opts) -> Just (optJobLog opts)
+      _ -> Nothing
 
 -- | The point of the command: a store that thinks its discussions are current
 -- has to stop thinking so.

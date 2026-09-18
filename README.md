@@ -13,9 +13,20 @@ You can query the db manually but it works best with scripts/agents.
 ## Full options
 
 ```
+# Caching MRs/Tickets
 fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE]
-             [--since WHEN] [--notes | --no-notes] [-v|--verbose] [--log FILE]
+             [--since WHEN] [--notes | --no-notes]
+             [-v|--verbose] [--log FILE]
+
+# Fetching a mrs pipelines and jobs
+fetch-gitlab --pipelines MR [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
+             [--backend sqlite] [--db FILE] [-v|--verbose] [--log FILE]
+
+# Fetch a jobs log:
+fetch-gitlab --job-log JOB_ID
+             [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
+             [--backend sqlite] [--db FILE] [-v|--verbose] [--log FILE]
 
 fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
 ```
@@ -126,6 +137,33 @@ INFO Fetched 6 tickets (5 new or changed, 1 already current), store now holds 26
 INFO Discussions for tickets: 26254 already current, requesting 5
 INFO All 16539 merge requests discussions are up to date, requesting none
 ```
+
+## Pipelines and job logs
+
+Neither is fetched unless asked for; GHC runs a pipeline per push.
+
+```
+fetch-gitlab --pipelines 16366     # the MR's pipelines and their jobs
+fetch-gitlab --job-log 2589581     # one job's log, into the job_logs table
+sqlite3 ~/.fetch-gitlab/gitlab.db \
+  "SELECT raw_log FROM job_logs WHERE job_id = 2589581" | grep -n -i error | tail
+```
+
+`--job-log` takes the job's GitLab id (`jobs.id`, the number in its URL), and
+the job must already be in the store, so run `--pipelines` for its merge
+request first. Running either again replaces what was stored; refreshing
+pipelines keeps the logs, deleting a job deletes its log.
+
+Colour codes, section markers and carriage-return progress rewrites are
+stripped before the log is stored, so `grep` and `LIKE` work on it; line
+numbers still match GitLab's. The log as sent is not kept: it is at
+`/api/v4/projects/:id/jobs/:job_id/trace`.
+
+Pipelines, jobs and logs are kept for a month from when they were last
+fetched, and a run removes what has run out before it fetches anything — CI
+data is bulky and the store is there for the records. Fetching a log keeps its
+merge request's pipelines and jobs for as long, since a log goes when its job
+does. Fetching again is all it takes to get something back.
 
 ## Disk space
 

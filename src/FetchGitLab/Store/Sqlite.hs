@@ -70,8 +70,9 @@ import Database.SQLite.Simple
 import GitLab.Types (Note)
 
 import FetchGitLab.Store (Entry (..), Record (..), Store)
-import FetchGitLab.Store.Class (StoreBackend (..))
+import FetchGitLab.Store.Class (Purged (..), StoreBackend (..))
 import FetchGitLab.Store.Schema
+import FetchGitLab.Store.Schema.Pipeline (expirySql, nowSql)
 
 -- | An open database, plus the memo tables that keep interning cheap.
 data SqliteStore = SqliteStore
@@ -221,10 +222,7 @@ sqliteTimestampTexts st =
 -- | How many rows each table holds. Says whether the sharing the schema is
 -- built around is actually happening.
 sqliteTableCounts :: SqliteStore -> IO [(Text, Int)]
-sqliteTableCounts st =
-  forM tables $ \t -> do
-    rows <- query_ (sqliteConn st) (Query ("SELECT count(*) FROM " <> t))
-    pure (t, case rows of (Only n : _) -> n; [] -> 0)
+sqliteTableCounts st = tableCounts st tables
   where
     tables =
       [ "records"
@@ -238,7 +236,22 @@ sqliteTableCounts st =
       , "jobs"
       , "runners"
       , "commits"
+      , "job_logs"
       ]
+
+-- | The row counts of the three tables a purge removes from, which is how a
+-- purge is counted: @changes()@ sees neither the rows a cascade took nor the
+-- ones a trigger did.
+ciCounts :: SqliteStore -> IO [(Text, Int)]
+ciCounts st = tableCounts st ["pipelines", "jobs", "job_logs"]
+
+-- | @count(*)@ of each table named. The names are literals in this module, so
+-- there is nothing for a caller to smuggle into the statement.
+tableCounts :: SqliteStore -> [Text] -> IO [(Text, Int)]
+tableCounts st =
+  traverse $ \t -> do
+    rows <- query_ (sqliteConn st) (Query ("SELECT count(*) FROM " <> t))
+    pure (t, case rows of (Only n : _) -> n; [] -> 0)
 
 instance StoreBackend SqliteStore where
   storeName _ = "sqlite"
@@ -350,6 +363,125 @@ instance StoreBackend SqliteStore where
     withImmediateTransaction (sqliteConn st) $
       forM_ pairs $ \(p, jobs) -> writePipeline st kind iid p jobs
 
+  storeHasJob :: SqliteStore -> Int -> IO Bool
+  storeHasJob st jid = do
+    rows <- query (sqliteConn st) "SELECT 1 FROM jobs WHERE id = ?" (Only jid)
+    pure (not (null (rows :: [Only Int])))
+
+  storeWriteJobLog :: SqliteStore -> Int -> Text -> IO ()
+  storeWriteJobLog st jid body =
+    withImmediateTransaction conn $ do
+      execute
+        conn
+        ( Query
+            ( "INSERT INTO job_logs (job_id, expire_at, raw_log) VALUES (?, "
+                <> expirySql
+                <> ", ?) \
+                   \ ON CONFLICT (job_id) DO UPDATE SET \
+                   \   raw_log = excluded.raw_log, expire_at = excluded.expire_at"
+            )
+        )
+        (jid, body)
+      -- The log's expiry has to carry the merge request it hangs off with it,
+      -- and the whole of it.
+      --
+      -- A log is deleted with its job, by cascade and by trigger, so a log
+      -- fetched on day 29 of its job's life would be gone on day 30 however
+      -- long its own expiry said. And renewing only the one job, or only its
+      -- pipeline, would leave the merge request holding a partial set of
+      -- pipelines and jobs, which reads as "this merge request ran one
+      -- pipeline" rather than as "the rest expired". @--pipelines MR@ is the
+      -- unit a fetch works in, so it is the unit expiry works in too.
+      --
+      -- Extend, never shorten: a row already expiring later than the log keeps
+      -- its date. The fixed-width format of 'expirySql' is what lets that be a
+      -- text comparison; a NULL is treated as the earliest date there is,
+      -- since NULL means the purge will not remove the row but says nothing
+      -- about when it should.
+      owner <-
+        query
+          conn
+          "SELECT p.kind, p.iid FROM jobs j \
+          \ JOIN pipelines p ON p.pipeline_id = j.pipeline_id \
+          \ WHERE j.id = ?"
+          (Only jid) ::
+          IO [(Text, Int)]
+      forM_ owner $ \(kind, iid) -> do
+        execute
+          conn
+          ( Query
+              ( "UPDATE pipelines SET expire_at = " <> expirySql <> " \
+                \ WHERE kind = ? AND iid = ? \
+                \   AND (expire_at IS NULL OR expire_at < " <> expirySql <> ")"
+              )
+          )
+          (kind, iid)
+        execute
+          conn
+          ( Query
+              ( "UPDATE jobs SET expire_at = " <> expirySql <> " \
+                \ WHERE pipeline_id IN (SELECT pipeline_id FROM pipelines WHERE kind = ? AND iid = ?) \
+                \   AND (expire_at IS NULL OR expire_at < " <> expirySql <> ")"
+              )
+          )
+          (kind, iid)
+    where
+      conn = sqliteConn st
+
+  storePurgeExpired :: SqliteStore -> IO Purged
+  storePurgeExpired st = withImmediateTransaction conn $ do
+    before <- ciCounts st
+    -- Logs first, then jobs — which take their own logs with them by cascade
+    -- and by trigger — then the pipelines that have no job left. A pipeline
+    -- that still has jobs is kept whatever its own date says: jobs reference
+    -- pipelines with no ON DELETE action and this connection enforces foreign
+    -- keys, so deleting it would fail the whole transaction.
+    execute_ conn (Query ("DELETE FROM job_logs WHERE expire_at <= " <> nowSql))
+    execute_ conn (Query ("DELETE FROM jobs WHERE expire_at IS NOT NULL AND expire_at <= " <> nowSql))
+    execute_
+      conn
+      ( Query
+          ( "DELETE FROM pipelines \
+            \ WHERE expire_at IS NOT NULL AND expire_at <= " <> nowSql <> " \
+            \   AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.pipeline_id = pipelines.pipeline_id)"
+          )
+      )
+    after <- ciCounts st
+    let purged =
+          Purged
+            { purgedPipelines = countOf "pipelines" before - countOf "pipelines" after
+            , purgedJobs = countOf "jobs" before - countOf "jobs" after
+            , purgedJobLogs = countOf "job_logs" before - countOf "job_logs" after
+            }
+    -- Commits and runners are referenced from jobs and from nowhere else, so
+    -- a job going can leave one unreferenced. Users are shared with the
+    -- records and the notes and are never touched here.
+    --
+    -- Only when something went: these are two scans of the jobs table that a
+    -- run which purged nothing has no reason to pay for.
+    when (purged /= Purged 0 0 0) $ do
+      execute_
+        conn
+        "DELETE FROM commits \
+        \ WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.commit_id = commits.commit_id)"
+      execute_
+        conn
+        "DELETE FROM runners \
+        \ WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.runner_row = runners.row_id)"
+      -- The interning cache maps a runner's JSON to a row that may be one of
+      -- those just deleted, and SQLite hands a deleted row's id out again.
+      -- Dropping the cache costs one query per runner the rest of the command
+      -- writes, and a purge happens once per run.
+      atomicModifyIORef' (sqliteRunners st) (const (Map.empty, ()))
+    -- No VACUUM: the pages this frees are reused by whatever the store grows
+    -- into next, and rewriting a gigabyte to hand a few megabytes back to the
+    -- filesystem is not a thing to do at every startup.
+    pure purged
+    where
+      conn = sqliteConn st
+
+      countOf t counts = fromMaybe 0 (lookup t counts)
+
 -- ---------------------------------------------------------------------------
 -- Writing
 -- ---------------------------------------------------------------------------
@@ -436,16 +568,28 @@ writeNote st kind iid position note = do
 --
 -- The pipeline object is kept verbatim: the MR pipelines endpoint returns the
 -- basic pipeline object with nothing shared in it worth lifting.
+--
+-- @expire_at@ is set from scratch rather than kept, so fetching a merge
+-- request's pipelines again is what keeps them: a pipeline is held for
+-- 'retentionInterval' from the last time it was seen, not from the first.
 writePipeline :: SqliteStore -> Text -> Int -> Value -> [Value] -> IO ()
 writePipeline st kind iid p jobs = do
   pid <- require "pipeline id" (fieldOf "id" p :: Maybe Int)
   execute
     (sqliteConn st)
-    "INSERT OR REPLACE INTO pipelines (pipeline_id, kind, iid, rest) VALUES (?, ?, ?, ?)"
+    ( Query
+        ( "INSERT OR REPLACE INTO pipelines (pipeline_id, kind, iid, rest, expire_at) \
+          \ VALUES (?, ?, ?, ?, " <> expirySql <> ")"
+        )
+    )
     (pid, kind, iid, encodeText p)
   forM_ jobs (writeJob st pid)
 
 -- | Write one job of a pipeline.
+--
+-- An upsert, not @INSERT OR REPLACE@: a replace deletes the row it replaces,
+-- and deleting a job deletes its log (see "FetchGitLab.Store.Schema.Pipeline").
+-- It also keeps @job_row@ the same across rewrites.
 --
 -- Four objects leave the job before it is stored: its @user@ and @runner@ are
 -- interned, its @commit@ is written to the commits table, and its nested
@@ -458,6 +602,10 @@ writePipeline st kind iid p jobs = do
 -- The scalars a job is queried by are copied into real columns; @rest@ keeps
 -- them too, so it stays the object the server sent minus exactly the four
 -- lifted keys.
+--
+-- The upsert renews @expire_at@ as well, so a refetched job is kept from now
+-- rather than from when it was first seen — the same rule
+-- 'writePipeline' follows.
 writeJob :: SqliteStore -> Int -> Value -> IO ()
 writeJob st pid v = do
   jid <- require "job id" (fieldOf "id" v :: Maybe Int)
@@ -478,12 +626,25 @@ writeJob st pid v = do
 
   executeNamed
     conn
-    "INSERT OR REPLACE INTO jobs \
-    \ (id, pipeline_id, user_row, runner_row, commit_id, status, stage, \
-    \  created_at, started_at, finished_at, erased_at, duration, queued_duration, rest) \
-    \ VALUES \
-    \ (:id, :pipeline_id, :user_row, :runner_row, :commit_id, :status, :stage, \
-    \  :created_at, :started_at, :finished_at, :erased_at, :duration, :queued_duration, :rest)"
+    ( Query
+        ( "INSERT INTO jobs \
+          \ (id, pipeline_id, user_row, runner_row, commit_id, status, stage, \
+          \  created_at, started_at, finished_at, erased_at, duration, queued_duration, rest, \
+          \  expire_at) \
+          \ VALUES \
+          \ (:id, :pipeline_id, :user_row, :runner_row, :commit_id, :status, :stage, \
+          \  :created_at, :started_at, :finished_at, :erased_at, :duration, :queued_duration, \
+          \  :rest, " <> expirySql <> ") \
+          \ ON CONFLICT (id) DO UPDATE SET \
+          \  pipeline_id = excluded.pipeline_id, user_row = excluded.user_row, \
+          \  runner_row = excluded.runner_row, commit_id = excluded.commit_id, \
+          \  status = excluded.status, stage = excluded.stage, \
+          \  created_at = excluded.created_at, started_at = excluded.started_at, \
+          \  finished_at = excluded.finished_at, erased_at = excluded.erased_at, \
+          \  duration = excluded.duration, queued_duration = excluded.queued_duration, \
+          \  rest = excluded.rest, expire_at = excluded.expire_at"
+        )
+    )
     [ ":id" := jid
     , ":pipeline_id" := pid
     , ":user_row" := userRow

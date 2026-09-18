@@ -19,13 +19,17 @@
 module FetchGitLab.Store.Class
   ( StoreBackend (..)
   , SomeStore (..)
+  , Purged (..)
+  , describePurged
   ) where
 
 import Data.Aeson (Value)
+import Data.List (intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Time.Clock (UTCTime)
 
 import GitLab.Types (Note)
@@ -124,6 +128,51 @@ class StoreBackend b where
   -- what to lift out of them is the backend's business. Re-writing a
   -- pipeline or job replaces the previous copy.
   storeWritePipelines :: b -> Text -> Int -> [(Value, [Value])] -> IO ()
+
+  -- | Whether the store holds the job with this GitLab id.
+  --
+  -- We ensure a job is present before fetching associated things like it's log.
+  storeHasJob :: b -> Int -> IO Bool
+
+  -- | Write the log of one job, named by its GitLab id, replacing any log
+  -- already held for it. The text is stored as given.
+  --
+  -- Also refreshes expire for the associated MR and pipeline.
+  storeWriteJobLog :: b -> Int -> Text -> IO ()
+
+  -- | Remove the pipelines, jobs and logs whose retention period has run out,
+  -- and whatever only they referred to; returns how many rows of each went.
+  --
+  -- One transaction, so a store is never seen halfway through a purge.
+  storePurgeExpired :: b -> IO Purged
+
+-- | What a purge removed, per table. Counted app side to account for deletions
+-- by trigger.
+data Purged = Purged
+  { purgedPipelines :: Int
+  , purgedJobs :: Int
+  , purgedJobLogs :: Int
+  }
+  deriving (Eq, Show)
+
+-- | A line naming what a purge removed, or 'Nothing' when it removed nothing
+-- — which is every run but the occasional one, and so is not worth a line.
+describePurged :: Purged -> Maybe Text
+describePurged p
+  | null parts = Nothing
+  | otherwise = Just (T.pack ("Removed expired: " <> intercalate ", " parts))
+  where
+    parts =
+      [ plural n one many
+      | (n, one, many) <-
+          [ (purgedPipelines p, "pipeline", "pipelines")
+          , (purgedJobs p, "job", "jobs")
+          , (purgedJobLogs p, "job log", "job logs")
+          ]
+      , n > 0
+      ]
+
+    plural n one many = show n <> " " <> (if n == 1 then one else many)
 
 -- | A backend chosen at run time, once the command line has been read.
 data SomeStore = forall b. StoreBackend b => SomeStore b

@@ -10,7 +10,8 @@ This file is for agents *using* the binary; how it is built is under
 ```
 fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE] [--since WHEN]
-             [--notes | --no-notes | --pipelines <mr>] [-v|--verbose] [--log FILE]
+             [--notes | --no-notes | --pipelines MR | --job-log JOB_ID]
+             [-v|--verbose] [--log FILE]
 
 fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
 ```
@@ -25,6 +26,7 @@ fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
 | `--since` | — | Override the incremental timestamp |
 | `--notes` / `--no-notes` | `--notes` | Whether to fetch discussions |
 | `--pipelines MR` | — | Fetch one merge request's pipelines and jobs instead of records |
+| `--job-log JOB_ID` | — | Fetch one job's log instead of records; the job must already be in the store |
 | `--log FILE` | — | Append a trace level log, one line per request, to FILE |
 | `--clear-timestamp` | — | Mark every stored discussion stale so the next run refetches it |
 | `-v`, `--verbose` | off | Log at trace level on the terminal |
@@ -57,7 +59,9 @@ from it, so nothing in the database can disagree with the JSON it holds.
 `records` and `notes` also carry `ref`, the row's name in GitLab notation
 (`#123` for a ticket, `!123` for a merge request; on a note, the record it
 belongs to), indexed, so `WHERE ref = '#123'` is the cheap way to name one.
-Pipelines and jobs, when fetched, land in tables of their own.
+Pipelines, jobs and job logs, when fetched, land in tables of their own, and
+are the one thing a store forgets again: they carry an `expire_at` a month
+out (see "CI data expires").
 
 Seven views spare a reader the joins: `view_tickets` and `view_mrs` (one row
 per record with author, assignees, labels, milestone and `notes_stale`),
@@ -76,16 +80,19 @@ the `ghc-gitlab` skill is written around them.
    not exist. A store already locked by another run aborts this one before
    anything else happens, including reading the token. A store that fails to
    open aborts the run rather than being overwritten.
-2. Read the token. A missing, unreadable or empty file is reported and the run
+2. Remove the pipelines, jobs and logs whose month is up, and the commit and
+   runner rows only they referred to. Logged when it removed something. This
+   is the only thing that deletes from a store; `--clear-timestamp` does not.
+3. Read the token. A missing, unreadable or empty file is reported and the run
    stops.
-3. Work out a starting timestamp per record kind: `--since` if given,
+4. Work out a starting timestamp per record kind: `--since` if given,
    otherwise one second before the newest `updated_at` stored for it,
    otherwise nothing, meaning fetch everything.
-4. Check the token against the server once.
-5. Fetch records a page of 100 at a time, oldest change first, writing each
+5. Check the token against the server once.
+6. Fetch records a page of 100 at a time, oldest change first, writing each
    page before asking for the next. Stopping halfway is safe: the next run
    asks for exactly what is missing.
-6. Unless `--no-notes`, fetch discussions for every record that has none or
+7. Unless `--no-notes`, fetch discussions for every record that has none or
    whose record changed. Records are visited newest first, and each
    discussion is written as it arrives.
 
@@ -141,6 +148,51 @@ stored complete, not through the library's typed models.
 Any failure aborts the run rather than skipping: re-running costs a handful
 of requests. Refetching a merge request's pipelines replaces what was there.
 A store from before the pipeline tables existed gains them at the next open.
+
+## Job logs on request
+
+`--job-log <job_id>` fetches the log of one job into `job_logs (log_id,
+job_id, raw_log)`, one row per job, replaced when fetched again. `job_id` is
+the job's GitLab id — `jobs.id`, not `jobs.job_row`. The job must already be
+in the store: run `--pipelines <mr>` first, or the run stops before
+downloading anything and says so. One request, a few megabytes.
+
+`raw_log` is TEXT and always cleaned: no ANSI escape sequences, no section
+markers, no control characters but newline and tab, and of a line rewritten
+with carriage returns only the last version. `grep`, `LIKE`, `instr` and
+`substr` all work on it. Newlines are untouched, so a line number in
+`raw_log` is the line number in GitLab's view. The log as the server sent it
+is not stored; in the rare case it matters, ask the API:
+`GET /api/v4/projects/:id/jobs/:job_id/trace`.
+
+Refetching a merge request's pipelines keeps the logs of its jobs. Deleting
+a row of `jobs` deletes its log, in any connection, `PRAGMA foreign_keys` on
+or off. A store from before `job_logs` existed gains it at the next open.
+
+## CI data expires
+
+`pipelines`, `jobs` and `job_logs` each carry `expire_at`, a fixed-width UTC
+text (`2026-10-18T08:50:20Z`, so it compares and sorts as text). Every write
+of a row sets it to a month ahead, and the start of the next fetching run
+removes whatever has passed — nothing else deletes from a store, and
+`--clear-timestamp` does not.
+
+What follows for a reader:
+
+- **An MR with no rows in `pipelines`, or a job with no row in `job_logs`,
+  may be one whose month ran out** rather than one nobody ever fetched. Both
+  cases look the same; refetching with `--pipelines`/`--job-log` is the
+  answer to either, and renews the month.
+- Fetching a job's log also extends every pipeline of that merge request and
+  every job of those pipelines to at least the log's date, never shortening
+  one. A log goes when its job does, and half a merge request's pipelines
+  would read as a merge request that ran one pipeline.
+- A pipeline is only removed once no job of it is left, so a purge never
+  leaves a job without its pipeline row.
+- `users` is never purged: it is shared with the records and the notes.
+  `commits` and `runners` rows lose only what no job refers to any more.
+- The file does not shrink. The pages are reused by what the store grows into
+  next; there is no `VACUUM`.
 
 ## Forcing a refetch
 

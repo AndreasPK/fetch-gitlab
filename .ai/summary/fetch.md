@@ -5,11 +5,12 @@ side [store.md](store.md), the lock [lock.md](lock.md).
 
 ## Where things are
 
-- `run` — the order: lock, `readToken`, `storeLatestUpdate` then
-  `fetchSince` per kind, `lookupProject` through the one *checked*
-  `runGitLabWithManager` call, `fetchRecords` per kind, then
-  `fetchDiscussions` unless `--no-notes`. `fetchPipelines` is the
-  `--pipelines` branch; `--clear-timestamp` is `FetchGitLab.ClearTimestamp`.
+- `run` — the order: lock, `storePurgeExpired`, `readToken`,
+  `lookupProject` through the one *checked* `runGitLabWithManager` call, then
+  one of three branches: `fetchTicketsAndMrs` (`storeLatestUpdate` and
+  `fetchSince` per kind, `fetchRecords` per kind, `fetchDiscussions` unless
+  `--no-notes`), `fetchPipelines` for `--pipelines`, `fetchJobLog` for
+  `--job-log`. `--clear-timestamp` is `FetchGitLab.ClearTimestamp`.
 - `fetchRecords` — one request per page of `recordsPerPage`, written
   before the next is asked for. Its haddock explains the `updated_at`
   anchoring; do not replace it with numbered pages.
@@ -33,6 +34,15 @@ side [store.md](store.md), the lock [lock.md](lock.md).
   O(page) + O(plan) whatever the project's history costs.
 - Pipelines are fetched as raw `Value`, never through typed models, and any
   failure aborts; there is no staleness bookkeeping for them.
+- The purge is the only thing that deletes from a store, it runs before the
+  token is read, and `--clear-timestamp` deliberately does not do it — that
+  is the command a damaged store is repaired with. See [store.md](store.md).
+- `fetchJobLog` asks `storeHasJob` before the request: the log needs its
+  job row, and nothing in a job says which merge request to fetch it under.
+- The trace endpoint answers with text, so `fetchJobLog` goes through
+  `gitlabGetByteStringResponse`, which never returns `Left`. Its `classify`
+  turns a challenge (HTTP 200, HTML) into the `Left` that `orChallenge`
+  raises; without it an interstitial is stored as the log.
 
 ## Traps
 
