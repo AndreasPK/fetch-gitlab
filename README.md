@@ -1,7 +1,19 @@
-Tool to fetch all issues/mrs from gitlab into a SQLite database.
+# Gitlab MR/Issue cache builder
+
+Fetches MRs/Issues with discussion
+
+Typically you want to just run
+
+    fetch-gitlab
+
+with the API token in ~/.fetch-gitlab/ to update the store.
+
+You can query the db manually but it works best with scripts/agents.
+
+## Full options
 
 ```
-fetch-gitlab --token FILE [--url URL] [--project NAMESPACE/PROJECT]
+fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE]
              [--since WHEN] [--notes | --no-notes] [-v|--verbose] [--log FILE]
 
