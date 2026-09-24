@@ -60,9 +60,13 @@ module FetchGitLab.Store.Schema (
 
 import Data.Text (Text)
 
-import FetchGitLab.Store.Schema.Pipeline (jobLogAndExpiryStatements, pipelineSchemaStatements)
+import FetchGitLab.Store.Schema.Pipeline (
+    jobLogAndExpiryStatements,
+    pipelineSchemaStatements,
+    testSummaryStatements,
+ )
 import FetchGitLab.Store.Schema.Types
-import FetchGitLab.Store.Schema.Views (ciViewStatements, viewStatements)
+import FetchGitLab.Store.Schema.Views (ciViewStatements, jobAndTestViewStatements, viewStatements)
 
 {- | Bumped when the schema changes in ways that would break older executables.
 Small (compatible) additions are done by patches.
@@ -122,6 +126,11 @@ Patches:
   every store runs this exactly once. Then the views over pipelines and
   jobs ('ciViewStatements'), last because they read @job_logs@ and
   @expire_at@.
+* 6. The @test_summaries@ table and the trigger that deletes a summary
+  with its pipeline ('testSummaryStatements'), then the views
+  ('jobAndTestViewStatements'): patch 5's @view_jobs@ again as
+  @view_mr_jobs@, @view_jobs@ dropped and recreated over every pipeline,
+  and @view_test_suites@. Repeatable: the drop is @IF EXISTS@.
 
 A patch that adds an index ends with @ANALYZE@. Without planner statistics
 SQLite rates an equality on the leading primary key column as cheap and
@@ -143,6 +152,7 @@ schemaPatches =
     , SchemaPatch refStatements Nothing
     , SchemaPatch viewStatements Nothing
     , SchemaPatch (jobLogAndExpiryStatements <> ciViewStatements) Nothing
+    , SchemaPatch (testSummaryStatements <> jobAndTestViewStatements) Nothing
     ]
 
 {- | A row's own name in GitLab notation: @#123@ for a ticket, @!123@ for a

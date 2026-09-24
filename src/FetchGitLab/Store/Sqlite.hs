@@ -71,7 +71,7 @@ import Database.SQLite.Simple (
 import GitLab.Types (Note)
 
 import FetchGitLab.Store (Entry (..), Record (..), Store)
-import FetchGitLab.Store.Class (Purged (..), StoreBackend (..))
+import FetchGitLab.Store.Class (PipelineState (..), Purged (..), StoreBackend (..))
 import FetchGitLab.Store.Schema
 import FetchGitLab.Store.Schema.Pipeline (expirySql, nowSql)
 
@@ -245,6 +245,7 @@ sqliteTableCounts st = tableCounts st tables
         , "runners"
         , "commits"
         , "job_logs"
+        , "test_summaries"
         ]
 
 {- | The row counts of the three tables a purge removes from, which is how a
@@ -373,6 +374,34 @@ instance StoreBackend SqliteStore where
         withImmediateTransaction (sqliteConn st) $
             forM_ pairs $
                 \(p, jobs) -> writePipeline st kind iid p jobs
+
+    storeWriteTestSummary :: SqliteStore -> Int -> Maybe Text -> Maybe Value -> IO ()
+    storeWriteTestSummary st pid stamp summary =
+        withImmediateTransaction (sqliteConn st) $
+            execute
+                (sqliteConn st)
+                "INSERT INTO test_summaries (pipeline_id, pipeline_updated_at, json) VALUES (?, ?, ?) \
+                \ ON CONFLICT (pipeline_id) DO UPDATE SET pipeline_updated_at = excluded.pipeline_updated_at, \
+                \   json = coalesce(excluded.json, test_summaries.json)"
+                (pid, stamp, encodeText <$> summary)
+
+    storePipelineStates :: SqliteStore -> [Int] -> IO (Map Int PipelineState)
+    storePipelineStates _ [] = pure Map.empty
+    storePipelineStates st pids = do
+        -- Literal ids, as in 'storeRecordVersions': one per pipeline listed.
+        rows <-
+            query_
+                (sqliteConn st)
+                ( Query
+                    ( "SELECT p.pipeline_id, p.status, p.updated_at, \
+                      \       (SELECT t.pipeline_updated_at FROM test_summaries t WHERE t.pipeline_id = p.pipeline_id) \
+                      \ FROM pipelines p WHERE p.pipeline_id IN ("
+                        <> T.intercalate "," (map (T.pack . show) pids)
+                        <> ")"
+                    )
+                ) ::
+                IO [(Int, Maybe Text, Maybe Text, Maybe Text)]
+        pure (Map.fromList [(pid, PipelineState status updated checked) | (pid, status, updated, checked) <- rows])
 
     storeHasJob :: SqliteStore -> Int -> IO Bool
     storeHasJob st jid = do
@@ -588,8 +617,14 @@ writeNote st kind iid position note = do
 
 {- | Write one pipeline and the jobs it ran.
 
-The pipeline object is kept verbatim: the MR pipelines endpoint returns the
+The pipeline object is kept verbatim: the pipelines endpoints return the
 basic pipeline object with nothing shared in it worth lifting.
+
+An upsert, not @INSERT OR REPLACE@, for the reason 'writeJob' is one: a
+replace deletes the row, and the test summary goes with it by cascade.
+Kind @pipeline@ means "owner unknown" and keeps whatever owner the row
+already had, so a project-wide listing never unfiles a merge request's
+pipeline.
 
 @expire_at@ is set from scratch rather than kept, so fetching a merge
 request's pipelines again is what keeps them: a pipeline is held for
@@ -601,10 +636,14 @@ writePipeline st kind iid p jobs = do
     execute
         (sqliteConn st)
         ( Query
-            ( "INSERT OR REPLACE INTO pipelines (pipeline_id, kind, iid, rest, expire_at) \
+            ( "INSERT INTO pipelines (pipeline_id, kind, iid, rest, expire_at) \
               \ VALUES (?, ?, ?, ?, "
                 <> expirySql
-                <> ")"
+                <> ") \
+                   \ ON CONFLICT (pipeline_id) DO UPDATE SET \
+                   \  kind = CASE WHEN excluded.kind = 'pipeline' THEN pipelines.kind ELSE excluded.kind END, \
+                   \  iid = CASE WHEN excluded.kind = 'pipeline' THEN pipelines.iid ELSE excluded.iid END, \
+                   \  rest = excluded.rest, expire_at = excluded.expire_at"
             )
         )
         (pid, kind, iid, encodeText p)

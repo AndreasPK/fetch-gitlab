@@ -28,7 +28,9 @@ A record is named by `ref`: `#123` is a ticket, `!123` a merge request.
 | `view_links` | cross-reference GitLab logged as a system note | `ref, kind, iid, created_at, rel, target_kind, target_project, target, target_ref` |
 | `view_people` | username | `username, name, user_id` |
 | `view_mr_ci_status` | merge request with fetched pipelines: its newest pipeline | `ref, iid, pipeline_id, status, jobs, failed, failed_allowed, unfinished, …` (see `Pipelines.md`) |
-| `view_jobs` | CI job | `ref, iid, pipeline_id, latest, job_id, name, stage, status, failure_reason, runner, has_log, …` (see `Pipelines.md`) |
+| `view_mr_jobs` | CI job of an MR pipeline | `ref, iid, pipeline_id, latest, job_id, name, stage, status, failure_reason, runner, has_log, …` (see `Pipelines.md`) |
+| `view_jobs` | any CI job, master and nightly too | the same plus `kind, source, git_ref`; for an MR filter `kind = 'mr' AND iid = …` (see `Pipelines.md`) |
+| `view_test_suites` | test job of a pipeline with a test summary | `ref, iid, pipeline_id, latest, git_ref, name, job_id, total, success, failed, skipped, error, …` (see `Pipelines.md`) |
 
 `author` is a username; `assignees`, `reviewers` and `labels` are one
 string each. `system` marks GitLab's own notes ("assigned to @x"),

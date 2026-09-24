@@ -37,6 +37,7 @@ statements run before the patches that add the columns.
 module FetchGitLab.Store.Schema.Views (
     viewStatements,
     ciViewStatements,
+    jobAndTestViewStatements,
 ) where
 
 import Data.Text (Text)
@@ -322,11 +323,20 @@ viewMrCiStatus =
 {- | One row per job, with the merge request and pipeline it belongs to.
 @job_id@ is GitLab's id, the one @--job-log@ takes; @has_log@ says whether
 that has been done.
+
+Patch 5 created this as @view_jobs@, and its text must stay as it was;
+patch 6 creates it again as @view_mr_jobs@ and gives the name @view_jobs@
+to 'viewAllJobs'.
 -}
 viewJobs :: Text
-viewJobs =
-    "CREATE VIEW IF NOT EXISTS view_jobs AS \
-    \SELECT '!' || p.iid AS ref, p.iid, p.pipeline_id, "
+viewJobs = mrJobsView "view_jobs"
+
+mrJobsView :: Text -> Text
+mrJobsView name =
+    "CREATE VIEW IF NOT EXISTS "
+        <> name
+        <> " AS \
+           \SELECT '!' || p.iid AS ref, p.iid, p.pipeline_id, "
         <> latestPipeline
         <> ", \
            \       p.status AS pipeline_status, \
@@ -340,3 +350,63 @@ viewJobs =
            \JOIN pipelines p ON p.pipeline_id = j.pipeline_id \
            \LEFT JOIN runners r ON r.row_id = j.runner_row \
            \WHERE p.kind = 'mr'"
+
+{- | Every job, of any pipeline, including non-mr related ones:
+'viewJobs' without the merge request
+filter, plus the pipeline's @kind@, @source@ and @git_ref@ to tell master,
+nightly and branch jobs apart. @ref@ and @latest@ are NULL where there is no
+merge request; @iid@ is the stored one, the pipeline's own id for those.
+
+-}
+viewAllJobs :: Text
+viewAllJobs =
+    "CREATE VIEW IF NOT EXISTS view_jobs AS \
+    \SELECT CASE WHEN p.kind = 'mr' THEN '!' || p.iid END AS ref, p.kind, p.iid, p.pipeline_id, \
+    \       CASE WHEN p.kind = 'mr' THEN p.pipeline_id = (SELECT max(p2.pipeline_id) FROM pipelines p2 \
+    \                                  WHERE p2.kind = p.kind AND p2.iid = p.iid) END AS latest, \
+    \       p.status AS pipeline_status, p.source, p.ref AS git_ref, \
+    \       j.id AS job_id, j.name, j.stage, j.status, \
+    \       (j.allow_failure IS 1) AS allow_failure, j.failure_reason, \
+    \       j.started_at, j.finished_at, round(j.duration) AS secs, \
+    \       r.description AS runner, \
+    \       EXISTS (SELECT 1 FROM job_logs l WHERE l.job_id = j.id) AS has_log, \
+    \       j.web_url \
+    \FROM jobs j \
+    \JOIN pipelines p ON p.pipeline_id = j.pipeline_id \
+    \LEFT JOIN runners r ON r.row_id = j.runner_row"
+
+{- | Schema patch 6: @view_mr_jobs@ and @view_jobs@ (see 'viewAllJobs'), then
+@view_test_suites@, one row per test job of a pipeline
+with a stored test summary. GitLab names a suite after its job and lists
+the job's id in @build_ids@; @job_id@ is the first of them.
+
+@ref@ is the merge request (@!123@) and @iid@ its number, both NULL for a
+pipeline without one; filter on @iid@, as in the CI views. @latest@ is
+'latestPipeline', NULL where there is no merge request to be latest in.
+@git_ref@ is the pipeline's branch, tag or merge request ref.
+-}
+jobAndTestViewStatements :: [Text]
+jobAndTestViewStatements =
+    [ mrJobsView "view_mr_jobs"
+    , "DROP VIEW IF EXISTS view_jobs"
+    , viewAllJobs
+    , "CREATE VIEW IF NOT EXISTS view_test_suites AS \
+      \SELECT CASE WHEN p.kind = 'mr' THEN '!' || p.iid END AS ref, \
+      \       CASE WHEN p.kind = 'mr' THEN p.iid END AS iid, \
+      \       p.pipeline_id, \
+      \       CASE WHEN p.kind = 'mr' THEN p.pipeline_id = (SELECT max(p2.pipeline_id) FROM pipelines p2 \
+      \                                  WHERE p2.kind = p.kind AND p2.iid = p.iid) END AS latest, \
+      \       p.status AS pipeline_status, p.source, p.ref AS git_ref, p.sha, \
+      \       p.created_at, \
+      \       json_extract(s.value, '$.name') AS name, \
+      \       json_extract(s.value, '$.build_ids[0]') AS job_id, \
+      \       json_extract(s.value, '$.total_count') AS total, \
+      \       json_extract(s.value, '$.success_count') AS success, \
+      \       json_extract(s.value, '$.failed_count') AS failed, \
+      \       json_extract(s.value, '$.skipped_count') AS skipped, \
+      \       json_extract(s.value, '$.error_count') AS error, \
+      \       json_extract(s.value, '$.suite_error') AS suite_error \
+      \FROM test_summaries t \
+      \JOIN pipelines p ON p.pipeline_id = t.pipeline_id, \
+      \     json_each(t.json, '$.test_suites') s"
+    ]

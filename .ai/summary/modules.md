@@ -26,7 +26,11 @@ All under `FetchGitLab.`; `app/Main.hs` only dispatches.
   order-sensitively. Cost: fetch-only flags are accepted and ignored.
 - `--pipelines`, `--job-log` and the notes flags are one alternative
   (`modeFlags`), so two of them together is a parse error ("--job-log is
-  a mode of its own").
+  a mode of its own"). `--with-summary` and the positional `MR` live in the
+  `--pipelines` branch; `--since` stays outside it, shared with records.
+- "Exactly one of MR and `--since`" is `checkCommand`, run by
+  `commandResult`, which `Main` and the tests parse through; parse with
+  `commandParserInfo` alone and it is not checked.
 
 ## Tests
 

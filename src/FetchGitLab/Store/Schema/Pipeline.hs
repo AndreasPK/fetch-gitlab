@@ -66,10 +66,28 @@ We store one cleaned up log per job at most.
 
 We cascade job deletions to their logs. Which is also why we UPSERT jobs. This
 avoids triggering the delete from the delete-and-insert combination.
+
+== Test summaries
+
+Every pipeline might produce a test_report based on the JUnit report.
+We keep them as-is, and delete them during database gc when we delete
+a pipeline. We is: @json@ NULL. @pipeline_updated_at@ is the
+pipeline's @updated_at@ the summary was asked for, the same kind of stamp
+as a record's @discussion_updated_at@, so a finished pipeline is not asked
+again until it changes.
+
+== Owners
+
+@kind@ and @iid@ say which record a pipeline was fetched for. A pipeline
+listed project-wide (@--pipelines --since@) has none unless its ref is a
+merge request's (@refs\/merge-requests\/N\/…@); it is filed as
+@kind = 'pipeline'@ with @iid@ its own @pipeline_id@, which a rewrite never
+puts over a known owner.
 -}
 module FetchGitLab.Store.Schema.Pipeline (
     pipelineSchemaStatements,
     jobLogAndExpiryStatements,
+    testSummaryStatements,
     retentionInterval,
     expirySql,
     nowSql,
@@ -178,6 +196,28 @@ jobLogAndExpiryStatements =
     , "ALTER TABLE jobs ADD COLUMN expire_at TEXT"
     , "UPDATE pipelines SET expire_at = " <> expirySql <> " WHERE expire_at IS NULL"
     , "UPDATE jobs SET expire_at = " <> expirySql <> " WHERE expire_at IS NULL"
+    ]
+
+{- | The __test_summaries__ table, schema patch 6: one test report summary per
+pipeline, deleted with it by cascade and, for connections without
+@PRAGMA foreign_keys@, by trigger — as 'jobLogAndExpiryStatements' does for
+a job's log. No @expire_at@: a summary lives exactly as long as its
+pipeline. The generated columns are the pipeline-wide totals; the per-job
+suites are @view_test_suites@.
+-}
+testSummaryStatements :: [Text]
+testSummaryStatements =
+    [ "CREATE TABLE IF NOT EXISTS test_summaries (\
+      \  pipeline_id INTEGER PRIMARY KEY REFERENCES pipelines(pipeline_id) ON DELETE CASCADE,\
+      \  pipeline_updated_at TEXT,\
+      \  json        TEXT,\
+      \  total   INTEGER GENERATED ALWAYS AS (json_extract(json, '$.total.count')) VIRTUAL,\
+      \  success INTEGER GENERATED ALWAYS AS (json_extract(json, '$.total.success')) VIRTUAL,\
+      \  failed  INTEGER GENERATED ALWAYS AS (json_extract(json, '$.total.failed')) VIRTUAL,\
+      \  skipped INTEGER GENERATED ALWAYS AS (json_extract(json, '$.total.skipped')) VIRTUAL,\
+      \  error   INTEGER GENERATED ALWAYS AS (json_extract(json, '$.total.error')) VIRTUAL)"
+    , "CREATE TRIGGER IF NOT EXISTS pipelines_delete_test_summary AFTER DELETE ON pipelines \
+      \ BEGIN DELETE FROM test_summaries WHERE pipeline_id = OLD.pipeline_id; END"
     ]
 
 -- | How long a pipeline, job or log is kept after being written.

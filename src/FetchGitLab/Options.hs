@@ -4,6 +4,7 @@
 module FetchGitLab.Options (
     Command (..),
     Options (..),
+    PipelineRequest (..),
     ClearOptions (..),
     Backend (..),
     parseBackend,
@@ -11,6 +12,8 @@ module FetchGitLab.Options (
     optionsParser,
     commandParser,
     commandParserInfo,
+    commandResult,
+    checkCommand,
     defaultStoreDir,
     dbFile,
     tokenFile,
@@ -89,15 +92,16 @@ data Options = Options
     -}
     , optSince :: Maybe Since
     {- ^ Fetch records modified after this, instead of after the newest one
-    already stored.
+    already stored. With 'optPipelines' and no merge request: fetch the
+    pipelines /created/ after this.
     -}
     , optNotes :: Bool
     -- ^ Whether to fetch the discussion of each ticket and merge request.
-    , optPipelines :: Maybe Int
-    {- ^ Fetch the pipelines (and their jobs) of this one merge request,
-    instead of fetching records at all. Pipelines are never fetched
-    unasked: a project the size of GHC runs one per push, so following
-    them for every merge request would dwarf the records themselves.
+    , optPipelines :: Maybe PipelineRequest
+    {- ^ Fetch pipelines (and their jobs) instead of fetching records at all.
+    Pipelines are never fetched unasked: a project the size of GHC runs one
+    per push, so following them for every merge request would dwarf the
+    records themselves.
     -}
     , optJobLog :: Maybe Int
     -- ^ Fetch a job log by the jobs GitLab id. The job must already be cached.
@@ -109,6 +113,21 @@ data Options = Options
     -}
     }
     deriving (Show)
+
+{- | Which pipelines a @--pipelines@ run fetches, and what with them.
+
+'checkCommand' holds the invariant the parser cannot: exactly one of
+'pipelinesOfMr' and 'optSince' is given.
+-}
+data PipelineRequest = PipelineRequest
+    { pipelinesOfMr :: Maybe Int
+    {- ^ The pipelines of this merge request, or 'Nothing' for every pipeline
+    of the project created after 'optSince'.
+    -}
+    , pipelinesWithSummary :: Bool
+    -- ^ Also fetch each pipeline's JUnit test report summary.
+    }
+    deriving (Eq, Show)
 
 defaultServerUrl :: Text
 defaultServerUrl = "https://gitlab.haskell.org"
@@ -154,7 +173,8 @@ optionsParser =
                     <> metavar "WHEN"
                     <> help
                         ( "Fetch everything modified after WHEN, instead of after the newest "
-                            <> "record already stored. Either a date (2026-08-01), an ISO 8601 "
+                            <> "record already stored; with --pipelines, the pipelines created "
+                            <> "after WHEN. Either a date (2026-08-01), an ISO 8601 "
                             <> "timestamp (2026-08-01T12:00:00Z), or a relative time such as "
                             <> "\"2 weeks\" or \"6 months ago\""
                         )
@@ -182,20 +202,35 @@ optionsParser =
     since = eitherReader parseSince
 
     -- What a run fetches: records with or without their discussions, or -- an
-    -- entirely separate errand -- one merge request's pipelines or one job's
-    -- log. Those alternatives come first because the notes flag defaults to
-    -- True and so never fails to parse.
+    -- entirely separate errand -- pipelines or one job's log. Those
+    -- alternatives come first because the notes flag defaults to True and so
+    -- never fails to parse.
+    --
+    -- The merge request is an optional positional argument rather than an
+    -- option's value, so that @--pipelines --since WHEN@ can do without one.
+    -- @--since@ itself stays shared with a records run: a branch that
+    -- consumed it would never be backtracked out of (see 'commandParser').
     modeFlags =
-        (\mr -> (True, Just mr, Nothing))
-            <$> option
-                auto
-                ( long "pipelines"
-                    <> metavar "MR"
-                    <> help
-                        ( "Fetch the pipelines and jobs of this one merge request, given by "
-                            <> "its number, instead of fetching records. Pipelines are only "
-                            <> "ever fetched on request"
-                        )
+        (\p -> (True, Just p, Nothing))
+            <$> ( flag'
+                    ()
+                    ( long "pipelines"
+                        <> help
+                            ( "Fetch pipelines and their jobs instead of records: those of "
+                                <> "merge request MR, or with --since every pipeline created "
+                                <> "after WHEN. Pipelines are only ever fetched on request"
+                            )
+                    )
+                    *> ( PipelineRequest
+                            <$> optional (argument auto (metavar "MR"))
+                            <*> switch
+                                ( long "with-summary"
+                                    <> help
+                                        ( "With --pipelines, also fetch each pipeline's test "
+                                            <> "report summary, where its jobs uploaded one"
+                                        )
+                                )
+                       )
                 )
                 <|> (\job -> (True, Nothing, Just job))
             <$> option
@@ -312,6 +347,27 @@ tokenFile = storeFile "gitlab-token" . optTokenFile
 storeFile :: FilePath -> Maybe FilePath -> IO FilePath
 storeFile _ (Just given) = pure given
 storeFile name Nothing = (</> name) <$> defaultStoreDir
+
+{- | What the parser cannot say: a @--pipelines@ run names its merge request
+or gives @--since@, and not both.
+-}
+checkCommand :: Command -> Either String Command
+checkCommand cmd@(Fetch opts) = case (optPipelines opts, optSince opts) of
+    (Just (PipelineRequest Nothing _), Nothing) ->
+        Left "--pipelines needs a merge request (--pipelines MR) or --since WHEN"
+    (Just (PipelineRequest (Just _) _), Just _) ->
+        Left "--pipelines takes a merge request or --since, not both"
+    _ -> Right cmd
+checkCommand cmd = Right cmd
+
+{- | Parse a command line and check it, failing either way as the parser does:
+with the usage and the message.
+-}
+commandResult :: ParserPrefs -> [String] -> ParserResult Command
+commandResult parserPrefs args =
+    execParserPure parserPrefs commandParserInfo args >>= either refuse pure . checkCommand
+  where
+    refuse msg = Failure (parserFailure parserPrefs commandParserInfo (ErrorMsg msg) mempty)
 
 commandParserInfo :: ParserInfo Command
 commandParserInfo =

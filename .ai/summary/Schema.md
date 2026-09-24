@@ -46,6 +46,11 @@
   claims a patch level must really be at it ("a store at the old schema
   loses has_discussion" and "a store at patch 1 gains expire_at" both run
   patch 1's statements for that reason).
+- Patch 6 (`testSummaryStatements`, `jobAndTestViewStatements`) adds
+  `test_summaries`, its delete trigger, `view_mr_jobs` (patch 5's
+  `view_jobs` renamed; `mrJobsView` keeps patch 5's text unchanged), a
+  `view_jobs` over every pipeline (drop + create), and `view_test_suites`.
+  Repeatable.
 - `migrate` runs the unapplied patches and writes the count last, in one
   `BEGIN IMMEDIATE` transaction. A store counted higher than the binary
   knows is left alone; lowering the count would repeat a non-repeatable

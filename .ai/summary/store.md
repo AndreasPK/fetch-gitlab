@@ -67,10 +67,16 @@ Schema versioning is [Schema.md](Schema.md).
   the `jobs_delete_log` trigger, the trigger being for connections without
   `PRAGMA foreign_keys` — the `sqlite3` shell ("deleting a job deletes its
   log, foreign keys enforced or not").
-- **Never write `jobs` with `INSERT OR REPLACE`.** A replace deletes the old
-  row, which cascades to the log; `writeJob` is an upsert ("refreshing
-  pipelines keeps a job's log"). Any future table hanging off `jobs` inherits
+- **Never write `jobs` or `pipelines` with `INSERT OR REPLACE`.** A replace
+  deletes the old row, which cascades to the log / test summary; `writeJob`
+  and `writePipeline` are upserts ("refreshing pipelines keeps a job's log",
+  "… keeps their test summaries"). Any table hanging off either inherits
   this. Log 2026-09-18 "job logs".
+- Owner `('pipeline', pipeline_id)` is "unknown": the upsert never puts it
+  over a stored owner ("an unknown owner never replaces a known one").
+- `test_summaries` has no `expire_at` and is not in `Purged`: it goes with its
+  pipeline (cascade + trigger). `pipeline_updated_at` stamps the pipeline version
+  asked for, `json` NULL = none; a NULL write `coalesce`s, never blanks.
 - Expiry is SQL, not Haskell: `expirySql`/`nowSql`/`retentionInterval`
   (Pipeline.hs) are the only definitions, so writes, patch 5 and the purge
   cannot disagree. Fixed width and UTC, so it sorts — unlike `encodeTime`,

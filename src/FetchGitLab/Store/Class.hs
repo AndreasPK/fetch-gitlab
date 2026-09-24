@@ -21,6 +21,7 @@ module FetchGitLab.Store.Class (
     StoreBackend (..),
     SomeStore (..),
     Purged (..),
+    PipelineState (..),
     describePurged,
 ) where
 
@@ -136,9 +137,28 @@ class StoreBackend b where
     which merge request a pipeline was fetched for is not part of the
     pipeline object. The values are the raw JSON the server sent, verbatim;
     what to lift out of them is the backend's business. Re-writing a
-    pipeline or job replaces the previous copy.
+    pipeline or job replaces the previous copy, but keeps what hangs off it:
+    a job's log, a pipeline's test summary.
+
+    Kind @pipeline@, with the pipeline's own id as the iid, says the owner is
+    not known; it never replaces the owner a pipeline was already stored
+    under.
     -}
     storeWritePipelines :: b -> Text -> Int -> [(Value, [Value])] -> IO ()
+
+    {- | Record that the test report summary of a pipeline the store holds,
+    named by its GitLab id, was asked for the pipeline version stamped (its
+    @updated_at@), and what came back: a summary, verbatim, replacing any
+    held; or 'Nothing', which keeps a summary already held — an empty answer
+    is also what expired report artifacts look like.
+    -}
+    storeWriteTestSummary :: b -> Int -> Maybe Text -> Maybe Value -> IO ()
+
+    {- | What the store holds of each of these pipelines, by GitLab id; a
+    pipeline it does not hold is not in the map. Lets a @--since@ run skip
+    the finished pipelines it already has.
+    -}
+    storePipelineStates :: b -> [Int] -> IO (Map Int PipelineState)
 
     {- | Whether the store holds the job with this GitLab id.
 
@@ -159,6 +179,16 @@ class StoreBackend b where
     One transaction, so a store is never seen halfway through a purge.
     -}
     storePurgeExpired :: b -> IO Purged
+
+-- | A stored pipeline, as far as deciding whether to fetch it again goes.
+data PipelineState = PipelineState
+    { stateStatus :: Maybe Text
+    , stateUpdatedAt :: Maybe Text
+    -- ^ As GitLab sent it, not re-encoded: compared as text with a listing's.
+    , stateSummaryPipelineUpdatedAt :: Maybe Text
+    -- ^ The @updated_at@ its test summary was last asked for, if ever.
+    }
+    deriving (Eq, Show)
 
 {- | What a purge removed, per table. Counted app side to account for deletions
 by trigger.

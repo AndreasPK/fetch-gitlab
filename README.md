@@ -12,16 +12,18 @@ You can query the db manually but it works best with scripts/agents.
 
 ## Full options
 
-```
+```bash
 # Caching MRs/Tickets
 fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE]
              [--since WHEN] [--notes | --no-notes]
              [-v|--verbose] [--log FILE]
 
-# Fetching a mrs pipelines and jobs
-fetch-gitlab --pipelines MR [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
-             [--backend sqlite] [--db FILE] [-v|--verbose] [--log FILE]
+# Fetching pipelines and jobs
+fetch-gitlab
+      --pipelines [MR | --since WHEN] [--with-summary]
+      [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
+      [--backend sqlite] [--db FILE] [-v|--verbose] [--log FILE]
 
 # Fetch a jobs log:
 fetch-gitlab --job-log JOB_ID
@@ -144,6 +146,9 @@ Neither is fetched unless asked for; GHC runs a pipeline per push.
 
 ```
 fetch-gitlab --pipelines 16366     # the MR's pipelines and their jobs
+fetch-gitlab --pipelines --since 1w --with-summary
+                                   # every pipeline created in the last week,
+                                   # with its test counts per job
 fetch-gitlab --job-log 2589581     # one job's log, into the job_logs table
 sqlite3 ~/.fetch-gitlab/gitlab.db \
   "SELECT raw_log FROM job_logs WHERE job_id = 2589581" | grep -n -i error | tail
@@ -153,6 +158,11 @@ sqlite3 ~/.fetch-gitlab/gitlab.db \
 the job must already be in the store, so run `--pipelines` for its merge
 request first. Running either again replaces what was stored; refreshing
 pipelines keeps the logs, deleting a job deletes its log.
+
+`--pipelines --since` skips the finished pipelines the store already holds,
+so running it again over an overlapping window is cheap. `--with-summary`
+adds the JUnit test report summary of each pipeline that has one; read it
+through `view_test_suites`.
 
 Colour codes, section markers and carriage-return progress rewrites are
 stripped before the log is stored, so `grep` and `LIKE` work on it; line

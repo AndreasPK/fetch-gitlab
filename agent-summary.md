@@ -10,7 +10,8 @@ This file is for agents *using* the binary; how it is built is under
 ```
 fetch-gitlab [--token FILE] [--url URL] [--project NAMESPACE/PROJECT]
              [--backend sqlite] [--db FILE] [--since WHEN]
-             [--notes | --no-notes | --pipelines MR | --job-log JOB_ID]
+             [--notes | --no-notes | --job-log JOB_ID
+              | --pipelines [MR] [--with-summary]]
              [-v|--verbose] [--log FILE]
 
 fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
@@ -23,9 +24,11 @@ fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
 | `--project` | `ghc/ghc` | Project as `namespace/project` |
 | `--backend` | `sqlite` | Which store format; `sqlite` is the only one |
 | `--db` | `~/.fetch-gitlab/gitlab.db` | Database to fetch into |
-| `--since` | — | Override the incremental timestamp |
+| `--since` | — | Override the incremental timestamp; with `--pipelines` and no MR, fetch the pipelines created after it |
 | `--notes` / `--no-notes` | `--notes` | Whether to fetch discussions |
 | `--pipelines MR` | — | Fetch one merge request's pipelines and jobs instead of records |
+| `--pipelines --since WHEN` | — | Fetch every pipeline of the project created after WHEN, and its jobs |
+| `--with-summary` | off | With `--pipelines`: also each pipeline's test report summary |
 | `--job-log JOB_ID` | — | Fetch one job's log instead of records; the job must already be in the store |
 | `--log FILE` | — | Append a trace level log, one line per request, to FILE |
 | `--clear-timestamp` | — | Mark every stored discussion stale so the next run refetches it |
@@ -37,6 +40,7 @@ fetch-gitlab --clear-timestamp [--backend sqlite] [--db FILE] [-v|--verbose]
 calendar arithmetic.
 
 `--clear-timestamp` accepts the fetch-only flags and ignores them.
+`--pipelines` needs exactly one of `MR` and `--since`.
 
 ## What a store holds
 
@@ -63,7 +67,7 @@ Pipelines, jobs and job logs, when fetched, land in tables of their own, and
 are the one thing a store forgets again: they carry an `expire_at` a month
 out (see "CI data expires").
 
-Nine views spare a reader the joins: `view_tickets` and `view_mrs` (one row
+Eleven views spare a reader the joins: `view_tickets` and `view_mrs` (one row
 per record with author, assignees, labels, milestone and `notes_stale`),
 `view_ticket` and `view_mr` (one record as a thread, a header row then its
 notes oldest first, each row's `text` rendered as Markdown, so
@@ -71,13 +75,17 @@ notes oldest first, each row's `text` rendered as Markdown, so
 transcript), `view_notes` (every note with its author, `system`, `is_import`
 for the Trac migration's, and `len`), `view_links` (the cross-references
 GitLab records as system notes, split into `rel`, `target_kind` and a
-joinable `target_ref`) and `view_people`. Two more cover CI:
+joinable `target_ref`) and `view_people`. Four more cover CI:
 `view_mr_ci_status` (one row per merge request with fetched pipelines: its
 newest pipeline's status and `jobs`/`failed`/`failed_allowed`/`unfinished`
-counts) and `view_jobs` (one row per job, `latest` marking the newest
-pipeline's, `job_id` being what `--job-log` takes, `has_log`); the failed jobs
-of an MR are `SELECT job_id, name FROM view_jobs WHERE iid = N AND latest AND
-status = 'failed'`. `Store.Schema.Views` defines them;
+counts), `view_mr_jobs` (one row per job of an MR's pipeline, `latest`
+marking the newest pipeline's, `job_id` being what `--job-log` takes,
+`has_log`) and `view_jobs` (every job, MR or not, plus `kind`, `source` and
+`git_ref`; filter `kind = 'mr' AND iid = N` there, `iid` alone scans). The
+failed jobs of an MR are `SELECT job_id, name FROM view_mr_jobs WHERE iid = N
+AND latest AND status = 'failed'`. `view_test_suites` is one row per test job of a
+pipeline with a stored test summary (`--with-summary`): `name`, `job_id` and
+its `total`/`success`/`failed`/`skipped`/`error` counts. `Store.Schema.Views` defines them;
 the `ghc-gitlab` skill is written around them.
 
 ## How a run proceeds
@@ -151,8 +159,27 @@ every merge request would dwarf the records themselves. A run is one request
 for the pipeline list plus one per pipeline for its jobs; the objects are
 stored complete, not through the library's typed models.
 
-Any failure aborts the run rather than skipping: re-running costs a handful
-of requests. Refetching a merge request's pipelines replaces what was there.
+`--pipelines --since <when>` lists every pipeline of the project created
+after `<when>` (GHC: about 25 a day) and fetches each one's jobs, writing each
+pipeline as it arrives. A pipeline whose ref is `refs/merge-requests/N/…` is
+filed under merge request N (`kind = 'mr'`); any other — master, schedules,
+branches — as `kind = 'pipeline'` with `iid` its own `pipeline_id`, and a
+merge request fetch later re-files it. A pipeline already stored with a final
+status and the same `updated_at` is skipped (with `--with-summary`, only if
+its summary was asked for that `updated_at`, whether or not there was one).
+Such a run gives a merge request only the pipelines
+in the window, so `view_mr_ci_status.pipelines` counts those, not all.
+
+`--with-summary` also fetches each pipeline's test report summary into
+`test_summaries` (one row per pipeline, verbatim JSON), one request more per
+pipeline, stamped with the pipeline's `updated_at` in `pipeline_updated_at`. A
+pipeline without JUnit reports gets a row with `json` NULL, so it is not asked
+again; an empty answer never replaces a stored summary. A summary goes when
+its pipeline does.
+
+Any failure aborts the run rather than skipping; what a `--since` run wrote
+before it stays. Refetching a merge request's pipelines replaces what was
+there, keeping job logs and test summaries.
 A store from before the pipeline tables existed gains them at the next open.
 
 ## Job logs on request

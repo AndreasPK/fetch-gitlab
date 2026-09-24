@@ -20,6 +20,9 @@ module FetchGitLab.Fetch (
     orChallenge,
     addUserAgent,
     userAgent,
+    pipelineOwner,
+    pipelineIsCurrent,
+    usableSummary,
 ) where
 
 import Control.Concurrent (threadDelay)
@@ -27,20 +30,24 @@ import Control.Exception (try)
 import Control.Monad (forM, forM_, when)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.Aeson (Value, object)
+import Data.Aeson (Value (..), object)
+import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
+import Data.Char (isDigit)
 import Data.Default (def)
 import qualified Data.IntSet as IntSet
 import qualified Data.Map.Strict as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import qualified Data.Text.IO as T
 import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.Version (showVersion)
 import Network.HTTP.Client (
     Manager,
@@ -75,7 +82,7 @@ import GitLab.Types (
     SortBy (..),
     project_id,
  )
-import GitLab.WebRequests.GitLabWebCalls (gitlabGetByteStringResponse, gitlabGetMany)
+import GitLab.WebRequests.GitLabWebCalls (gitlabGetByteStringResponse, gitlabGetMany, gitlabGetOne)
 
 import Log (
     LogLevel (..),
@@ -96,12 +103,12 @@ import FetchGitLab.Lock (
     withStoreLocks,
  )
 import FetchGitLab.Logging (withFetchLogger)
-import FetchGitLab.Options (Options (..), tokenFile)
+import FetchGitLab.Options (Options (..), PipelineRequest (..), tokenFile)
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager)
 import FetchGitLab.Since (Since, resolveSince)
 import FetchGitLab.Store (Record (..))
 import FetchGitLab.Store.Backend (optionsSpec, specPaths, withStore)
-import FetchGitLab.Store.Class (SomeStore (..), StoreBackend (..), describePurged)
+import FetchGitLab.Store.Class (PipelineState (..), SomeStore (..), StoreBackend (..), describePurged)
 import Paths_fetch_gitlab (version)
 
 {- | How many requests per second we allow ourselves.
@@ -242,10 +249,16 @@ run opts = withFetchLogger (optLogFile opts) terminalLevel $ \logger level -> do
                 (liftIO (runGitLabWithManager manager (serverConfig opts token) (lookupProject (optProject opts))))
                 >>= either (\err -> abort ("GitLab request failed: " <> tshow err)) pure
 
-        case (optJobLog opts, optPipelines opts) of
-            (Just job, _) -> fetchJobLog gitlab store prj job
-            (Nothing, Just mr) -> fetchPipelines gitlab store prj mr
-            (Nothing, Nothing) -> fetchTicketsAndMrs gitlab store prj opts
+        case (optJobLog opts, optPipelines opts, optSince opts) of
+            (Just job, _, _) -> fetchJobLog gitlab store prj job
+            (Nothing, Just (PipelineRequest (Just mr) withSummary), _) ->
+                fetchMrPipelines gitlab store prj withSummary mr
+            (Nothing, Just (PipelineRequest Nothing withSummary), Just when_) ->
+                liftIO (resolveNow when_) >>= fetchPipelinesSince gitlab store prj withSummary
+            -- 'FetchGitLab.Options.checkCommand' turns this down before a run starts.
+            (Nothing, Just (PipelineRequest Nothing _), Nothing) ->
+                abort "--pipelines needs a merge request or --since"
+            (Nothing, Nothing, _) -> fetchTicketsAndMrs gitlab store prj opts
 
     terminalLevel
         | optVerbose opts = LogTrace
@@ -520,74 +533,279 @@ fetchTicketsAndMrs gitlab backend prj opts = do
                 \iid -> mergeRequestNotes prj iid Nothing Nothing
         else logInfo_ "Skipping discussions (--no-notes)"
 
-{- | Fetch the pipelines of one merge request, and the jobs of each.
+{- | The pipelines of one merge request and the jobs of each, and with
+@--with-summary@ each pipeline's test report summary. A handful of requests,
+so everything is written once, at the end: re-running costs less than
+reasoning about a store holding half a fetch.
 
-Never part of an ordinary run: a project the size of GHC runs a pipeline
-per push, so following pipelines for every merge request would dwarf the
-records themselves. This is the on-request path — one request lists the
-pipelines, then one more per pipeline lists its jobs, a handful in all.
+Pipelines are never part of an ordinary run: a project the size of GHC runs
+a pipeline per push, so following pipelines for every merge request would
+dwarf the records themselves. Jobs are always fetched: they are one request
+per pipeline (a page holds 100, GHC's nightly runs 73) and most of what a
+pipeline is worth.
 
-Both are fetched as raw JSON rather than through the library's types,
+Everything is fetched as raw JSON rather than through the library's types,
 because the store keeps a pipeline and a job verbatim; a typed model would
 silently drop whatever fields it does not know.
 
-Any failure aborts the run rather than skipping: a whole run here is a few
-requests, so re-running it costs less than reasoning about a store holding
-half a fetch. Writing happens once, at the end, for the same reason.
+Any failure aborts the run rather than skipping: nothing records what a
+run skipped, so a skip would read as a pipeline that had no jobs.
 -}
-fetchPipelines ::
+fetchMrPipelines ::
     forall s m.
     (StoreBackend s, MonadLog m, MonadIO m) =>
     (forall b. GitLab b -> m (Either GitLabError b)) ->
     s ->
     Project ->
+    -- | Whether to fetch test summaries.
+    Bool ->
     -- | The merge request, by its iid.
     Int ->
     m ()
-fetchPipelines gitlab backend prj mr = do
+fetchMrPipelines gitlab backend prj withSummary mr = do
     pipelines <-
-        fetchJSON
+        fetchJSONList
+            gitlab
             ("pipelines of merge request !" <> tshow mr)
-            (base <> "/merge_requests/" <> tshow mr <> "/pipelines")
+            (projectPath prj <> "/merge_requests/" <> tshow mr <> "/pipelines")
+            []
     logInfo_ $
         tshow (length pipelines) <> " pipelines for merge request !" <> tshow mr
-    pairs <- forM pipelines $ \p -> do
-        pid <- case pipelineId p of
-            Nothing -> abort ("GitLab sent a pipeline without an id for merge request !" <> tshow mr)
-            Just pid -> pure pid
-        jobs <-
-            fetchJSON
-                ("jobs of pipeline " <> tshow pid)
-                (base <> "/pipelines/" <> tshow pid <> "/jobs")
-        logTrace_ $ tshow (length jobs) <> " jobs in pipeline " <> tshow pid
-        pure (p, jobs)
-    liftIO $ storeWritePipelines backend "mr" mr pairs
+    fetched <- forM pipelines $ \p -> do
+        pid <- requirePipelineId p
+        jobs <- fetchJobs gitlab prj pid
+        summary <- if withSummary then Just <$> fetchTestSummary gitlab prj False pid else pure Nothing
+        pure (pid, p, jobs, summary)
+    liftIO $ storeWritePipelines backend "mr" mr [(p, jobs) | (_, p, jobs, _) <- fetched]
+    summaries <- liftIO $ writeSummaries backend [(pid, p, summary) | (pid, p, _, summary) <- fetched]
     logInfo_ $
         "Pipelines for merge request !"
             <> tshow mr
             <> " ("
-            <> tshow (sum (map (length . snd) pairs))
-            <> " jobs) written to "
+            <> tshow (sum [length jobs | (_, _, jobs, _) <- fetched])
+            <> " jobs"
+            <> summaryCount withSummary summaries
+            <> ") written to "
             <> storeLocation backend
+
+{- | Every pipeline of the project created after a time, oldest first, fetched
+as 'fetchMrPipelines' fetches one merge request's.
+
+Possibly hundreds, so each pipeline is written as soon as its jobs (and
+summary) are in, in a transaction of its own: a run stopped halfway keeps
+what it fetched. There is no watermark; every run lists the whole range it
+is given, and skips the pipelines 'pipelineIsCurrent' says it already has,
+so an overlapping window costs a listing page per hundred of those.
+
+A pipeline is filed under the merge request its ref names, and otherwise
+as its own owner; see 'pipelineOwner'. A pipeline deleted between listing
+and fetching its summary has none, rather than stopping the run.
+-}
+fetchPipelinesSince ::
+    forall s m.
+    (StoreBackend s, MonadLog m, MonadIO m) =>
+    (forall b. GitLab b -> m (Either GitLabError b)) ->
+    s ->
+    Project ->
+    -- | Whether to fetch test summaries.
+    Bool ->
+    UTCTime ->
+    m ()
+fetchPipelinesSince gitlab backend prj withSummary after = do
+    listed <-
+        fetchJSONList
+            gitlab
+            ("pipelines created after " <> tshow after)
+            (projectPath prj <> "/pipelines")
+            [ ("created_after", Just (BS8.pack (iso8601Show after)))
+            , ("order_by", Just "id")
+            , ("sort", Just "asc")
+            ]
+    withIds <- forM listed $ \p -> (\pid -> (pid, p)) <$> requirePipelineId p
+    states <- liftIO $ storePipelineStates backend (map fst withIds)
+    let current (pid, p) = maybe False (pipelineIsCurrent withSummary p) (Map.lookup pid states)
+        pipelines = filter (not . current) withIds
+        total = length pipelines
+    logInfo_ $
+        tshow (length listed)
+            <> " pipelines created after "
+            <> tshow after
+            <> ": "
+            <> tshow (length listed - total)
+            <> " finished and already stored, fetching "
+            <> tshow total
+    counts <- forM (zip [1 :: Int ..] pipelines) $ \(done, (pid, p)) -> do
+        jobs <- fetchJobs gitlab prj pid
+        summary <- if withSummary then Just <$> fetchTestSummary gitlab prj True pid else pure Nothing
+        let (kind, iid) = pipelineOwner pid (textField "ref" p)
+        liftIO $ storeWritePipelines backend kind iid [(p, jobs)]
+        stored <- liftIO $ writeSummaries backend [(pid, p, summary)]
+        when (done `mod` progressEvery == 0 && done /= total) $
+            logInfo_ $
+                "Pipelines: " <> tshow done <> "/" <> tshow total
+        pure (length jobs, stored)
+    logInfo_ $
+        tshow total
+            <> " pipelines ("
+            <> tshow (sum (map fst counts))
+            <> " jobs"
+            <> summaryCount withSummary (sum (map snd counts))
+            <> ") written to "
+            <> storeLocation backend
+
+{- | Whether a listed pipeline is one the store already holds in full, so
+that fetching its jobs (and summary) again would change nothing.
+
+A pipeline's @updated_at@ moves with its own status and not with its jobs':
+a running pipeline keeps the one it started with while its jobs finish.
+So it only says "unchanged" once the status is final, and a retry, which
+takes the pipeline back to running, moves it. Asked for summaries, the
+summary must have been asked for this same @updated_at@ too -- whether or
+not there was one, so a pipeline without a test report is not asked again.
+-}
+pipelineIsCurrent :: Bool -> Value -> PipelineState -> Bool
+pipelineIsCurrent withSummary p st =
+    maybe False (`elem` finalStatuses) status
+        && stateStatus st == status
+        && isJust updated
+        && stateUpdatedAt st == updated
+        && summaryCurrent
   where
-    base = "/projects/" <> tshow (project_id prj)
+    status = textField "status" p
+    updated = textField "updated_at" p
+    -- A run that does not fetch summaries has no use for a current one.
+    summaryCurrent
+        | withSummary = stateSummaryPipelineUpdatedAt st == updated
+        | otherwise = True
+    finalStatuses = ["success", "failed", "canceled", "skipped"]
 
-    fetchJSON :: Text -> Text -> m [Value]
-    fetchJSON what path = do
-        result <- gitlab (orChallenge (gitlabGetMany path []))
-        case result of
-            Left err -> abort ("Cannot fetch " <> what <> ": " <> tshow err)
-            Right (Left response) ->
-                abort
-                    ( "Cannot fetch "
-                        <> what
-                        <> ": HTTP "
-                        <> tshow (statusCode (responseStatus response))
-                    )
-            Right (Right values) -> pure values
+textField :: Text -> Value -> Maybe Text
+textField k = Aeson.parseMaybe (Aeson.withObject "object" (Aeson..: Key.fromText k))
 
-    pipelineId :: Value -> Maybe Int
-    pipelineId = Aeson.parseMaybe (Aeson.withObject "pipeline" (Aeson..: "id"))
+{- | Which record a pipeline listed project-wide belongs to: the merge request
+its ref names (@refs\/merge-requests\/N\/head@, @…\/merge@, @…\/train@),
+and otherwise kind @pipeline@ with the pipeline's own id, which the store
+reads as "owner unknown" and never puts over a known one.
+
+A branch ref is not traced back to a merge request: the same branch can be
+the source of several, and a push pipeline on it belongs to none of them.
+-}
+pipelineOwner :: Int -> Maybe Text -> (Text, Int)
+pipelineOwner pid ref = case T.stripPrefix "refs/merge-requests/" =<< ref of
+    Just rest
+        | (digits, suffix) <- T.span isDigit rest
+        , not (T.null digits)
+        , suffix `elem` ["/head", "/merge", "/train"] ->
+            ("mr", read (T.unpack digits))
+    _ -> ("pipeline", pid)
+
+{- | The jobs of one pipeline. Only the latest attempt of each; GitLab leaves
+out retried ones unless asked.
+-}
+fetchJobs ::
+    (MonadLog m, MonadIO m) =>
+    (forall b. GitLab b -> m (Either GitLabError b)) ->
+    Project ->
+    Int ->
+    m [Value]
+fetchJobs gitlab prj pid = do
+    jobs <-
+        fetchJSONList
+            gitlab
+            ("jobs of pipeline " <> tshow pid)
+            (projectPath prj <> "/pipelines/" <> tshow pid <> "/jobs")
+            []
+    logTrace_ $ tshow (length jobs) <> " jobs in pipeline " <> tshow pid
+    pure jobs
+
+{- | The test report summary of one pipeline, or 'Nothing' when its jobs
+uploaded no JUnit report: GitLab then answers with zero counts and no
+suites, which says nothing worth storing.
+-}
+fetchTestSummary ::
+    (MonadLog m, MonadIO m) =>
+    (forall b. GitLab b -> m (Either GitLabError b)) ->
+    Project ->
+    {- | Whether a 404 means "no summary" rather than a failure: for a pipeline
+    listed a while ago, which may have been deleted since.
+    -}
+    Bool ->
+    Int ->
+    m (Maybe Value)
+fetchTestSummary gitlab prj missingOk pid = do
+    result <- gitlab (orChallenge (gitlabGetOne path []))
+    case result of
+        Left err -> abort ("Cannot fetch " <> what <> ": " <> tshow err)
+        Right (Left response)
+            | missingOk && statusCode (responseStatus response) == 404 -> none
+            | otherwise ->
+                abort ("Cannot fetch " <> what <> ": HTTP " <> tshow (statusCode (responseStatus response)))
+        Right (Right summary) -> maybe none (pure . Just) (usableSummary =<< summary)
+  where
+    what = "the test report summary of pipeline " <> tshow pid
+    path = projectPath prj <> "/pipelines/" <> tshow pid <> "/test_report_summary"
+    none = do
+        logTrace_ $ "No test report for pipeline " <> tshow pid
+        pure Nothing
+
+{- | A summary worth storing: one with at least one suite. GitLab answers a
+pipeline without JUnit reports -- or whose report artifacts have expired --
+with zero counts and no suites, and storing that would put nothing over a
+summary fetched while the artifacts were there.
+-}
+usableSummary :: Value -> Maybe Value
+usableSummary v = case Aeson.parseMaybe (Aeson.withObject "summary" (Aeson..: "test_suites")) v of
+    Just (Array suites) | not (null suites) -> Just v
+    _ -> Nothing
+
+{- | Record, after their pipelines, the summaries that were asked for --
+'Nothing' for a pipeline they were not asked for, @Just Nothing@ for one
+without -- stamped with the @updated_at@ of the pipeline as it was listed,
+not as it may be now: a pipeline that moved in between must look stale.
+Returns how many summaries there were.
+-}
+writeSummaries :: (StoreBackend s) => s -> [(Int, Value, Maybe (Maybe Value))] -> IO Int
+writeSummaries backend summaries = do
+    forM_ [(pid, p, v) | (pid, p, Just v) <- summaries] $ \(pid, p, v) ->
+        storeWriteTestSummary backend pid (textField "updated_at" p) v
+    pure (length [() | (_, _, Just (Just _)) <- summaries])
+
+{- | The part of a closing log line that counts summaries, when they were
+asked for.
+-}
+summaryCount :: Bool -> Int -> Text
+summaryCount False _ = ""
+summaryCount True n = ", " <> tshow n <> " test summaries"
+
+-- | A collection in raw JSON, every page of it. Any failure aborts the run.
+fetchJSONList ::
+    (MonadLog m, MonadIO m) =>
+    (forall b. GitLab b -> m (Either GitLabError b)) ->
+    -- | What is being fetched, for the message if it cannot be.
+    Text ->
+    Text ->
+    [(BS.ByteString, Maybe BS.ByteString)] ->
+    m [Value]
+fetchJSONList gitlab what path params = do
+    result <- gitlab (orChallenge (gitlabGetMany path params))
+    case result of
+        Left err -> abort ("Cannot fetch " <> what <> ": " <> tshow err)
+        Right (Left response) ->
+            abort
+                ( "Cannot fetch "
+                    <> what
+                    <> ": HTTP "
+                    <> tshow (statusCode (responseStatus response))
+                )
+        Right (Right values) -> pure values
+
+requirePipelineId :: (MonadLog m, MonadIO m) => Value -> m Int
+requirePipelineId p = case Aeson.parseMaybe (Aeson.withObject "pipeline" (Aeson..: "id")) p of
+    Nothing -> abort "GitLab sent a pipeline without an id"
+    Just pid -> pure pid
+
+projectPath :: Project -> Text
+projectPath prj = "/projects/" <> tshow (project_id prj)
 
 {- | Fetch the log of one job into the store, replacing any log held for it.
 It is stored cleaned, never as sent: see "FetchGitLab.JobLog".

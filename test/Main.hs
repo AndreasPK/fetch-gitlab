@@ -42,7 +42,15 @@ import Log.Backend.StandardOutput (withStdOutLogger)
 import Log.Internal.Logger (withLogger)
 
 import FetchGitLab.ClearTimestamp (clearTimestamps)
-import FetchGitLab.Fetch (challengeDetail, challengeWaits, readToken, waitOutChallenge)
+import FetchGitLab.Fetch (
+    challengeDetail,
+    challengeWaits,
+    pipelineIsCurrent,
+    pipelineOwner,
+    readToken,
+    usableSummary,
+    waitOutChallenge,
+ )
 import FetchGitLab.JobLog (stripControlChars)
 import FetchGitLab.Lock (
     LockBusy (..),
@@ -51,7 +59,15 @@ import FetchGitLab.Lock (
     readLockInfo,
     withStoreLocks,
  )
-import FetchGitLab.Options (Backend (..), Command (..), Options (..), commandParserInfo, parseBackend)
+import FetchGitLab.Options (
+    Backend (..),
+    Command (..),
+    Options (..),
+    PipelineRequest (..),
+    commandParserInfo,
+    commandResult,
+    parseBackend,
+ )
 import FetchGitLab.RateLimit (newRateLimiter, rateLimitedManager, waitTurn)
 import FetchGitLab.Since (Since (..), Unit (..), parseSince, resolveSince)
 import FetchGitLab.Store (
@@ -61,7 +77,7 @@ import FetchGitLab.Store (
     needsDiscussion,
  )
 import FetchGitLab.Store.Backend (StoreSpec (..), detectSpec)
-import FetchGitLab.Store.Class (Purged (..), StoreBackend (..))
+import FetchGitLab.Store.Class (PipelineState (..), Purged (..), StoreBackend (..))
 import FetchGitLab.Store.Schema (
     Lifted (..),
     noteSpec,
@@ -132,11 +148,18 @@ tests =
             , testCase "only a job the store holds can be asked about" jobLogNeedsItsJob
             , testCase "refreshing pipelines keeps a job's log" pipelinesRewriteKeepsJobLog
             , testCase "the CI views report the newest pipeline and its failed jobs" ciViewsReportLatest
+            , testCase "view_jobs has every job, view_mr_jobs those of merge requests" jobViewsSplitByOwner
             , testCase "deleting a job deletes its log, foreign keys enforced or not" deletingJobDeletesLog
             , testCase "a fetched pipeline, its jobs and its log are kept for a month" fetchedRowsExpireAMonthOn
             , testCase "what has expired is removed and the rest kept" purgeRemovesWhatExpired
             , testCase "an expired pipeline with a live job is kept whole" purgeKeepsPipelineWithLiveJob
             , testCase "refetching pipelines renews their expiry" refetchRenewsExpiry
+            , testCase "a test summary is kept per pipeline and read per job" testSummaryIsWritten
+            , testCase "refreshing pipelines keeps their test summaries" pipelinesRewriteKeepsSummary
+            , testCase "a missing test report is recorded, and never blanks a stored one" testSummaryAbsenceIsRecorded
+            , testCase "an unknown owner never replaces a known one" unknownOwnerKeepsKnown
+            , testCase "the store says which pipelines it holds and how" pipelineStatesAreReported
+            , testCase "deleting a pipeline deletes its summary, foreign keys enforced or not" deletingPipelineDeletesSummary
             , testCase "fetching a log extends its whole merge request" jobLogExtendsMergeRequest
             , testCase "an expiry further off than a log's is left alone" jobLogNeverShortensExpiry
             , testCase "purging a store with nothing expired removes nothing" purgeOfFreshStoreDoesNothing
@@ -149,6 +172,13 @@ tests =
             , testCase "line numbers survive stripping" jobLogKeepsLineCount
             , testCase "a sequence cut short does not swallow the log" jobLogSurvivesBrokenSequence
             , testCase "--job-log is a mode of its own" jobLogFlagParses
+            ]
+        , testGroup
+            "pipelines"
+            [ testCase "--pipelines takes a merge request or --since, not both" pipelinesFlagParses
+            , testCase "a merge request's ref files a pipeline under it" pipelineOwnerFromRef
+            , testCase "only a finished, unchanged pipeline is skipped" pipelineCurrentOnlyWhenFinished
+            , testCase "a summary without suites is not worth storing" emptySummaryIsNotStored
             ]
         , testGroup
             "clear-timestamp"
@@ -632,7 +662,7 @@ oldStoreLosesHasDiscussion = withSystemTempDirectory "fetch-gitlab-test" $ \dir 
         n <- SQL.query_ raw' "SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name LIKE 'view\\_%' ESCAPE '\\'" :: IO [SQL.Only Int]
         SQL.close raw'
         pure n
-    assertEqual "patch 4 added seven views and patch 5 two" [SQL.Only 9] views
+    assertEqual "patch 4 added seven views, patch 5 two and patch 6 two" [SQL.Only 11] views
 
 {- | A store written before pipelines could expire gains the column when it is
 opened, and the rows it already holds are given a month from the migration
@@ -1278,11 +1308,184 @@ ciViewsReportLatest = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
                 IO [(T.Text, Int, T.Text, Int, Int, Int, Int, Int)]
         status @?= [("!16366", 102, "failed", 2, 1, 1, 0, 0)]
         failed <-
-            SQL.query_ raw "SELECT job_id, runner, has_log FROM view_jobs WHERE iid = 16366 AND latest AND status = 'failed'" ::
+            SQL.query_ raw "SELECT job_id, runner, has_log FROM view_mr_jobs WHERE iid = 16366 AND latest AND status = 'failed'" ::
                 IO [(Int, T.Text, Int)]
         failed @?= [(9003, "maki", 1)]
-        older <- SQL.query_ raw "SELECT job_id, has_log FROM view_jobs WHERE NOT latest AND status = 'failed'" :: IO [(Int, Int)]
+        older <- SQL.query_ raw "SELECT job_id, has_log FROM view_mr_jobs WHERE NOT latest AND status = 'failed'" :: IO [(Int, Int)]
         older @?= [(9002, 0)]
+
+-- | The @updated_at@ a test summary is stamped with in these tests.
+stampT :: Maybe T.Text
+stampT = Just "2026-07-18T10:30:00.000Z"
+
+{- | A pipeline without a test report is recorded as asked, so a later run can
+skip it; and an empty answer after a real one -- expired report artifacts
+-- moves the stamp but keeps the summary.
+-}
+testSummaryAbsenceIsRecorded :: Assertion
+testSummaryAbsenceIsRecorded = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    let path = dir </> "gitlab.db"
+        later = Just "2026-07-19T00:00:00.000Z"
+    withSqliteStore path $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWriteTestSummary db 102 stampT Nothing
+        storeWriteTestSummary db 101 stampT (Just testSummaryFixture)
+        storeWriteTestSummary db 101 later Nothing
+        states <- storePipelineStates db [101, 102]
+        fmap stateSummaryPipelineUpdatedAt states @?= Map.fromList [(101, later), (102, stampT)]
+    SQL.withConnection path $ \raw -> do
+        rows <- SQL.query_ raw "SELECT pipeline_id, total FROM test_summaries ORDER BY pipeline_id" :: IO [(Int, Maybe Int)]
+        rows @?= [(101, Just 23), (102, Nothing)]
+        suites <- SQL.query_ raw "SELECT DISTINCT pipeline_id FROM view_test_suites" :: IO [SQL.Only Int]
+        suites @?= [SQL.Only 101]
+
+{- | A test report summary as GitLab sends it, for pipeline 101 of
+'pipelineFixture': one suite per test job, named after it.
+-}
+testSummaryFixture :: Value
+testSummaryFixture =
+    object
+        [ "total" .= object ["time" .= (0 :: Int), "count" .= (23 :: Int), "success" .= (20 :: Int), "failed" .= (1 :: Int), "skipped" .= (2 :: Int), "error" .= (0 :: Int), "suite_error" .= Null]
+        , "test_suites"
+            .= [ suite "x86_64-linux-validate" 9001 12 12 0 0
+               , suite "x86_64-linux-validate-slow" 9002 11 8 1 2
+               ]
+        ]
+  where
+    suite :: T.Text -> Int -> Int -> Int -> Int -> Int -> Value
+    suite name job total success failed skipped =
+        object
+            [ "name" .= name
+            , "total_time" .= (0 :: Int)
+            , "total_count" .= total
+            , "success_count" .= success
+            , "failed_count" .= failed
+            , "skipped_count" .= skipped
+            , "error_count" .= (0 :: Int)
+            , "build_ids" .= [job]
+            , "suite_error" .= Null
+            ]
+
+testSummaryIsWritten :: Assertion
+testSummaryIsWritten = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    let path = dir </> "gitlab.db"
+    withSqliteStore path $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWriteTestSummary db 101 stampT (Just testSummaryFixture)
+        -- A second write replaces the first rather than adding a row.
+        storeWriteTestSummary db 101 stampT (Just testSummaryFixture)
+    SQL.withConnection path $ \raw -> do
+        totals <- SQL.query_ raw "SELECT pipeline_id, total, failed, skipped FROM test_summaries" :: IO [(Int, Int, Int, Int)]
+        totals @?= [(101, 23, 1, 2)]
+        suites <-
+            SQL.query_ raw "SELECT ref, iid, pipeline_id, latest, name, job_id, total, failed FROM view_test_suites ORDER BY job_id" ::
+                IO [(T.Text, Int, Int, Int, T.Text, Int, Int, Int)]
+        suites
+            @?= [ ("!16366", 16366, 101, 0, "x86_64-linux-validate", 9001, 12, 0)
+                , ("!16366", 16366, 101, 0, "x86_64-linux-validate-slow", 9002, 11, 1)
+                ]
+
+{- | Refetching pipelines without @--with-summary@ must not cost the summaries
+fetched with it. It would while a pipeline was written with INSERT OR
+REPLACE, which deletes the row and so sets off the cascade.
+-}
+pipelinesRewriteKeepsSummary :: Assertion
+pipelinesRewriteKeepsSummary = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    let path = dir </> "gitlab.db"
+    withSqliteStore path $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWriteTestSummary db 101 stampT (Just testSummaryFixture)
+        storeWritePipelines db "mr" 16366 pipelineFixture
+    SQL.withConnection path $ \raw -> do
+        kept <- SQL.query_ raw "SELECT pipeline_id FROM test_summaries" :: IO [SQL.Only Int]
+        kept @?= [SQL.Only 101]
+
+{- | A project-wide listing does not know the merge request of a pipeline on a
+branch; one fetched as that merge request's keeps it.
+-}
+unknownOwnerKeepsKnown :: Assertion
+unknownOwnerKeepsKnown = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    let path = dir </> "gitlab.db"
+        p103 = object ["id" .= (103 :: Int), "status" .= ("success" :: T.Text)]
+    withSqliteStore path $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWritePipelines db "pipeline" 101 (take 1 pipelineFixture)
+        storeWritePipelines db "pipeline" 103 [(p103, [])]
+    SQL.withConnection path $ \raw -> do
+        owners <- SQL.query_ raw "SELECT pipeline_id, kind, iid FROM pipelines ORDER BY pipeline_id" :: IO [(Int, T.Text, Int)]
+        owners @?= [(101, "mr", 16366), (102, "mr", 16366), (103, "pipeline", 103)]
+
+-- | What a @--since@ run asks before deciding to skip a pipeline.
+pipelineStatesAreReported :: Assertion
+pipelineStatesAreReported = withSystemTempDirectory "fetch-gitlab-test" $ \dir ->
+    withSqliteStore (dir </> "gitlab.db") $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWriteTestSummary db 101 stampT (Just testSummaryFixture)
+        states <- storePipelineStates db [101, 102, 999]
+        states
+            @?= Map.fromList
+                [ (101, PipelineState (Just "failed") Nothing stampT)
+                , (102, PipelineState (Just "failed") Nothing Nothing)
+                ]
+        storePipelineStates db [] >>= (@?= Map.empty)
+
+-- | As 'deletingJobDeletesLog', for a pipeline and its summary.
+deletingPipelineDeletesSummary :: Assertion
+deletingPipelineDeletesSummary = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    let path = dir </> "gitlab.db"
+    withSqliteStore path $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWriteTestSummary db 101 stampT (Just testSummaryFixture)
+        storeWriteTestSummary db 102 stampT (Just testSummaryFixture)
+    deletePipeline path False 101
+    summaries path >>= (@?= [SQL.Only 102])
+    deletePipeline path True 102
+    summaries path >>= (@?= [])
+  where
+    -- Its jobs first: with foreign keys on, they would refuse the delete.
+    deletePipeline :: FilePath -> Bool -> Int -> IO ()
+    deletePipeline path enforce pid = SQL.withConnection path $ \raw -> do
+        SQL.execute_ raw (if enforce then "PRAGMA foreign_keys = ON" else "PRAGMA foreign_keys = OFF")
+        SQL.execute raw "DELETE FROM jobs WHERE pipeline_id = ?" (SQL.Only pid)
+        SQL.execute raw "DELETE FROM pipelines WHERE pipeline_id = ?" (SQL.Only pid)
+
+    summaries :: FilePath -> IO [SQL.Only Int]
+    summaries path = SQL.withConnection path $ \raw ->
+        SQL.query_ raw "SELECT pipeline_id FROM test_summaries ORDER BY pipeline_id"
+
+{- | A master pipeline's job is in @view_jobs@ with no merge request to be
+@latest@ in, and not in @view_mr_jobs@; an MR's jobs are reached through
+the index either way, as long as @view_jobs@ is also given the kind.
+-}
+jobViewsSplitByOwner :: Assertion
+jobViewsSplitByOwner = withSystemTempDirectory "fetch-gitlab-test" $ \dir -> do
+    let path = dir </> "gitlab.db"
+        master = object ["id" .= (131462 :: Int), "status" .= ("success" :: T.Text), "ref" .= ("master" :: T.Text), "source" .= ("push" :: T.Text)]
+        job = object ["id" .= (9100 :: Int), "status" .= ("success" :: T.Text), "stage" .= ("build" :: T.Text), "created_at" .= ("2026-09-24T10:00:00.000Z" :: T.Text), "name" .= ("x86_64-linux-deb13-validate" :: T.Text)]
+    withSqliteStore path $ \db -> do
+        storeWritePipelines db "mr" 16366 pipelineFixture
+        storeWritePipelines db "pipeline" 131462 [(master, [job])]
+    SQL.withConnection path $ \raw -> do
+        everyJob <- SQL.query_ raw "SELECT job_id, kind, latest FROM view_jobs ORDER BY job_id" :: IO [(Int, T.Text, Maybe Int)]
+        everyJob
+            @?= [ (9001, "mr", Just 0)
+                , (9002, "mr", Just 0)
+                , (9003, "mr", Just 1)
+                , (9100, "pipeline", Nothing)
+                ]
+        other <- SQL.query_ raw "SELECT ref, git_ref, source FROM view_jobs WHERE job_id = 9100" :: IO [(Maybe T.Text, T.Text, T.Text)]
+        other @?= [(Nothing, "master", "push")]
+        mrOnly <- SQL.query_ raw "SELECT job_id FROM view_mr_jobs ORDER BY job_id" :: IO [SQL.Only Int]
+        mrOnly @?= map SQL.Only [9001, 9002, 9003]
+        forM_
+            [ "SELECT * FROM view_jobs WHERE kind = 'mr' AND iid = 16366"
+            , "SELECT * FROM view_mr_jobs WHERE iid = 16366"
+            ]
+            $ \q -> do
+                plan <- SQL.query_ raw ("EXPLAIN QUERY PLAN " <> q) :: IO [(Int, Int, Int, T.Text)]
+                assertBool
+                    (show q <> " uses the pipelines_record index: " <> show plan)
+                    (any (\(_, _, _, detail) -> "pipelines_record" `T.isInfixOf` detail) plan)
 
 {- | A log does not outlive its job. The likeliest delete is one typed into the
 sqlite3 shell, which does not enforce foreign keys unless asked to, so this
@@ -1549,6 +1752,75 @@ jobLogFlagParses = do
     parsed args = case getParseResult (execParserPure defaultPrefs commandParserInfo args) of
         Just (Fetch opts) -> Just (optJobLog opts)
         _ -> Nothing
+
+{- | What @--pipelines@ accepts. The merge request and @--since@ are the one
+thing the parser alone cannot check, so this goes through 'commandResult'
+as @main@ does.
+-}
+pipelinesFlagParses :: Assertion
+pipelinesFlagParses = do
+    parsed ["--pipelines", "5"] @?= Just (Just (PipelineRequest (Just 5) False))
+    parsed ["--db", "x.db", "--pipelines", "5", "-v"] @?= Just (Just (PipelineRequest (Just 5) False))
+    parsed ["--pipelines", "--since", "2d", "--with-summary"] @?= Just (Just (PipelineRequest Nothing True))
+    parsed ["--since", "2d", "--with-summary", "--pipelines"] @?= Just (Just (PipelineRequest Nothing True))
+    parsed ["--with-summary", "--pipelines", "5"] @?= Just (Just (PipelineRequest (Just 5) True))
+    -- --since alone is still a records run.
+    parsed ["--since", "2d"] @?= Just Nothing
+    parsed ["--pipelines"] @?= Nothing
+    parsed ["--pipelines", "5", "--since", "2d"] @?= Nothing
+    parsed ["--with-summary"] @?= Nothing
+    parsed ["--pipelines", "5", "--no-notes"] @?= Nothing
+  where
+    parsed args = case getParseResult (commandResult defaultPrefs args) of
+        Just (Fetch opts) -> Just (optPipelines opts)
+        _ -> Nothing
+
+pipelineOwnerFromRef :: Assertion
+pipelineOwnerFromRef = do
+    pipelineOwner 7 (Just "refs/merge-requests/16683/head") @?= ("mr", 16683)
+    pipelineOwner 7 (Just "refs/merge-requests/16683/merge") @?= ("mr", 16683)
+    pipelineOwner 7 (Just "refs/merge-requests/16683/train") @?= ("mr", 16683)
+    pipelineOwner 7 (Just "refs/merge-requests/16683/other") @?= ("pipeline", 7)
+    pipelineOwner 7 (Just "wip/refs/merge-requests/16683/head") @?= ("pipeline", 7)
+    pipelineOwner 7 (Just "master") @?= ("pipeline", 7)
+    pipelineOwner 7 (Just "wip/mangoiv/9.12.5-rc4") @?= ("pipeline", 7)
+    pipelineOwner 7 (Just "refs/merge-requests/16683") @?= ("pipeline", 7)
+    pipelineOwner 7 (Just "refs/merge-requests//head") @?= ("pipeline", 7)
+    pipelineOwner 7 Nothing @?= ("pipeline", 7)
+
+{- | A pipeline's @updated_at@ follows its own status, not its jobs', so only
+a final status makes an unchanged one mean "nothing new".
+-}
+pipelineCurrentOnlyWhenFinished :: Assertion
+pipelineCurrentOnlyWhenFinished = do
+    let listed status = object ["id" .= (7 :: Int), "status" .= (status :: T.Text), "updated_at" .= stamp]
+        stored status checked = PipelineState (Just status) (Just stamp) (if checked then Just stamp else Nothing)
+        stamp = "2026-09-24T11:30:46.900Z" :: T.Text
+    pipelineIsCurrent False (listed "success") (stored "success" False) @?= True
+    pipelineIsCurrent False (listed "failed") (stored "failed" False) @?= True
+    pipelineIsCurrent False (listed "running") (stored "running" False) @?= False
+    pipelineIsCurrent False (listed "running") (stored "failed" False) @?= False
+    pipelineIsCurrent True (listed "success") (stored "success" False) @?= False
+    pipelineIsCurrent True (listed "success") (stored "success" True) @?= True
+    pipelineIsCurrent False (listed "success") (PipelineState (Just "success") (Just "2026-09-24T12:00:00.000Z") Nothing) @?= False
+    -- Asked for an older version of the pipeline: ask again.
+    pipelineIsCurrent True (listed "success") (PipelineState (Just "success") (Just stamp) (Just "2026-09-24T10:00:00.000Z")) @?= False
+    -- No updated_at to compare: never current.
+    pipelineIsCurrent False (object ["status" .= ("success" :: T.Text)]) (PipelineState (Just "success") Nothing Nothing) @?= False
+
+{- | GitLab's answer for a pipeline without JUnit reports, or whose report
+artifacts expired: zero counts and no suites. Storing it would put nothing
+over a summary fetched while the artifacts were there.
+-}
+emptySummaryIsNotStored :: Assertion
+emptySummaryIsNotStored = do
+    let empty =
+            object
+                [ "total" .= object ["time" .= (0 :: Int), "count" .= (0 :: Int), "success" .= (0 :: Int), "failed" .= (0 :: Int), "skipped" .= (0 :: Int), "error" .= (0 :: Int), "suite_error" .= Null]
+                , "test_suites" .= ([] :: [Value])
+                ]
+    usableSummary empty @?= Nothing
+    usableSummary testSummaryFixture @?= Just testSummaryFixture
 
 {- | The point of the command: a store that thinks its discussions are current
 has to stop thinking so.

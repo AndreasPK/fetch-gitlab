@@ -31,7 +31,7 @@ month ago — see "Expiry"), not an MR without CI.**
 
    ```sql
    SELECT job_id, name, stage, allow_failure, failure_reason, secs, runner, has_log
-     FROM view_jobs
+     FROM view_mr_jobs
     WHERE iid = 16366 AND latest AND status = 'failed'
     ORDER BY finished_at;
    ```
@@ -43,11 +43,26 @@ month ago — see "Expiry"), not an MR without CI.**
 pipeline_id, status, sha, created_at, updated_at, pipelines, jobs, failed,
 failed_allowed, unfinished, web_url, expire_at`.
 
-`view_jobs`: one row per job of any pipeline — `ref, iid, pipeline_id,
-latest, pipeline_status, job_id, name, stage, status, allow_failure,
-failure_reason, started_at, finished_at, secs, runner, has_log, web_url`.
-`latest` = belongs to the MR's newest pipeline; drop it to see a job's
-history across pushes (`WHERE iid = … AND name = …`). Filter both views on
+`view_mr_jobs`: one row per job of an MR's pipeline — `ref, iid,
+pipeline_id, latest, pipeline_status, job_id, name, stage, status,
+allow_failure, failure_reason, started_at, finished_at, secs, runner,
+has_log, web_url`. `latest` = belongs to the MR's newest pipeline; drop it to
+see a job's history across pushes (`WHERE iid = … AND name = …`).
+
+`view_jobs`: every job, MR or not — the same columns plus `kind`, `source`
+and `git_ref` (branch, tag or MR ref); `ref` and `latest` are NULL for a
+pipeline without an MR. For an MR's jobs here, say `kind = 'mr' AND iid = …`:
+`iid` alone scans every job. E.g. the failed jobs of recent master and
+nightly pipelines:
+
+```sql
+SELECT pipeline_id, source, job_id, name, failure_reason
+  FROM view_jobs
+ WHERE kind = 'pipeline' AND git_ref = 'master' AND status = 'failed'
+ ORDER BY pipeline_id DESC;
+```
+
+Filter the MR views on
 `iid`, not `ref`: only `iid` is indexed.
 
 ## Fetching an MR's pipelines
@@ -65,10 +80,70 @@ records, no notes. Refetching the same MR replaces what is there, so it is
 also how to refresh a running pipeline's status. It writes, so it takes the
 store lock: it will refuse to run beside a full fetch.
 
+Add `--with-summary` for each pipeline's test counts (see "Test summaries").
+
+## Fetching every pipeline in a time window
+
+```
+fetch-gitlab --pipelines --since 1w [--with-summary]
+```
+
+Every pipeline of the project created in the window (GHC: about 25 a day)
+and its jobs, each written as it arrives. Pipelines already stored with a
+final status and the same `updated_at` are skipped (with `--with-summary`,
+only if their summary was asked for that same `updated_at`, found or not),
+so rerunning an overlapping window is cheap; running ones are always
+refetched.
+
+Gotchas:
+
+- Only a `refs/merge-requests/N/{head,merge,train}` ref files a pipeline
+  under MR N. Master, nightly (`source = 'schedule'`) and branch pipelines
+  get `kind = 'pipeline'`, `iid` = their own `pipeline_id`, and are **not in
+  `view_mr_ci_status` or `view_mr_jobs`** (both MR-only); they are in
+  `view_jobs` and `view_test_suites`. `--pipelines <mr>` later re-files an
+  MR's branch pipelines under it.
+- A window gives an MR only the pipelines created in it:
+  `view_mr_ci_status.pipelines` counts those, not the MR's history.
+
+## Test summaries
+
+`--with-summary` stores GitLab's `test_report_summary` per pipeline in
+`test_summaries` (`pipeline_id`, `pipeline_updated_at` = the pipeline's `updated_at`
+it was asked for, verbatim `json`, generated `total`, `success`, `failed`,
+`skipped`, `error` for the whole pipeline). `json` NULL: asked, the pipeline
+had no JUnit report. Read it per job through `view_test_suites`:
+
+```sql
+SELECT name, job_id, total, failed, skipped
+  FROM view_test_suites
+ WHERE iid = 16366 AND latest AND failed > 0;
+```
+
+`view_test_suites`: one row per test job — `ref, iid, pipeline_id, latest,
+pipeline_status, source, git_ref, sha, created_at, name, job_id, total,
+success, failed, skipped, error, suite_error`. `ref`/`iid`/`latest` are NULL
+for a pipeline without an MR. `name` is the job name; `job_id` joins
+`jobs.id`.
+
+Gotchas:
+
+- Counts only: which tests failed is not in the summary.
+- GHC's JUnit writer (`testsuite/driver/junit.py`) sets the meaning:
+  `failed` = unexpected failures + stat failures + unexpected passes,
+  `skipped` = **fragile tests that failed** (not tests that did not run —
+  those are not reported at all), `error` = framework failures.
+- A running pipeline's summary is partial (`pipeline_status` says so);
+  refetch when it is done.
+- No row: `--with-summary` was never used for the pipeline. A row with
+  `json` NULL: no JUnit report (early failure, cancel). A later empty answer
+  (report artifacts expired) never replaces a stored summary.
+
 ## Schema
 
 `pipelines` is keyed by the project-unique `pipeline_id`; `kind`/`iid` name
-the MR it was fetched for (`kind` = `'mr'`, `iid` = the `!16366` number).
+the MR it was fetched for (`kind` = `'mr'`, `iid` = the `!16366` number), or
+`kind` = `'pipeline'`, `iid` = `pipeline_id` for one with no known MR.
 Real columns: `expire_at` (see "Expiry"). Verbatim JSON in `rest` with the
 useful fields generated from it: `pipeline_iid`, `project_id`, `status`,
 `source`, `ref`, `sha`, `name`, `web_url`, `created_at`, `updated_at`.
@@ -148,7 +223,7 @@ Gotchas:
 ## Expiry
 
 CI data is the one thing a store forgets. `pipelines`, `jobs` and `job_logs`
-all carry `expire_at`, a fixed-width UTC string (`2026-10-18T08:50:20Z`) that
+all carry `expire_at` (a test summary goes with its pipeline), a fixed-width UTC string (`2026-10-18T08:50:20Z`) that
 compares and sorts as text. Every write sets it a month ahead; the start of
 the next `fetch-gitlab` run deletes what has passed, with a line saying what
 went. Records and notes never expire.

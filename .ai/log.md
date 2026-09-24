@@ -434,3 +434,84 @@ Touched: `Store/Schema/Views.hs`, `Store/Schema.hs`, `test/Main.hs` (view
 count 7 → 9, `ciViewsReportLatest`), `skill/ghc-gitlab/{SKILL,Pipelines}.md`
 (workflow section first; the two long queries it replaces removed),
 `agent-summary.md`, `.ai/summary/Schema.md`.
+
+## 2026-09-24T12:20+00:00 — decision: pipelines created since, and test summaries
+
+`--pipelines [MR | --since WHEN] [--with-summary]`. `--since` lists
+`/projects/:id/pipelines?created_after=` (gitlab.haskell.org supports it;
+about 25 pipelines a day) and fetches every pipeline's jobs;
+`--with-summary` stores `/pipelines/:id/test_report_summary` per pipeline.
+Design reviewed in the `pipeline-caching` session.
+
+- **Grammar.** `--pipelines` is a flag with an optional positional MR;
+  `--since` stays the shared outer option, since a branch that consumed it is
+  never backtracked out of and a records run with `--since` would fail.
+  `checkCommand` holds "exactly one" and reports through optparse's usual
+  failure.
+- **Jobs always.** `/pipelines/:id/jobs` is one page for every GHC pipeline
+  (nightly 73 jobs, master 47, MR 16). Paging project-wide `/jobs` instead
+  was rejected: token-only, keyset paging, ordered by job id so a pipeline's
+  jobs are complete only late, and it saves 10–15 requests a day.
+- **Owner.** `refs/merge-requests/N/{head,merge,train}` → `('mr', N)`;
+  anything else `('pipeline', pipeline_id)`, which never overwrites a stored
+  owner. `('project', …)` was rejected: a `--job-log` on one master job would
+  extend every master pipeline via `storeWriteJobLog`. A nullable `iid`
+  needs a table rebuild. Branch refs are not traced to an MR — the MR fetch
+  files those, since `/merge_requests/:iid/pipelines` also lists them.
+- **Skip.** Experiment (pipeline-caching, 2026-09-24): a pipeline's
+  `updated_at` stayed at its start while ~15 of its jobs changed state over
+  15 minutes; finished pipelines' `updated_at` is 0.2–9 s after the last
+  job's `finished_at`. So a stored pipeline with a final status and the same
+  `updated_at` is skipped (`pipelineIsCurrent`), running ones never are.
+  Live: a second `--since 1d --with-summary` run skipped 13 of 23.
+- **Summaries.** Verbatim JSON, no `expire_at`, cascade + trigger with the
+  pipeline, so `writePipeline` became an upsert. An answer with no suites
+  (no JUnit, or expired artifacts) is not stored and never overwrites; a
+  summary 404 in `--since` mode is "none" (pipeline deleted since listing).
+  Partial summaries of running pipelines are stored; `view_test_suites`
+  carries `pipeline_status`. GHC's JUnit `skipped` is fragile failures.
+
+**Verified.** 87 tests. Live into `.ai/scratch/pipelines-since.db`:
+`--pipelines --since 1d --with-summary` wrote 23 pipelines (22 MR, 1
+other), 558 jobs, 18 summaries; the rerun fetched 10.
+
+**Files.** `Options.hs`, `app/Main.hs`, `Fetch.hs`, `Store/Class.hs`,
+`Store/Sqlite.hs`, `Store/Schema.hs`, `Store/Schema/{Pipeline,Views}.hs`,
+`test/Main.hs`, `README.md`, `agent-summary.md`,
+`skill/ghc-gitlab/{SKILL,Pipelines}.md`,
+`.ai/summary/{fetch,store,Schema,modules}.md`.
+
+## 2026-09-24T12:30+00:00 — decision: every job in view_jobs; summary checks are stamped
+
+Both folded into the still unreleased patch 6 (the real store is at 5).
+
+- **`view_jobs` covers every pipeline.** Patch 5's MR-only view is recreated
+  as `view_mr_jobs`; `view_jobs` is dropped and recreated without the
+  `kind = 'mr'` filter, with `kind`, `source`, `git_ref`, and `ref`/`latest`
+  NULL outside an MR. The built-in kind filter was what reached the
+  `pipelines_record` index: on the all-jobs view `iid = N` alone scans
+  (`EXPLAIN QUERY PLAN`, also with `iid` wrapped in CASE), `kind = 'mr' AND
+  iid = N` does not — pinned by "view_jobs has every job, view_mr_jobs those
+  of merge requests". `iid` stays the stored one rather than NULL outside an
+  MR: NULL buys no index, and pipeline ids (~131000) are far from MR iids.
+- **A missing test report is recorded.** `test_summaries.checked_for` is the
+  pipeline's listed `updated_at` the summary was asked for, `json` NULL when
+  GitLab had none; a NULL write `coalesce`s. `pipelineIsCurrent` with
+  `--with-summary` requires `checked_for` to equal the listed `updated_at`.
+  Our own fetch time was considered and not used: comparing it with GitLab's
+  `updated_at` brings in clock skew, and the discussion stamp already shows
+  the pattern. Live: a rerun of `--since 1d --with-summary` skipped 17 of 24
+  (13 before this), fetching only the 7 unfinished.
+
+Touched: `Store/Schema/{Pipeline,Views}.hs`, `Store/Schema.hs`,
+`Store/{Class,Sqlite}.hs`, `Fetch.hs`, `test/Main.hs` (89 tests),
+`agent-summary.md`, `skill/ghc-gitlab/{SKILL,Pipelines,CiFailure}.md`,
+`.ai/summary/{store,fetch,Schema}.md`.
+
+## 2026-09-24T13:10+00:00 — test_summaries.checked_for renamed pipeline_updated_at
+
+The column the entry above calls `checked_for` is `pipeline_updated_at`
+(Haskell: `stateSummaryPipelineUpdatedAt`): it is a copy of the pipeline's
+`updated_at`, so the name says what it is compared with, as
+`discussion_updated_at` does on records. Patch 6 was still unreleased, so
+the table definition changed in place.

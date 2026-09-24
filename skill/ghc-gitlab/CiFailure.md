@@ -43,7 +43,7 @@ raw_log without a filter, a substr(), or a pipe into tail/grep.
 3. List the failed jobs:
      sqlite3 -readonly -header ~/.fetch-gitlab/gitlab.db \
        "SELECT job_id, name, stage, failure_reason, secs, runner, has_log
-          FROM view_jobs
+          FROM view_mr_jobs
          WHERE iid = <MR> AND latest AND status = 'failed' AND NOT allow_failure
          ORDER BY name LIKE '%release%' DESC, finished_at"
    Take the first row: a job with "release" in its name if there is one,
