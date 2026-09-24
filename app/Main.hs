@@ -8,7 +8,7 @@ import FetchGitLab.Options (Command (..), commandParserInfo)
 
 main :: IO ()
 main = do
-  command <- execParser commandParserInfo
-  case command of
-    Fetch opts -> run opts
-    ClearTimestamp opts -> runClearTimestamp opts
+    command <- execParser commandParserInfo
+    case command of
+        Fetch opts -> run opts
+        ClearTimestamp opts -> runClearTimestamp opts
