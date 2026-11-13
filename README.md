@@ -4,10 +4,26 @@ This tool/repo has two purposes:
 
 * It provides a haskell program to create and update a snapshot of ghc-gitlab
   tickets and MRs.
+* It provides options to fetch (and cache) pipeline/job data and results.
 * It provides a skill file that AI tools can use to query that data
   reasonably efficiently.
 
-TLDR:
+## Why not vibe your own
+
+Yes claude will vibe you something similar. But it will likely be a little worse
+until you spend similar effort to tweak it, and waste a lot of tokens to get there.
+
+I spent non-trivial effort on:
+
+* Fiddling with skill/data presentation to ensure a decent range of agents can
+  reliably use the skill/data for common ghc tasks.
+* Ensure this plays nice with ghc gitlab. (I only got almost temp banned once!)
+* We want to avoid burning forests worth of energy to produce the same thing ten times.
+* I've used this for months and it just works so far.
+* I'm happy to add features/tweaks that are in line with the current feature set.
+
+## Quickstart guide:
+
 * Install via `cabal install`, ideally also install the `sqlite3` binary
 * Create a read-only api_read token under `~/.fetch-gitlab/gitlab-token`
 * Run `fetch-gitlab` to fetch MRs/Tickets
@@ -18,21 +34,24 @@ Ideally you aquire a snapshot of `gitlab.db` to avoid a very long initial sync.
 This creates a sqlite.db file under `~/.fetch-gitlab/gitlab.db` that will contain all
 MRs/Tickets and their discussions.
 
-You can query this database manually, or via the fetch-gitlab tool itself. But it's
+You can now query this database manually, or via the fetch-gitlab tool itself. But it's
 mostly meant to be consumed with scripts/agents, primarily via a set of hand curated
 views.
 
 ## Other things of note for fellow humans:
 
-The tool uses a restrictive rate limit. As a result starting a sync from scratch
-*will* take hours. But starting from a recent snapshot should take at most a few
-minutes.
+The tool uses a restrictive rate limit and only does requests sequentially.
+This is slower. But friendly to our gitlab instance :)
+
+As a result starting a sync from scratch *will* take hours. But starting from a
+recent snapshot should take at most a few minutes. If you find this to be a big
+issue after the initial sync let me know.
 
 Fetching is incremental, and uses transactions. So not much is lost when killing
-a fetch command while it runs.
+a fetch command while it runs if you grow tired of waiting.
 
 When ghc gitlab is under load it throws Anubis challenges even to API users. In
-these cases we do exponential backoff.
+these cases, and on other errors we do exponential backoff.
 
 Pipeline/job data is purged after some (calendar) time on startup. Tickets/MRs
 are cached forever.
